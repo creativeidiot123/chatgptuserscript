@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.1.1
+// @version      1.2.0
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.1.1
+   * ChatGPT Resilience 1.2.0
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.1.1';
+  const VERSION = '1.2.0';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -79,6 +79,8 @@
     answerSettleMs: 1_200,
     incompleteVerifyMs: 5 * 60_000,
     recoveryPauseMs: 10_000,
+    intentionalStopNetworkSuppressMs: 15_000,
+    composerMissingGraceMs: 12_000,
     controlMismatchGraceMs: 350,
     noStartControlGraceMs: 2_500,
     sendConfirmMs: 18_000,
@@ -154,23 +156,23 @@
   });
 
 
-  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection (?:reset|closed|lost|failed|interrupted|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
   const ERROR_RULES = [
-    { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare|automated traffic|security check|you have been blocked/i },
+    { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare challenge|automated traffic|security check|you have been blocked/i },
     { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
     { id: 'policy', kind: 'hard', re: /content policy|may violate|can(?:not|'t|’t) assist with that|can(?:not|'t|’t) help with that request/i },
     { id: 'artifact-expired', kind: 'hard', re: /download failed|file not found|generated file (?:has )?expired|file (?:has )?expired/i },
     { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
     { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|please wait before trying again/i },
-    { id: 'conversation-load', kind: 'reload', re: /conversation not found|unable to load conversation|failed to load conversation|problem preparing your chat|couldn(?:'|’)t load (?:this )?conversation/i },
-    { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|connection (?:error|lost|failed|interrupted)|websocket|socket (?:error|closed)|disconnected/i },
-    { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|message[- ]delivery (?:timed? out|timeout)|too late/i },
-    { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted)/i },
+    { id: 'conversation-load', kind: 'reload', re: /conversation not found|(?:unable|failed|error) to load (?:this )?(?:conversation|chat)|problem preparing your chat|couldn(?:'|’)t load (?:this )?(?:conversation|chat)|chat not found/i },
+    { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|fetch failed|connection (?:error|reset|closed|lost|failed|interrupted|terminated)|websocket|socket (?:error|closed)|disconnected|upstream connect error|disconnect\/reset before headers|transport error|err_network/i },
+    { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|connection timed out|message[- ]delivery (?:timed? out|timeout)|gateway time[- ]?out|err_timed_out|too late/i },
+    { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted|closed unexpectedly)|incomplete chunked encoding|premature eof/i },
     { id: 'thinking-failed', kind: 'continue', re: /thinking failed|reasoning failed|failed while thinking|stopped thinking|reasoning stopped|stopped reasoning/i },
-    { id: 'generation', kind: 'continue', re: /there was an error generating a response|something (?:seems to have )?gone wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)/i },
-    { id: 'server', kind: 'continue', re: /server error|internal server error|service unavailable|temporarily unavailable|overloaded|bad gateway|gateway timeout|model (?:is )?(?:currently |temporarily )?unavailable|model capacity/i },
+    { id: 'generation', kind: 'continue', re: /there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)|failed to get (?:a )?response|response (?:interrupted|failed)|generation interrupted|we encountered an error/i },
+    { id: 'server', kind: 'continue', re: /server error|internal server error|service unavailable|temporarily unavailable|overloaded|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|upstream error|unknown error|model (?:is )?(?:currently |temporarily )?unavailable|model capacity/i },
     { id: 'image-generation', kind: 'continue', re: /image generation failed|failed to generate (?:the )?image|couldn(?:'|’)t generate (?:the )?image/i },
-    { id: 'message-send', kind: 'send', re: /message (?:failed|couldn(?:'|’)t|could not) (?:to )?send|failed to send (?:the )?message|unable to send (?:the )?message/i },
+    { id: 'message-send', kind: 'send', re: /message (?:failed|couldn(?:'|’)t|could not) (?:to )?send|failed to send (?:the )?message|unable to send (?:the )?message|error sending (?:the )?message/i },
   ];
 
   const store = {
@@ -651,6 +653,10 @@
     lastHttpStatus: 0,
     lastHttpStatusAt: 0,
     lastNetworkFailureAt: 0,
+    lastNetworkFailureKind: '',
+    suppressTransportErrorsUntil: 0,
+    pendingRecoveryReason: '',
+    composerMissingSince: 0,
     rateRetryAt: 0,
     lastGenerationEndAt: 0,
     lastAssistantSig: '',
@@ -1042,6 +1048,50 @@
     return chunks.join('\n').slice(-10_000);
   }
 
+  function classifyHttpStatus(status) {
+    const n = Number(status || 0);
+    if (!n) return null;
+    if (n === 401) return { id: 'auth', kind: 'hard', sourceText: 'HTTP 401' };
+    if (n === 403) return { id: 'anti-abuse', kind: 'hard', sourceText: 'HTTP 403' };
+    if (n === 429) return { id: 'rate', kind: 'rate', sourceText: 'HTTP 429' };
+    if (n === 404) return { id: 'conversation-load', kind: 'reload', sourceText: 'HTTP 404' };
+    if (n === 408) return { id: 'timeout', kind: 'continue', sourceText: 'HTTP 408' };
+    if ([400, 409, 422, 424, 425].includes(n)) return { id: 'request-failed', kind: 'continue', sourceText: `HTTP ${n}` };
+    if (n >= 500 && n <= 599) return { id: 'server', kind: 'continue', sourceText: `HTTP ${n}` };
+    return null;
+  }
+
+  function suppressIntentionalStopTransportErrors() {
+    S.suppressTransportErrorsUntil = Math.max(
+      Number(S.suppressTransportErrorsUntil || 0),
+      now() + CFG.intentionalStopNetworkSuppressMs,
+    );
+    S.lastNetworkFailureAt = 0;
+    S.lastNetworkFailureKind = '';
+  }
+
+  function transportFailureSuppressed() {
+    return now() < Number(S.suppressTransportErrorsUntil || 0);
+  }
+
+  function noteTransportFailure(kind = 'transport') {
+    S.lastNetworkAt = now();
+    if (transportFailureSuppressed()) {
+      log('transport-failure-suppressed', { kind });
+      return;
+    }
+    S.lastNetworkFailureAt = now();
+    S.lastNetworkFailureKind = String(kind || 'transport');
+    scheduleEvaluate(`transport-fail:${S.lastNetworkFailureKind}`, 80);
+  }
+
+  function clearTransientNetworkError() {
+    S.lastNetworkFailureAt = 0;
+    S.lastNetworkFailureKind = '';
+    S.lastHttpStatus = 0;
+    S.lastHttpStatusAt = 0;
+  }
+
   function currentError(msgs = getMessages()) {
     const retry = findRetryButton();
     if (retry) return {
@@ -1052,15 +1102,20 @@
 
     const dom = classifyError(collectErrorText(msgs));
     if (dom) return dom;
+
     const age = now() - Number(S.lastHttpStatusAt || 0);
     if (age < 20_000) {
-      const status = Number(S.lastHttpStatus || 0);
-      if (status === 401) return { id: 'auth', kind: 'hard', sourceText: 'HTTP 401' };
-      if (status === 403) return { id: 'anti-abuse', kind: 'hard', sourceText: 'HTTP 403' };
-      if (status === 429) return { id: 'rate', kind: 'rate', sourceText: 'HTTP 429' };
-      if ([408, 425, 500, 502, 503, 504].includes(status)) return { id: status === 408 ? 'timeout' : 'server', kind: 'continue', sourceText: `HTTP ${status}` };
+      const http = classifyHttpStatus(S.lastHttpStatus);
+      if (http) return http;
     }
-    if (S.lastNetworkFailureAt && now() - S.lastNetworkFailureAt < 20_000) return { id: 'network', kind: 'continue', sourceText: 'transport failure' };
+
+    if (S.lastNetworkFailureAt && now() - S.lastNetworkFailureAt < 20_000 && !transportFailureSuppressed()) {
+      return {
+        id: S.lastNetworkFailureKind === 'timeout' ? 'timeout' : 'network',
+        kind: 'continue',
+        sourceText: S.lastNetworkFailureKind || 'transport failure',
+      };
+    }
     return null;
   }
 
@@ -1582,7 +1637,11 @@
     }
     if (now() < Number(t.nextRecoveryAt || 0)) return false;
     const input = getComposer();
-    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
+    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) {
+      if (!input) S.pendingRecoveryReason = reason;
+      return false;
+    }
+    clearTransientNetworkError();
     const nextCount = Number(t.continueCount || 0) + 1;
     const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, { newLogicalTask: false });
     if (!ok || !S.txn) return false;
@@ -1607,6 +1666,13 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
     if (latestMarker(getMessages())) return false;
 
+    if (!getComposer()) {
+      S.pendingRecoveryReason = reason;
+      S.controlFault = 'composer-missing';
+      paintUI(true);
+      return false;
+    }
+
     const expectedTxnId = t.id;
     if (S.recovery?.txnId === expectedTxnId) return false;
     if (S.actionInFlight) return false;
@@ -1627,7 +1693,8 @@
           const diskTxn = loadTxn(S.route);
           if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
           S.txn = diskTxn;
-          if (!stop.isConnected || disabled(stop) || !visible(stop)) return false;
+          if (!stop.isConnected || disabled(stop) || !controlVisible(stop)) return false;
+          suppressIntentionalStopTransportErrors();
           stop.click();
           log('auto-stop', { reason });
         } finally { S.actionInFlight = false; }
@@ -1653,6 +1720,11 @@
       // Ten-second grace: any genuine recovery wins over our literal continue.
       if (S.recovery !== recovery) return false;
       if (!S.txn || S.txn.id !== expectedTxnId || S.txn.manualStopped) return false;
+      if (!getComposer()) {
+        S.pendingRecoveryReason = reason;
+        S.controlFault = 'composer-missing';
+        return false;
+      }
       const after = getMessages(true);
       if (latestMarker(after)) return false;
       if (isGenerating()) return false;
@@ -2029,9 +2101,12 @@
   }
 
   function cancelRecovery(reason = 'cancelled') {
-    if (!S.recovery) return;
-    log('recovery-cancel', { reason, recoveryReason: S.recovery.reason, phase: S.recovery.phase });
-    S.recovery = null;
+    if (S.recovery) {
+      log('recovery-cancel', { reason, recoveryReason: S.recovery.reason, phase: S.recovery.phase });
+      S.recovery = null;
+    }
+    S.pendingRecoveryReason = '';
+    if (S.controlFault === 'composer-missing') S.controlFault = '';
     paintUI(true);
   }
 
@@ -2282,6 +2357,39 @@
       // this transaction/chat and never freeze unrelated project conversations.
       if (t.manualStopped || t.holdReason) { paintUI(); scheduleWatchdog(); return; }
 
+      // SPA composer remount/disappearance is a real failure class. Give React a
+      // short grace window, then preserve a pending recovery until the composer
+      // comes back instead of spinning, reloading, or losing the logical task.
+      const composerNow = getComposer();
+      if (!composerNow) {
+        S.composerMissingSince ||= now();
+        if (err && !['auth', 'anti-abuse', 'policy'].includes(err.id)) {
+          S.pendingRecoveryReason = `error:${err.id}`;
+        } else if (longThinking) {
+          S.pendingRecoveryReason = 'long-thinking';
+        } else if (now() - S.composerMissingSince >= CFG.composerMissingGraceMs) {
+          S.pendingRecoveryReason ||= 'composer-missing';
+        }
+        if (S.pendingRecoveryReason) S.controlFault = 'composer-missing';
+        paintUI(); scheduleWatchdog(); return;
+      }
+
+      if (S.composerMissingSince) {
+        const missingFor = now() - S.composerMissingSince;
+        S.composerMissingSince = 0;
+        if (missingFor >= CFG.composerMissingGraceMs && !S.pendingRecoveryReason) {
+          S.pendingRecoveryReason = 'composer-remounted';
+        }
+      }
+
+      if (S.pendingRecoveryReason) {
+        const pendingReason = S.pendingRecoveryReason;
+        S.pendingRecoveryReason = '';
+        if (S.controlFault === 'composer-missing') S.controlFault = '';
+        await stopThenContinue(pendingReason);
+        paintUI(); scheduleWatchdog(); return;
+      }
+
       // A visible/recognized error owns recovery before any native continuation.
       if (err) {
         await handleError(err, msgs);
@@ -2429,6 +2537,12 @@
     S.hib = loadHibernation(next);
     S.verify = null;
     S.sendIntent = null;
+    S.recovery = null;
+    S.pendingRecoveryReason = '';
+    S.composerMissingSince = 0;
+    S.controlFault = '';
+    clearTransientNetworkError();
+    S.suppressTransportErrorsUntil = 0;
     DC.longThinkingNode = null;
     DC.messagesDirty = true;
     DC.composer = null; DC.form = null;
@@ -2465,6 +2579,7 @@
           if (tracked) {
             S.lastNetworkAt = now();
             S.lastNetworkFailureAt = 0;
+            S.lastNetworkFailureKind = '';
             S.lastHttpStatus = 0;
             S.lastHttpStatusAt = 0;
             if (validSendIntent()) promoteSendIntent('network');
@@ -2475,6 +2590,7 @@
             if (tracked) {
               S.lastNetworkAt = now();
               S.lastNetworkFailureAt = 0;
+              S.lastNetworkFailureKind = '';
               S.lastHttpStatus = Number(res?.status || 0);
               S.lastHttpStatusAt = now();
               if (S.lastHttpStatus === 429) {
@@ -2485,11 +2601,7 @@
             }
             return res;
           } catch (e) {
-            if (tracked) {
-              S.lastNetworkAt = now();
-              S.lastNetworkFailureAt = now();
-              scheduleEvaluate('fetch-fail', 80);
-            }
+            if (tracked) noteTransportFailure(e?.name === 'AbortError' ? 'abort' : 'fetch');
             throw e;
           }
         };
@@ -2511,22 +2623,34 @@
           if (tracked) {
             S.lastNetworkAt = now();
             S.lastNetworkFailureAt = 0;
+            S.lastNetworkFailureKind = '';
             S.lastHttpStatus = 0;
             S.lastHttpStatusAt = 0;
+            this.__cgr1TransportFailed = false;
             if (validSendIntent()) promoteSendIntent('network');
             if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
+
+            const fail = kind => {
+              this.__cgr1TransportFailed = true;
+              noteTransportFailure(kind);
+            };
+            this.addEventListener('error', () => fail('xhr-error'), { once: true });
+            this.addEventListener('timeout', () => fail('timeout'), { once: true });
+            this.addEventListener('abort', () => fail('abort'), { once: true });
             this.addEventListener('loadend', () => {
               S.lastNetworkAt = now();
-              S.lastNetworkFailureAt = 0;
               S.lastHttpStatus = Number(this.status || 0);
               S.lastHttpStatusAt = now();
+              if (!this.__cgr1TransportFailed && S.lastHttpStatus > 0) {
+                S.lastNetworkFailureAt = 0;
+                S.lastNetworkFailureKind = '';
+              }
               if (S.lastHttpStatus === 429) {
                 const retryMs = parseRetryAfterMs(this.getResponseHeader?.('Retry-After'));
                 if (retryMs) S.rateRetryAt = now() + retryMs;
               }
               scheduleEvaluate('xhr-end', 80);
             }, { once: true });
-            this.addEventListener('error', () => { S.lastNetworkFailureAt = now(); scheduleEvaluate('xhr-fail', 80); }, { once: true });
           }
           return send.apply(this, args);
         };
@@ -2593,6 +2717,7 @@
       if (isStopButtonTarget(e.target)) {
         if (e.isTrusted && !S.actionInFlight && S.txn) {
           cancelRecovery('manual-stop');
+          suppressIntentionalStopTransportErrors();
           S.txn.manualStopped = true;
           saveTxn();
           resetVerification('manual-stop');
@@ -2786,6 +2911,7 @@
     if (S.hib?.phase === 'wait-user') return ['Waiting for you', 'warn'];
     if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
     if (S.txn?.holdReason) return [`Waiting · ${S.txn.holdReason}`, 'warn'];
+    if (S.controlFault === 'composer-missing') return ['Waiting for composer', 'warn'];
     if (S.controlFault === 'send-draft-without-marker') return ['Unfinished · queue draft', 'warn'];
     if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
@@ -2818,7 +2944,7 @@
     ensureUI(); ensureQueueButton(); renderQueueList();
     const root = document.getElementById('cgr-root'); if (!root) return;
     const [text, state] = statusText();
-    const fp = `${text}|${state}|${S.queuePaused}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}|${S.composerControl?.kind || ''}|${S.composerControl?.busyEvidence ? 1 : 0}|${S.recovery?.phase || ''}|${S.controlFault || ''}`;
+    const fp = `${text}|${state}|${S.queuePaused}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}|${S.composerControl?.kind || ''}|${S.composerControl?.busyEvidence ? 1 : 0}|${S.recovery?.phase || ''}|${S.controlFault || ''}|${S.pendingRecoveryReason || ''}`;
     if (!force && fp === DC.uiFingerprint) return;
     DC.uiFingerprint = fp;
     root.dataset.state = state;
@@ -2910,7 +3036,13 @@
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
       ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_5M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
+      ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
+      ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
+      ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
+      ['upstream reset continues', classifyError('upstream connect error or disconnect/reset before headers')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
+      ['HTTP 520 server', classifyHttpStatus(520)?.id, 'server'],
+      ['HTTP 422 recoverable request', classifyHttpStatus(422)?.kind, 'continue'],
       ['rate classified', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
       ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
       ['maximum length ignored', classifyError('This conversation has reached its maximum length')?.kind || null, null],
@@ -2984,7 +3116,15 @@
         verify: S.verify ? { ...S.verify } : null,
         recovery: S.recovery ? { ...S.recovery } : null,
         controlFault: S.controlFault,
+        pendingRecoveryReason: S.pendingRecoveryReason,
+        composerMissingSince: S.composerMissingSince,
         retryVisible: S.error?.id === 'retry-control',
+        transport: {
+          lastFailureAt: S.lastNetworkFailureAt,
+          lastFailureKind: S.lastNetworkFailureKind,
+          suppressedUntil: S.suppressTransportErrorsUntil,
+          lastHttpStatus: S.lastHttpStatus,
+        },
         pausedUntil: S.pausedUntil,
         pausedReason: S.pausedReason,
         blockedReason: S.blockedReason,
