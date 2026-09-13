@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.18
+// @version      1.3.19
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.18
+   * ChatGPT Resilience 1.3.19
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.18';
+  const VERSION = '1.3.19';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1875,13 +1875,20 @@
     );
   }
 
-  function queueUnlockedByDoneMarker() {
-    const msgs = getMessages();
-    return assistantIsCurrentTail(msgs) && latestMarker(msgs) === 'done';
-  }
-
-  function queueBlocked() {
-    return !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error;
+  function queueReleaseBlockReason(msgs = getMessages()) {
+    if (!assistantIsCurrentTail(msgs) || latestMarker(msgs) !== 'done') return 'waiting-for-cgr-done';
+    if (S.error) return `error:${S.error.id || 'unknown'}`;
+    if (S.recovery || S.pendingRecoveryReason || S.controlFault) return 'recovery';
+    if (S.hib) return `hibernate:${S.hib.phase || 'active'}`;
+    if (S.txn) return 'active-task';
+    if (S.generating) return 'generating';
+    if (S.verify) return 'verifying';
+    if (isPaused()) return `paused:${S.pausedReason || 'active'}`;
+    if (S.blockedReason) return `blocked:${S.blockedReason}`;
+    if (S.actionInFlight) return 'action-in-flight';
+    if (S.sendIntent) return 'send-intent';
+    if (!navigator.onLine) return 'offline';
+    return '';
   }
 
   function kickQueue(reason = 'event', delay = 0) {
@@ -1900,16 +1907,11 @@
     if (!verifyTabContext() || S.queueProcessing || !S.enabled || !S.queue.length) return false;
     const pumpRoute = S.route;
 
-    // Queue dispatch has exactly one unlock condition: the current assistant
-    // tail must end in [[CGR_DONE]]. Errors, hibernate, wait-user, recovery,
-    // generation, and ambiguous states never release queued work.
-    if (!queueUnlockedByDoneMarker()) {
-      S.queueHoldReason = 'waiting-for-cgr-done';
-      return false;
-    }
-
-    if (queueBlocked()) {
-      S.queueHoldReason = S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
+    // DONE is necessary but not sufficient. The same canonical gate also
+    // requires every recovery/error/hibernate activity to be fully settled.
+    const initialBlock = queueReleaseBlockReason();
+    if (initialBlock) {
+      S.queueHoldReason = initialBlock;
       return false;
     }
     if (S.lastGenerationEndAt && now() - S.lastGenerationEndAt < CFG.interTurnSettleMs) {
@@ -1936,11 +1938,17 @@
       reconcileQueueClaim('queue-pump');
 
       if (S.route !== pumpRoute) return false;
-      const freshError = currentError(getMessages(true));
-      if (freshError) { S.error = freshError; S.queueHoldReason = `error:${freshError.id}`; return false; }
 
-      if (S.txn || S.hib) {
-        S.queueHoldReason = S.txn ? 'active-task' : S.hib.phase;
+      const freshMsgs = getMessages(true);
+      const freshError = currentError(freshMsgs);
+      if (freshError) S.error = freshError;
+
+      // Re-run the exact same gate after durable state and live DOM refresh.
+      // This closes races where recovery, an error, or hibernation begins while
+      // the pump is staging.
+      const freshBlock = queueReleaseBlockReason(freshMsgs);
+      if (freshBlock) {
+        S.queueHoldReason = freshBlock;
         return false;
       }
 
@@ -3091,8 +3099,11 @@
     }
     if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
     if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
-    if (S.queue.length) return [queueUnlockedByDoneMarker() ? `Queue ${S.queue.length} · ready` : `Queue ${S.queue.length} · waiting for DONE`, 'active'];
-    if (!queueUnlockedByDoneMarker()) return ['Untracked unfinished turn', 'warn'];
+    if (S.queue.length) {
+      const reason = queueReleaseBlockReason();
+      return [reason ? `Queue ${S.queue.length} · ${reason === 'waiting-for-cgr-done' ? 'waiting for DONE' : 'held'}` : `Queue ${S.queue.length} · ready`, 'active'];
+    }
+    if (!assistantIsCurrentTail(getMessages()) || latestMarker(getMessages()) !== 'done') return ['Untracked unfinished turn', 'warn'];
     return ['Healthy', 'ok'];
   }
 
