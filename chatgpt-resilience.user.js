@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.14
+// @version      1.3.15
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.14
+   * ChatGPT Resilience 1.3.15
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.14';
+  const VERSION = '1.3.15';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -81,7 +81,6 @@
     composerMissingGraceMs: 12_000,
     controlMismatchGraceMs: 350,
     noStartControlGraceMs: 2_500,
-    draftBusyGraceMs: 5_000,
     sendConfirmMs: 18_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
@@ -853,17 +852,18 @@
     return { kind: 'idle', label: '', hasDraft, busyEvidence };
   }
 
-  function generationDecision(next, wasGenerating, lastEvidenceAt, at = now()) {
-    // Explicit idle composer controls beat stale streaming attributes.
+  function generationDecision(next, wasGenerating) {
+    // Explicit idle controls are trustworthy only when the human draft is gone.
     if (next.kind === 'voice') return false;
     if (next.kind === 'send' && !next.hasDraft) return false;
 
     const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
     if (strongBusy) return true;
 
-    if (next.kind === 'send' && next.hasDraft && wasGenerating) {
-      return at - Number(lastEvidenceAt || 0) <= CFG.draftBusyGraceMs;
-    }
+    // Typing can hide Stop and expose Send. Never let that human-only UI change
+    // demote a live generation. Clearing/queueing the draft reveals the real state.
+    if (next.kind === 'send' && next.hasDraft && wasGenerating) return true;
+
     return false;
   }
 
@@ -879,7 +879,7 @@
     const explicitIdle = next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft);
     const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence || longThinkingBusy || recentAssistantProgress);
     if (strongBusy) S.lastGenerationEvidenceAt = t;
-    const decision = strongBusy ? true : generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
+    const decision = strongBusy ? true : generationDecision(next, S.generating);
 
     // Typing can replace Stop with Send while the response is still running.
     // generationDecision gives that ambiguous state a bounded grace period.
@@ -1784,6 +1784,69 @@
       return false;
     }
     kickQueue('queued', 40);
+    return item;
+  }
+
+  async function resolveQueuedHumanSendAfterDraftClear(item) {
+    if (!item?.id) return false;
+
+    // Give React a moment to replace the draft-induced Send control with the
+    // actual post-draft control. If any real busy signal appears, leave queued.
+    await sleep(120);
+    if (!verifyTabContext() || !S.queue.some(x => x.id === item.id)) return false;
+
+    for (let i = 0; i < 4; i++) {
+      const control = getComposerControlState();
+      const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
+      const busy = control.kind === 'stop' || control.kind === 'spinner' || control.kind === 'streaming' ||
+        control.busyEvidence || longThinkingBusy;
+
+      if (busy) {
+        S.composerControl = control;
+        S.generating = true;
+        S.lastGenerationEvidenceAt = now();
+        return false;
+      }
+
+      const idle = control.kind === 'voice' ||
+        (control.kind === 'send' && !control.hasDraft) ||
+        (control.kind === 'idle' && !control.busyEvidence);
+
+      if (idle) {
+        // Require idle to survive one more frame-sized check so a transient
+        // composer swap cannot immediately interrupt an answer.
+        await sleep(100);
+        const confirm = getComposerControlState();
+        const confirmBusy = confirm.kind === 'stop' || confirm.kind === 'spinner' || confirm.kind === 'streaming' ||
+          confirm.busyEvidence || (!!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode));
+        const confirmIdle = confirm.kind === 'voice' ||
+          (confirm.kind === 'send' && !confirm.hasDraft) ||
+          (confirm.kind === 'idle' && !confirm.busyEvidence);
+
+        if (confirmBusy) {
+          S.composerControl = confirm;
+          S.generating = true;
+          S.lastGenerationEvidenceAt = now();
+          return false;
+        }
+        if (confirmIdle) {
+          S.composerControl = confirm;
+          S.generating = false;
+          return dispatchQueuedItemNow(item.id);
+        }
+      }
+
+      await sleep(100);
+    }
+
+    // Ambiguous is safe: keep it queued. Never risk interrupting generation.
+    return false;
+  }
+
+  function queueHumanSendFromComposer() {
+    const item = queueCurrentComposer();
+    if (!item) return false;
+    resolveQueuedHumanSendAfterDraftClear(item).catch(err => log('queue-human-resolve-error', { message: String(err?.message || err) }));
     return true;
   }
 
@@ -2909,7 +2972,7 @@
       if (e.isTrusted && shouldQueueHumanSend() && !hasComposerAttachments(input)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        queueCurrentComposer();
+        queueHumanSendFromComposer();
         return;
       }
 
@@ -2949,7 +3012,7 @@
       const isHumanWaitReply = S.hib?.phase === 'wait-user' && !S.txn && !S.generating;
       const isBlockedReply = !!S.blockedReason && !S.generating;
       if (!isHumanWaitReply && !isBlockedReply && shouldQueueEnter()) {
-        e.preventDefault(); e.stopImmediatePropagation(); queueCurrentComposer(); return;
+        e.preventDefault(); e.stopImmediatePropagation(); queueHumanSendFromComposer(); return;
       }
       // Idle Enter remains native, but only records an ephemeral intent. If a
       // slash/autocomplete UI or React swallows the keystroke, nothing durable is
@@ -2975,7 +3038,7 @@
       if (e.isTrusted && !S.actionInFlight && shouldQueueHumanSend() && !hasComposerAttachments(input)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        queueCurrentComposer();
+        queueHumanSendFromComposer();
         return;
       }
 
@@ -3258,13 +3321,12 @@
       ['input guard never demotes cached generation', queueEnterDecision({ generating:true }), true],
       ['Enter ignores unfinished idle tail', queueEnterDecision({ generating:false, tailDone:false }), false],
       ['Enter ignores idle transaction journal', queueEnterDecision({ generating:false, txn:true }), false],
-      ['draft Send keeps recent active generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 8_000, 10_000), true],
-      ['draft Send cannot self-latch forever', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 1_000, 10_000), false],
-      ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false, 9_900, 10_000), false],
-      ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true, 9_900, 10_000), false],
-      ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false, 0, 10_000), true],
-      ['voice beats stale busy evidence', generationDecision({ kind:'voice', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
-      ['empty Send beats stale busy evidence', generationDecision({ kind:'send', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
+      ['draft Send preserves active generation until draft clears', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true), true],
+      ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false), false],
+      ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true), false],
+      ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false), true],
+      ['voice beats stale busy evidence', generationDecision({ kind:'voice', hasDraft:false,busyEvidence:true }, true), false],
+      ['empty Send beats stale busy evidence', generationDecision({ kind:'send',hasDraft:false,busyEvidence:true }, true), false],
       ['post-stop Send is settled even with stale busy attr', postStopControlSettled({ kind:'send', hasDraft:true, busyEvidence:true }), true],
       ['post-stop Voice is settled even with stale busy attr', postStopControlSettled({ kind:'voice', hasDraft:false, busyEvidence:true }), true],
       ['post-stop Stop is not settled', postStopControlSettled({ kind:'stop', hasDraft:false, busyEvidence:false }), false],
