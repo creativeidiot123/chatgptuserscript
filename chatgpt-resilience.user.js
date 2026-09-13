@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.10
+// @version      1.3.11
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.10
+   * ChatGPT Resilience 1.3.11
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.10';
+  const VERSION = '1.3.11';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -81,6 +81,7 @@
     composerMissingGraceMs: 12_000,
     controlMismatchGraceMs: 350,
     noStartControlGraceMs: 2_500,
+    draftBusyGraceMs: 5_000,
     sendConfirmMs: 18_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
@@ -568,6 +569,7 @@
     composerMissingSince: 0,
     rateRetryAt: 0,
     lastGenerationEndAt: 0,
+    lastGenerationEvidenceAt: 0,
     lastAssistantSig: '',
     lastUserSig: '',
     longThinkingSeenAt: 0,
@@ -851,28 +853,30 @@
     return { kind: 'idle', label: '', hasDraft, busyEvidence };
   }
 
+  function generationDecision(next, wasGenerating, lastEvidenceAt, at = now()) {
+    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
+    if (strongBusy) return true;
+    if (next.kind === 'voice') return false;
+    if (next.kind === 'send' && !next.hasDraft) return false;
+    if (next.kind === 'send' && next.hasDraft && wasGenerating) {
+      return at - Number(lastEvidenceAt || 0) <= CFG.draftBusyGraceMs;
+    }
+    return false;
+  }
+
   function isGenerating() {
     const next = getComposerControlState();
     const prev = S.composerControl || {};
-    if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = now();
+    const t = now();
+    if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = t;
     S.composerControl = next;
 
-    if (next.kind === 'stop') return true;
+    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
+    if (strongBusy) S.lastGenerationEvidenceAt = t;
 
-    // Voice is an idle affordance. A stale busy attribute does not get to
-    // overrule it; that contradiction is handled as a recovery signal.
-    if (next.kind === 'voice') return false;
-
-    // A human draft is never evidence that generation ended. ChatGPT normally
-    // exposes Send for the draft while the current response is still running.
-    // Keep the prior busy state latched until independent evidence can clear it.
-    if (next.kind === 'send') {
-      if (!next.hasDraft) return false;
-      return !!(next.busyEvidence || S.generating);
-    }
-
-    if (next.kind === 'spinner' || next.kind === 'streaming') return true;
-    return false;
+    // Typing can replace Stop with Send while the response is still running.
+    // generationDecision gives that ambiguous state a bounded grace period.
+    return generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
   }
 
   function unfinishedControlSignal(t, marker, control = S.composerControl) {
@@ -1055,6 +1059,7 @@
     DC.assistantObserver = new MutationObserver(() => {
       if (!S.projectActive || !isProjectUrl()) return;
       S.lastAssistantProgressAt = now();
+      if (S.generating) S.lastGenerationEvidenceAt = now();
       scheduleEvaluate('assistant-progress', CFG.tailDebounceMs);
     });
     try {
@@ -1785,6 +1790,8 @@
     const item = S.queue.find(x => x.id === id);
     const input = getComposer();
     if (!item || !input || norm(composerText(input))) return false;
+    cancelPendingDraft(S.route);
+    clearDraft(S.route);
     S.queueEditingId = id;
     S.queueEditingOriginalText = item.text;
     setComposerText(input, item.text);
@@ -1795,7 +1802,7 @@
   function cancelQueueEdit() {
     if (!S.queueEditingId) return;
     const input = getComposer();
-    if (input && norm(composerText(input)) === norm(S.queueEditingOriginalText)) clearComposer(input);
+    if (input) clearComposer(input);
     S.queueEditingId = '';
     S.queueEditingOriginalText = '';
     renderQueueList();
@@ -1850,8 +1857,8 @@
     const freshError = currentError(getMessages(true));
     if (freshError) { S.error = freshError; return false; }
 
-    const resumeWait = S.hib?.phase === 'wait-user';
-    if (S.route !== actionRoute || (S.hib && !resumeWait)) return false;
+    const resumeHib = !!S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase);
+    if (S.route !== actionRoute || (S.hib && !resumeHib)) return false;
     const item = S.queue.find(x => x.id === id);
     if (!item) { renderQueueList(); return false; }
 
@@ -1864,7 +1871,7 @@
     const accepted = await dispatchQueuedItem(item, source, !S.txn);
     if (!accepted) return false;
 
-    if (resumeWait && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
+    if (resumeHib && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
     if (hadBlock && S.blockedReason) clearBlock('queue-send-confirmed');
     S.queueHoldReason = '';
     return true;
@@ -2768,6 +2775,13 @@
     document.addEventListener('input', e => {
       if (!S.projectActive || !isProjectUrl()) return;
       if (isComposerTarget(e.target)) {
+        if (S.queueEditingId) {
+          cancelPendingDraft(S.route);
+          clearDraft(S.route);
+          ensureQueueButton();
+          renderQueueList();
+          return;
+        }
         const txt = promptText(composerText(e.target));
         if (norm(txt)) scheduleDraftSave(txt, S.route);
         else {
@@ -2826,7 +2840,8 @@
 
     document.addEventListener('keydown', e => {
       if (!S.projectActive || !isProjectUrl()) return;
-      if (e.isComposing || e.repeat || !isComposerTarget(e.target) || !S.enabled) return;
+      if (e.isComposing || !isComposerTarget(e.target) || !S.enabled) return;
+      if (e.repeat && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.stopImmediatePropagation(); return; }
       if (e.key === 'Escape' && S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); cancelQueueEdit(); return; }
       if (e.key !== 'Enter' || e.shiftKey || e.altKey || e.metaKey) return;
       if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
@@ -2941,7 +2956,7 @@
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (S.queueEditingId !== item.id) {
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
-        send.disabled = (S.hib && S.hib.phase !== 'wait-user') || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
+        send.disabled = S.hib?.phase === 'waking' || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
         send.addEventListener('click', () => dispatchQueuedItemNow(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
@@ -3148,6 +3163,11 @@
       ['Enter queues while generation active', queueEnterDecision({ generating:true }), true],
       ['Enter ignores unfinished idle tail', queueEnterDecision({ generating:false, tailDone:false }), false],
       ['Enter ignores idle transaction journal', queueEnterDecision({ generating:false, txn:true }), false],
+      ['draft Send keeps recent active generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 8_000, 10_000), true],
+      ['draft Send cannot self-latch forever', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 1_000, 10_000), false],
+      ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false, 9_900, 10_000), false],
+      ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true, 9_900, 10_000), false],
+      ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false, 0, 10_000), true],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
