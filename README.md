@@ -35,3 +35,14 @@ See `PROJECT-INSTRUCTIONS.txt`. The project uses these terminal markers:
 - `[[CGR_WAIT_USER]]`
 
 No terminal marker means the logical task is not proven complete.
+
+
+## Project-only scope
+
+The userscript only runs on ChatGPT project routes matching:
+
+```text
+https://chatgpt.com/g/*
+```
+
+It does not run on ordinary chats such as `https://chatgpt.com/c/*`.
