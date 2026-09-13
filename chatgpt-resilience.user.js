@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.2.2
+// @version      1.2.3
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.2.2
+   * ChatGPT Resilience 1.2.3
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.2.2';
+  const VERSION = '1.2.3';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1355,6 +1355,7 @@
     saveTxn();
 
     if (i.resumeHib && S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase)) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
+    reconcileQueueOwnership('send-intent-promote');
     if (i.clearBlocked && S.blockedReason) clearBlock(`human-send:${evidence}`);
     S.sendIntent = null;
     log('send-intent-promote', { evidence, source: i.source, subturn: i.subturn });
@@ -1517,12 +1518,34 @@
     return terminalMarker(msgs.lastAssistantText, turn);
   }
 
+  function firstPendingQueueItem(queue = S.queue) {
+    return Array.isArray(queue) ? (queue.find(x => x?.status === 'pending') || null) : null;
+  }
+
+  function queueOwnerId() {
+    return S.txn?.queueItemId || S.hib?.queueItemId || null;
+  }
+
   function markQueueItemInflight(id) {
     const item = S.queue.find(x => x.id === id);
-    if (!item) return;
+    if (!item) return false;
+    let changed = false;
+    if (item.status !== 'inflight') { item.status = 'inflight'; changed = true; }
+    if (!item.sentAt) { item.sentAt = now(); changed = true; }
+    if (changed) saveQueue();
+    return true;
+  }
+
+  function reconcileQueueOwnership(reason = 'reconcile') {
+    const qid = queueOwnerId();
+    if (!qid) return false;
+    const item = S.queue.find(x => x.id === qid);
+    if (!item || item.status === 'inflight') return false;
     item.status = 'inflight';
-    item.sentAt = now();
+    item.sentAt ||= now();
     saveQueue();
+    log('queue-owner-reconciled', { id: qid, reason });
+    return true;
   }
 
   function completeQueueItem(id, reason = 'done') {
@@ -1624,12 +1647,29 @@
         return false;
       }
 
+      let queueClaim = null;
+      if (options.claimQueueItem) {
+        S.queue = loadQueue(S.route);
+        queueClaim = S.queue.find(x => x.id === options.queueItemId && x.status === 'pending') || null;
+        if (!queueClaim) return false;
+        if (options.expectedQueueHash && queueClaim.hash !== options.expectedQueueHash) return false;
+        if (norm(queueClaim.text) !== norm(p)) return false;
+      }
+
       let t;
       if (options.newLogicalTask) t = armNewTxn(p, source, options.queueItemId || null);
       else if (S.txn) t = beginSubturn(p, source);
       else t = armNewTxn(p, source, options.queueItemId || null);
       if (!t) return false;
       if (options.queueItemId) { t.queueItemId = options.queueItemId; saveTxn(); }
+
+      // Journal first, queue ownership second. A crash can now leave at worst a
+      // journal owning a still-pending item, which reconcileQueueOwnership heals.
+      if (options.claimQueueItem && !markQueueItemInflight(options.queueItemId)) {
+        S.txn = null;
+        store.del(txnKey(S.route));
+        return false;
+      }
 
       t.sendObserved = false;
       t.dispatchAt = now();
@@ -1813,8 +1853,10 @@
   }
 
   function clearPendingQueue() {
+    if (S.queueEditingId) cancelQueueEdit();
     S.queue = S.queue.filter(x => x.status === 'inflight');
     saveQueue();
+    S.queueHoldReason = '';
     renderQueueList();
   }
 
@@ -1917,23 +1959,36 @@
 
   async function steerOrSendQueuedItem(id) {
     cancelRecovery('queue-action');
-    const item = S.queue.find(x => x.id === id && x.status === 'pending');
-    if (!item || S.actionInFlight || S.hib || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
+    if (S.actionInFlight || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
     if (!(await verifyLease())) return false;
 
+    // Lease first, then trust durable state. Never steer/send from a stale tab.
+    const diskTxn = loadTxn(S.route);
+    const diskHib = loadHibernation(S.route);
+    S.txn = diskTxn;
+    S.hib = diskHib;
+    S.queue = loadQueue(S.route);
+    reconcileQueueOwnership('manual-action');
+
+    if (S.hib) return false;
+    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    if (!item) { renderQueueList(); return false; }
+
+    S.generating = isGenerating();
+
     if (S.txn || S.generating) {
-      // A Steer is still a real user subturn and therefore must be journaled.
-      // Only remove the future queue copy after the send was actually dispatched;
-      // the transaction then owns resend/reconciliation if acceptance is ambiguous.
-      if (!S.txn) return false; // orphan generation: do not inject unjournaled work
+      // A Steer is a real subturn. Once the journal owns this exact steer, the
+      // future queue copy must disappear even if the native click later throws.
+      if (!S.txn) return false; // orphan generation: never inject unjournaled work
       const ok = await dispatchPrompt(item.text, 'queue-steer', { newLogicalTask: false });
-      if (ok) {
+      const journalOwnsSteer = S.txn?.source === 'queue-steer' && S.txn?.currentPromptHash === item.hash;
+      if (ok || journalOwnsSteer) {
         removeQueueItem(id, 'steered-into-active-task');
-        log('queue-steer', { id });
+        log('queue-steer', { id, journalOwned: journalOwnsSteer });
       }
-      return ok;
+      return ok || journalOwnsSteer;
     }
 
     if (!tailCommittedForQueue()) {
@@ -1942,14 +1997,22 @@
       return false;
     }
 
-    markQueueItemInflight(id);
-    const ok = await dispatchPrompt(item.text, 'queue-send-now', { newLogicalTask: true, queueItemId: id });
-    if (!ok) {
-      const cur = S.queue.find(x => x.id === id); if (cur) { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
+    // dispatchPrompt claims queue ownership only after its transaction journal
+    // exists, eliminating inflight-without-journal crash windows.
+    const ok = await dispatchPrompt(item.text, 'queue-send-now', {
+      newLogicalTask: true,
+      queueItemId: id,
+      claimQueueItem: true,
+      expectedQueueHash: item.hash,
+    });
+    if (!ok && S.txn?.queueItemId !== id) {
+      S.queue = loadQueue(S.route);
+      const cur = S.queue.find(x => x.id === id);
+      if (cur?.status === 'inflight') { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
+      if (norm(composerText(input)) === norm(item.text)) clearComposer(input);
     }
-    return ok;
+    return ok || S.txn?.queueItemId === id;
   }
-
 
   function tailCommittedForQueue() {
     const msgs = getMessages();
@@ -1984,49 +2047,70 @@
       S.queueHoldReason = 'tail-uncommitted-no-journal';
       return false;
     }
-    if (S.lastGenerationEndAt && now() - S.lastGenerationEndAt < CFG.interTurnSettleMs) return kickQueue('settle', CFG.interTurnSettleMs);
-    const inflight = inflightQueueItem();
-    if (inflight) {
-      S.queueHoldReason = 'inflight-without-journal';
-      maybeNotify(`${APP}: queue held`, 'A queued item is marked in-flight but its transaction journal is missing. It will not be duplicated automatically.');
+    if (S.lastGenerationEndAt && now() - S.lastGenerationEndAt < CFG.interTurnSettleMs) {
+      kickQueue('settle', CFG.interTurnSettleMs);
       return false;
     }
-    const item = S.queue.find(x => x.status === 'pending');
-    if (!item) return false;
+
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
 
     S.queueProcessing = true;
     try {
-      if (!(await verifyLease())) { kickQueue('other-tab-lease', CFG.queueBlockedRetryMs); return false; }
+      if (!(await verifyLease())) {
+        kickQueue('other-tab-lease', CFG.queueBlockedRetryMs);
+        return false;
+      }
+
+      // Durable state after the lease is the only source of dispatch truth.
       const diskTxn = loadTxn(S.route);
       const diskHib = loadHibernation(S.route);
-      if (diskTxn || diskHib) {
-        if (diskTxn) S.txn = diskTxn;
-        if (diskHib) S.hib = diskHib;
-        S.queueHoldReason = diskTxn ? 'active-task-other-tab' : diskHib.phase;
-        return false;
-      }
+      S.txn = diskTxn;
+      S.hib = diskHib;
       S.queue = loadQueue(S.route);
-      const freshItem = S.queue.find(x => x.id === item.id && x.status === 'pending');
-      if (!freshItem) return false;
-      markQueueItemInflight(freshItem.id);
-      const ok = await dispatchPrompt(freshItem.text, 'queue', { newLogicalTask: true, queueItemId: freshItem.id });
-      if (!ok) {
-        // If dispatchPrompt already created the matching journal, that journal now
-        // owns reconciliation. Otherwise put the item back rather than losing it.
-        if (S.txn?.queueItemId !== freshItem.id) {
-          const cur = S.queue.find(x => x.id === freshItem.id);
-          if (cur) { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
-          if (norm(composerText(input)) === norm(freshItem.text)) clearComposer(input);
-          kickQueue('queue-dispatch-not-ready', CFG.queuePumpRetryMs);
-        }
+      reconcileQueueOwnership('queue-pump');
+
+      if (S.txn || S.hib) {
+        S.queueHoldReason = S.txn ? 'active-task-other-tab' : S.hib.phase;
         return false;
       }
+
+      const inflight = inflightQueueItem();
+      if (inflight) {
+        S.queueHoldReason = 'inflight-without-journal';
+        maybeNotify(`${APP}: queue held`, 'A queued item is marked in-flight but its transaction journal is missing. It will not be duplicated automatically.');
+        return false;
+      }
+
+      const freshItem = firstPendingQueueItem(S.queue);
+      if (!freshItem) {
+        S.queueHoldReason = '';
+        renderQueueList();
+        return false;
+      }
+
+      // Another tab may have edited/reordered the queue while this tab waited for
+      // the lease. We intentionally use the freshly reloaded head and fresh text.
+      const ok = await dispatchPrompt(freshItem.text, 'queue', {
+        newLogicalTask: true,
+        queueItemId: freshItem.id,
+        claimQueueItem: true,
+        expectedQueueHash: freshItem.hash,
+      });
+
+      if (!ok && S.txn?.queueItemId !== freshItem.id) {
+        S.queue = loadQueue(S.route);
+        if (norm(composerText(input)) === norm(freshItem.text)) clearComposer(input);
+        kickQueue('queue-dispatch-not-ready', CFG.queuePumpRetryMs);
+        return false;
+      }
+
       S.queueHoldReason = '';
-      return true;
+      return ok || S.txn?.queueItemId === freshItem.id;
     } finally {
       S.queueProcessing = false;
+      renderQueueList();
+      paintUI(true);
     }
   }
 
@@ -2569,6 +2653,7 @@
     S.txn = loadTxn(next);
     S.queue = loadQueue(next);
     S.hib = loadHibernation(next);
+    reconcileQueueOwnership('route-change');
     S.verify = null;
     S.sendIntent = null;
     S.recovery = null;
@@ -2880,6 +2965,7 @@
     if (fp === DC.queueFingerprint && list.childNodes.length) return;
     DC.queueFingerprint = fp;
     list.textContent = '';
+    const nextPendingId = firstPendingQueueItem(S.queue)?.id || '';
     S.queue.forEach((item, index) => {
       const row = document.createElement('div');
       row.className = `cgr-queue-item ${item.status === 'inflight' ? 'is-inflight' : ''} ${S.queueEditingId === item.id ? 'is-editing' : ''}`;
@@ -2892,7 +2978,7 @@
 
       const body = document.createElement('div'); body.className = 'cgr-queue-body';
       const text = document.createElement('div'); text.className = 'cgr-queue-text'; text.textContent = item.text; text.title = item.text; if (item.status === 'pending') text.addEventListener('dblclick', () => beginQueueEdit(item.id));
-      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = item.status === 'inflight' ? 'Active logical task' : S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : index === 0 ? 'Next follow-up' : `Follow-up ${index + 1}`;
+      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = item.status === 'inflight' ? 'Active logical task' : S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : item.id === nextPendingId ? 'Next follow-up' : `Follow-up ${index + 1}`;
       body.append(text, meta); row.appendChild(body);
 
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
@@ -3093,6 +3179,8 @@
       ['retry label exact', RETRY_CONTROL_RE.test('Retry'), true],
       ['try again label exact', RETRY_CONTROL_RE.test('Try again'), true],
       ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
+      ['queue head is first pending', firstPendingQueueItem([{id:'a',status:'inflight'},{id:'b',status:'pending'},{id:'c',status:'pending'}])?.id, 'b'],
+      ['queue head ignores later pending', firstPendingQueueItem([{id:'a',status:'pending'},{id:'b',status:'pending'}])?.id, 'a'],
       ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
@@ -3124,6 +3212,7 @@
     installRootObserver();
     installComposerObserver();
     refreshMessageCache(true);
+    reconcileQueueOwnership('boot');
     restoreDraftIfSafe();
     ensureQueueButton(); renderQueueList();
     scheduleWakeTimer();
