@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.2.4
+// @version      1.2.5
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.2.4
+   * ChatGPT Resilience 1.2.5
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.2.4';
+  const VERSION = '1.2.5';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1962,7 +1962,6 @@
   }
 
   async function steerOrSendQueuedItem(id) {
-    cancelRecovery('queue-action');
     const actionRoute = S.route;
     if (S.actionInFlight || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
     const input = getComposer();
@@ -1983,6 +1982,7 @@
     const item = S.queue.find(x => x.id === id && x.status === 'pending');
     if (!item) { renderQueueList(); return false; }
 
+    cancelRecovery('queue-action');
     S.generating = isGenerating();
 
     if (S.txn || S.generating) {
@@ -2027,7 +2027,7 @@
     const msgs = getMessages();
     if (!msgs.lastUser && !msgs.lastAssistant) return true;
     if (!assistantIsCurrentTail(msgs)) return false;
-    return !!latestMarker(msgs);
+    return latestMarker(msgs) === 'done';
   }
 
   function queueBlocked() {
@@ -2257,6 +2257,42 @@
     return stopThenContinue(v.reason);
   }
 
+  function orphanMarkerQueueItemId(msgs) {
+    const item = inflightQueueItem();
+    if (!item || !msgs?.lastUserText) return null;
+    return fnv1a(norm(msgs.lastUserText)) === item.hash ? item.id : null;
+  }
+
+  function reconcileOrphanTerminalMarker(marker, msgs) {
+    if (S.txn || !marker) return false;
+    const qid = orphanMarkerQueueItemId(msgs);
+
+    if (marker === 'hibernate') {
+      if (!S.hib) {
+        armHibernation(qid);
+        log('orphan-marker-reconcile', { marker, queueItem: !!qid });
+      }
+      return true;
+    }
+
+    if (marker === 'wait-user') {
+      if (!S.hib || S.hib.phase !== 'wait-user') {
+        setWaitUser(qid);
+        log('orphan-marker-reconcile', { marker, queueItem: !!qid });
+      }
+      return true;
+    }
+
+    if (marker === 'done' && qid) {
+      completeQueueItem(qid, 'orphan-done-marker');
+      S.lastGenerationEndAt = now();
+      log('orphan-marker-reconcile', { marker, queueItem: true });
+      return true;
+    }
+
+    return false;
+  }
+
   async function completeLogicalTask(marker, msgs) {
     const t = S.txn;
     if (!t) return false;
@@ -2460,6 +2496,15 @@
     if (!navigator.onLine) { paintUI(); return; }
     if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
     if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
+
+    // Rendered protocol is durable evidence too. If the journal disappeared
+    // across reload/update, reconstruct sleep/wait ownership before any queue
+    // item can advance.
+    if (!S.txn && marker && reconcileOrphanTerminalMarker(marker, msgs)) {
+      paintUI(true);
+      scheduleWatchdog();
+      return;
+    }
 
     // A failed UI can outlive the journal after reload/navigation/script install.
     // Recoverable Retry/error states may adopt only the current visible tail.
@@ -3210,6 +3255,8 @@
       ['queue head is first pending', firstPendingQueueItem([{id:'a',status:'inflight'},{id:'b',status:'pending'},{id:'c',status:'pending'}])?.id, 'b'],
       ['queue head ignores later pending', firstPendingQueueItem([{id:'a',status:'pending'},{id:'b',status:'pending'}])?.id, 'a'],
       ['queue owner prefers txn', (() => { const oldT=S.txn, oldH=S.hib; S.txn={queueItemId:'txn-q'}; S.hib={queueItemId:'hib-q'}; const got=queueOwnerId(); S.txn=oldT; S.hib=oldH; return got; })(), 'txn-q'],
+      ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_5M]]') === 'done', false],
+      ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
