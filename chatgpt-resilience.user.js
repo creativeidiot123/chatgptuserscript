@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.0.9
+// @version      1.1.0
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.0.9
+   * ChatGPT Resilience 1.1.0
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -35,13 +35,13 @@
    *   [[CGR_WAIT_USER]]            suspend the logical task for human input
    *
    * Recovery policy:
-   *   - Native Continue generating is preferred when ChatGPT exposes it.
    *   - A confirmed unfinished turn with no text/control progress for 5 minutes
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
    *   - Send/Voice appearing after turn work without a terminal marker is an immediate incomplete-turn signal
    *   - Retry/Try again/Regenerate controls are failure signals only; they are never clicked
+   *   - There is one continuation path: Stop if needed -> 10s grace -> literal "continue"
    *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.0.9';
+  const VERSION = '1.1.0';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -75,6 +75,7 @@
     hiddenWatchdogMs: 30_000,
     structureDebounceMs: 250,
     tailDebounceMs: 300,
+    draftWriteDebounceMs: 600,
     answerSettleMs: 1_200,
     incompleteVerifyMs: 5 * 60_000,
     recoveryPauseMs: 10_000,
@@ -87,12 +88,6 @@
     queuePumpRetryMs: 750,
     queueBlockedRetryMs: 2_000,
     queueStageReadyMs: 3_000,
-    longThinkingMinVisibleMs: 30_000,
-    longThinkingPartialStallMs: 90_000,
-    longThinkingNoOutputStallMs: 180_000,
-    genericPartialStallMs: 180_000,
-    genericNoOutputStallMs: 300_000,
-    noStopReloadStallMs: 300_000,
     stopSettleTimeoutMs: 12_000,
     maxContinuesPerLogicalTask: 8,
     maxResendAttempts: 1,
@@ -105,7 +100,6 @@
     leaseMs: 20_000,
     leaseVerifyMs: 50,
     logLimit: 160,
-    retryBackoffMs: [2_000, 5_000, 15_000, 30_000, 60_000, 120_000],
   });
 
   const SELECTORS = Object.freeze({
@@ -158,8 +152,6 @@
       '[data-testid*="error" i]',
     ],
   });
-
-  const CONTINUE_LABELS = new Set(['continue generating', 'continue response']);
 
 
   const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something went wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
@@ -277,6 +269,16 @@
     } catch (_) { return true; }
   }
 
+  function controlVisible(el) {
+    if (!visible(el)) return false;
+    try {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || 1) <= 0.02) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (_) { return visible(el); }
+  }
+
   function disabled(el) {
     return !el || !!el.disabled || el.getAttribute?.('aria-disabled') === 'true';
   }
@@ -357,7 +359,7 @@
       for (const [token, marker] of tokens) {
         const exact = nodes.find(el => {
           if (!visible(el)) return false;
-          if (el.closest?.('pre,code,blockquote')) return false;
+          if (el.closest?.('pre,code,blockquote') || el.querySelector?.('pre,code,blockquote')) return false;
           const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
           return value === token;
         });
@@ -454,12 +456,45 @@
   const hibKey = scope => `github:${scope}`;
   const draftKey = scope => `draft:${scope}`;
 
+  const draftWrite = { timer: null, scope: '', text: '' };
+
   function getDraft(scope = routeKey()) { return String(store.get(draftKey(scope), '') || ''); }
+
+  function cancelPendingDraft(scope = null) {
+    if (scope && draftWrite.scope && draftWrite.scope !== scope) return;
+    if (draftWrite.timer) clearTimeout(draftWrite.timer);
+    draftWrite.timer = null;
+    draftWrite.scope = '';
+    draftWrite.text = '';
+  }
+
+  function flushDraftSave() {
+    if (!draftWrite.scope) return;
+    const scope = draftWrite.scope;
+    const value = draftWrite.text;
+    cancelPendingDraft();
+    if (norm(value)) store.set(draftKey(scope), value);
+    else store.del(draftKey(scope));
+  }
+
+  function scheduleDraftSave(text, scope = routeKey()) {
+    const value = promptText(text);
+    if (draftWrite.timer) clearTimeout(draftWrite.timer);
+    draftWrite.scope = scope;
+    draftWrite.text = value;
+    draftWrite.timer = setTimeout(flushDraftSave, CFG.draftWriteDebounceMs);
+  }
+
   function setDraft(text, scope = routeKey()) {
+    cancelPendingDraft(scope);
     const value = promptText(text);
     if (norm(value)) store.set(draftKey(scope), value); else store.del(draftKey(scope));
   }
-  function clearDraft(scope = routeKey()) { store.del(draftKey(scope)); }
+
+  function clearDraft(scope = routeKey()) {
+    cancelPendingDraft(scope);
+    store.del(draftKey(scope));
+  }
 
 
   function loadTxn(scope = routeKey()) {
@@ -733,6 +768,36 @@
     };
   }
 
+  function assistantIsCurrentTail(msgs = getMessages()) {
+    if (!msgs.lastAssistant) return false;
+    if (!msgs.lastUser) return true;
+    try {
+      return !!(msgs.lastUser.compareDocumentPosition(msgs.lastAssistant) & Node.DOCUMENT_POSITION_FOLLOWING);
+    } catch (_) { return false; }
+  }
+
+  function tailTurnRoot() {
+    return DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || DC.lastAssistant || null;
+  }
+
+  function isTailRelevantElement(el) {
+    if (!el?.isConnected) return false;
+    const assistant = DC.lastAssistant;
+    if (!assistant?.isConnected) return true;
+    const turn = tailTurnRoot();
+    if (turn?.contains?.(el) || assistant.contains?.(el)) return true;
+
+    const ownTurn = el.closest?.('[data-testid^="conversation-turn"],article');
+    if (ownTurn && turn && ownTurn !== turn) return false;
+
+    try {
+      if (!(assistant.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+      const form = composerForm(getComposer());
+      if (form && !(el.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+      return true;
+    } catch (_) { return false; }
+  }
+
   function findSafeSendButton(input = getComposer()) {
     const form = composerForm(input);
     const roots = form ? [form] : [document];
@@ -740,7 +805,7 @@
       for (const sel of SELECTORS.send) {
         try {
           for (const b of root.querySelectorAll(sel)) {
-            if (!visible(b) || disabled(b)) continue;
+            if (!controlVisible(b) || disabled(b)) continue;
             const label = lower(`${b.id || ''} ${b.getAttribute?.('aria-label') || ''} ${b.getAttribute?.('data-testid') || ''}`);
             if (/stop|voice|mic|attach|upload|model|tool|retry|regenerat/.test(label)) continue;
             return b;
@@ -753,8 +818,16 @@
 
   function findStopButton() {
     const form = composerForm(getComposer());
-    const local = form ? qFirst(SELECTORS.stop, form) : null;
-    return local || qFirst(SELECTORS.stop);
+    const roots = form ? [form, document] : [document];
+    for (const root of roots) {
+      for (const sel of SELECTORS.stop) {
+        try {
+          const hit = Array.from(root.querySelectorAll(sel)).find(el => controlVisible(el) && !disabled(el));
+          if (hit) return hit;
+        } catch (_) {}
+      }
+    }
+    return null;
   }
 
   function findVoiceButton(input = getComposer()) {
@@ -763,7 +836,7 @@
     for (const root of roots) {
       for (const sel of SELECTORS.voice) {
         try {
-          const hit = Array.from(root.querySelectorAll(sel)).find(el => visible(el) && !disabled(el));
+          const hit = Array.from(root.querySelectorAll(sel)).find(el => controlVisible(el) && !disabled(el));
           if (hit) return hit;
         } catch (_) {}
       }
@@ -790,46 +863,27 @@
   }
 
   function findRetryButton() {
-    const roots = [];
-    const turn = DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || null;
-    if (turn) roots.push(turn);
-    const main = document.querySelector('main');
-    if (main && !roots.includes(main)) roots.push(main);
+    const turn = tailTurnRoot();
+    if (!turn) return null;
 
-    for (const root of roots) {
-      for (const sel of SELECTORS.retry) {
-        try {
-          const hit = Array.from(root.querySelectorAll(sel)).find(el => visible(el) && !disabled(el));
-          if (hit) return hit;
-        } catch (_) {}
-      }
+    for (const sel of SELECTORS.retry) {
       try {
-        const hit = Array.from(root.querySelectorAll('button')).find(el => visible(el) && !disabled(el) && retryControlLabel(el));
+        const hit = Array.from(turn.querySelectorAll(sel)).find(el => controlVisible(el) && !disabled(el));
         if (hit) return hit;
       } catch (_) {}
     }
+
+    const main = document.querySelector('main');
+    if (!main) return null;
+    try {
+      const buttons = Array.from(main.querySelectorAll('button'));
+      for (let i = buttons.length - 1, seen = 0; i >= 0 && seen < 40; i--, seen++) {
+        const el = buttons[i];
+        if (!isTailRelevantElement(el) || !controlVisible(el) || disabled(el)) continue;
+        if (retryControlLabel(el)) return el;
+      }
+    } catch (_) {}
     return null;
-  }
-
-  function isContinueButton(btn) {
-    if (!btn || !visible(btn) || disabled(btn)) return false;
-    const labels = [
-      btn.getAttribute?.('aria-label'),
-      btn.textContent,
-      btn.getAttribute?.('title'),
-      btn.getAttribute?.('data-testid'),
-    ].map(v => lower(v || '')).filter(Boolean);
-    return labels.some(label => CONTINUE_LABELS.has(label) || /^continue (?:generating|response)(?:\b|$)/i.test(label));
-  }
-
-  function findContinueButton() {
-    const turn = DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || null;
-    if (turn) {
-      const local = Array.from(turn.querySelectorAll?.('button') || []).filter(isContinueButton);
-      if (local.length) return local.at(-1);
-    }
-    const global = Array.from(document.querySelectorAll?.('button') || []).filter(isContinueButton);
-    return global.at(-1) || null;
   }
 
   function findComposerSpinner(input = getComposer()) {
@@ -971,16 +1025,16 @@
 
   function collectErrorText(msgs = getMessages()) {
     const chunks = [];
-    // Do not classify an ordinary answer merely because it discusses timeouts or
-    // network errors. Assistant text is trusted only when its tail has the shape
-    // of ChatGPT's own product-error boilerplate.
     const tail = msgs.lastAssistantText.slice(-1400);
-    if (!S.generating && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
-    for (const el of qAll(SELECTORS.alerts).filter(visible).slice(-6)) {
+    if (tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
+
+    const root = document.querySelector('main') || document;
+    const alerts = qAll(SELECTORS.alerts, root).slice(-16);
+    for (const el of alerts) {
+      if (!controlVisible(el) || !isTailRelevantElement(el)) continue;
       if (el.closest?.('[data-message-author-role="user"]')) continue;
       const t = norm(el.textContent || '');
-      if (!t || t.length >= 4000) continue;
-      if (MAX_LENGTH_UI_RE.test(t)) continue;
+      if (!t || t.length >= 4000 || MAX_LENGTH_UI_RE.test(t)) continue;
       chunks.push(t);
     }
     return chunks.join('\n').slice(-10_000);
@@ -1045,15 +1099,27 @@
   }
 
   function captureLongThinkingFromNode(node) {
-    if (!node || node.nodeType !== 1) return;
+    if (!node || node.nodeType !== 1) return false;
     const el = node;
-    if (el.closest?.('[data-message-author-role]')) return;
-    const text = norm(el.textContent || '');
-    if (text && text.length < 1200 && LONG_THINKING_RE.test(text)) {
-      DC.longThinkingNode = el;
-      S.longThinkingSeenAt ||= now();
-      S.longThinkingLastSeenAt = now();
+    if (el.closest?.('[data-message-author-role]')) return false;
+
+    const candidates = [];
+    if (el.matches?.('[role="status"],[aria-live]') || (el.childElementCount || 0) <= 12) candidates.push(el);
+    try {
+      const nested = el.querySelectorAll?.('[role="status"],[aria-live]') || [];
+      for (let i = Math.max(0, nested.length - 8); i < nested.length; i++) candidates.push(nested[i]);
+    } catch (_) {}
+
+    for (const candidate of candidates) {
+      const text = norm(candidate.textContent || '');
+      if (text && text.length < 1200 && LONG_THINKING_RE.test(text)) {
+        DC.longThinkingNode = candidate;
+        S.longThinkingSeenAt ||= now();
+        S.longThinkingLastSeenAt = now();
+        return true;
+      }
     }
+    return false;
   }
 
   function installRootObserver() {
@@ -1071,15 +1137,14 @@
         if (DC.lastAssistant && (rec.target === DC.lastAssistant || DC.lastAssistant.contains?.(rec.target))) continue;
         // Some status banners keep the same wrapper and only replace a text
         // child. Inspect that small mutation target as well as newly added nodes.
-        if (rec.target?.nodeType === 1) captureLongThinkingFromNode(rec.target);
+        if (rec.target?.nodeType === 1 && captureLongThinkingFromNode(rec.target)) statusChanged = true;
         for (const node of rec.addedNodes || []) {
-          captureLongThinkingFromNode(node);
+          if (captureLongThinkingFromNode(node)) statusChanged = true;
           if (node.nodeType !== 1) continue;
           const el = node;
           if (el.matches?.('[data-message-author-role]') || el.querySelector?.('[data-message-author-role]')) structureChanged = true;
           if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
-          const txt = norm(el.textContent || '');
-          if (txt.length < 1200 && LONG_THINKING_RE.test(txt)) statusChanged = true;
+          if (el.matches?.('[role="alert"],[data-testid*="error" i],button') || el.querySelector?.('[role="alert"],[data-testid*="error" i],button')) statusChanged = true;
         }
         for (const node of rec.removedNodes || []) {
           if (node.nodeType !== 1) continue;
@@ -1162,6 +1227,7 @@
   // never actually submitted. The intent is promoted on submit, matching POST,
   // or matching user-turn DOM evidence.
   function setSendIntent(prompt, source, options = {}) {
+    flushDraftSave();
     const p = promptText(prompt);
     if (!norm(p)) return null;
     const msgs = getMessages(true);
@@ -1251,6 +1317,7 @@
       reconciledAt: 0,
       nextRecoveryAt: 0,
       manualStopped: false,
+      holdReason: '',
     };
   }
 
@@ -1317,6 +1384,7 @@
     t.generationObserved = false;
     t.assistantObserved = false;
     t.manualStopped = false;
+    t.holdReason = '';
     t.nextRecoveryAt = 0;
     setDraft(p, S.route);
     saveTxn();
@@ -1492,31 +1560,6 @@
     }
   }
 
-  async function clickNativeContinue() {
-    const btn = findContinueButton();
-    if (!btn || S.actionInFlight || S.generating || isPaused()) return false;
-    const expectedTxnId = S.txn?.id || null;
-    S.actionInFlight = true;
-    try {
-      if (!(await verifyLease())) return false;
-      if (expectedTxnId) {
-        const diskTxn = loadTxn(S.route);
-        if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
-        S.txn = diskTxn;
-      }
-      if (!btn.isConnected || disabled(btn) || !visible(btn)) return false;
-      btn.click();
-      if (S.txn) {
-        S.txn.generationObserved = true;
-        S.txn.nextRecoveryAt = now() + 3_000;
-        saveTxn();
-      }
-      S.verify = null;
-      log('native-continue', {});
-      scheduleEvaluate('native-continue', 250);
-      return true;
-    } finally { S.actionInFlight = false; }
-  }
 
   async function sendLiteralContinue(reason = 'incomplete') {
     const t = S.txn;
@@ -1806,7 +1849,7 @@
   }
 
   function queueBlocked() {
-    return S.queuePaused || !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error || !!findRetryButton() || !!findContinueButton();
+    return S.queuePaused || !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error;
   }
 
   function kickQueue(reason = 'event', delay = 0) {
@@ -1996,7 +2039,6 @@
     const t = S.txn;
     if (!v || !t || S.generating || t.manualStopped) return false;
     if (signature(msgs.lastAssistantText) !== v.sig) { resetVerification('assistant-changed'); return false; }
-    if (!findRetryButton() && findContinueButton()) { resetVerification('native-continue'); return clickNativeContinue(); }
     if (now() < Number(t.nextRecoveryAt || 0)) return false;
     if (now() - logicalQuietSince() < CFG.incompleteVerifyMs) return false;
     if (now() - v.since < CFG.incompleteVerifyMs) return false;
@@ -2056,8 +2098,11 @@
     if ((t.sendAttempted || t.sendObserved) && t.reconciledAt && now() - t.reconciledAt < CFG.postReloadReconcileMs) return false;
 
     if (Number(t.resendCount || 0) >= CFG.maxResendAttempts) {
-      pauseUntil(now() + 10 * 60_000, 'send-unconfirmed');
-      maybeNotify(`${APP}: send needs attention`, 'The last message could not be confirmed after reconciliation. It was not duplicated automatically.');
+      if (t.holdReason !== 'send-unconfirmed') {
+        t.holdReason = 'send-unconfirmed';
+        saveTxn();
+        maybeNotify(`${APP}: send needs attention`, 'The last message could not be confirmed after reconciliation. This chat is held without affecting other project chats.');
+      }
       return false;
     }
 
@@ -2196,7 +2241,7 @@
 
     // A failed UI can outlive the journal after reload/navigation/script install.
     // Recoverable Retry/error states may adopt only the current visible tail.
-    if (!S.txn && err && !['hard', 'rate', 'reload'].includes(err.kind || '')) {
+    if (!S.txn && err && !['auth', 'anti-abuse', 'policy'].includes(err.id)) {
       const adopted = adoptUntrackedTurn(msgs, `error-adopt:${err.id}`);
       if (adopted) {
         await handleError(err, msgs);
@@ -2219,8 +2264,9 @@
         return;
       }
 
-      // Manual Stop is sacred. Do not immediately undo the user's action.
-      if (t.manualStopped) { paintUI(); scheduleWatchdog(); return; }
+      // Manual Stop and reconciliation holds are sacred. They belong only to
+      // this transaction/chat and never freeze unrelated project conversations.
+      if (t.manualStopped || t.holdReason) { paintUI(); scheduleWatchdog(); return; }
 
       // A visible/recognized error owns recovery before any native continuation.
       if (err) {
@@ -2253,13 +2299,6 @@
         paintUI(); scheduleWatchdog(); return;
       }
 
-      // Native continuation is a fallback only when the composer has not already
-      // given us the stronger Send/Voice ended-without-marker signal.
-      if (!S.generating && !findRetryButton() && findContinueButton()) {
-        await clickNativeContinue();
-        paintUI(); scheduleWatchdog(); return;
-      }
-
       S.controlFault = '';
 
       if (await maybeRecoverStall(msgs, longThinking)) {
@@ -2276,6 +2315,21 @@
         armVerification(msgs, 'missing-terminal-marker');
         await maybeFinishVerification(msgs, err);
         paintUI(); scheduleWatchdog(); return;
+      }
+    }
+
+    // A journal can be missing after installation/reload while the rendered tail
+    // remains unfinished. The same five-minute no-progress rule may adopt that
+    // current tail, but never an active hibernation or a safety-blocked response.
+    if (!S.txn && !S.hib && !marker && assistantIsCurrentTail(msgs) && msgs.lastUserText &&
+        !['auth', 'anti-abuse', 'policy'].includes(err?.id || '') &&
+        now() - S.lastAssistantProgressAt >= CFG.incompleteVerifyMs) {
+      const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-5m');
+      if (adopted) {
+        await stopThenContinue('untracked-stuck-5m');
+        paintUI(true);
+        scheduleWatchdog();
+        return;
       }
     }
 
@@ -2298,15 +2352,26 @@
     }
 
     // No active journal. Hibernation has priority over ordinary queued work.
-    if (S.hib?.phase === 'sleeping' && now() >= Number(S.hib.wakeAt || 0)) await attemptGithubWake('due');    if (!S.txn && !S.hib && S.queue.length) await processQueue();
+    if (S.hib?.phase === 'sleeping' && now() >= Number(S.hib.wakeAt || 0)) await attemptGithubWake('due');
+    if (!S.txn && !S.hib && S.queue.length) await processQueue();
     paintUI();
     scheduleWatchdog();
   }
 
   // ---------- route migration ---------------------------------------------------------
-  function migrateScope(oldScope, newScope) {
+  function projectKeyFromUrl(href = location.href) {
+    try {
+      const u = new URL(href, location.origin);
+      const m = u.pathname.match(/^\/g\/([^/?#]+)/);
+      return m ? m[1] : '';
+    } catch (_) { return ''; }
+  }
+
+  function migrateScope(oldScope, newScope, oldHref, newHref) {
     if (!oldScope || !newScope || oldScope === newScope) return;
-    if (oldScope.startsWith('p:') && newScope.startsWith('c:')) {
+    const oldProject = projectKeyFromUrl(oldHref);
+    const sameProject = !!oldProject && oldProject === projectKeyFromUrl(newHref);
+    if (sameProject && oldScope.startsWith('p:') && newScope.startsWith('c:')) {
       const oldTxn = store.json(txnKey(oldScope), null);
       if (oldTxn) { oldTxn.route = newScope; store.setJson(txnKey(newScope), oldTxn); store.del(txnKey(oldScope)); }
       const oldQueue = store.json(queueKey(oldScope), []);
@@ -2328,9 +2393,16 @@
   function detectRouteChange() {
     if (location.href === S.href) return false;
     const old = S.route;
-    S.href = location.href;
-    const next = routeKey();
-    migrateScope(old, next);
+    const oldHref = S.href;
+    const nextHref = location.href;
+    const next = routeKey(nextHref);
+    S.href = nextHref;
+
+    // Query/hash churn inside one conversation is not a state transition.
+    if (next === old) return false;
+
+    flushDraftSave();
+    migrateScope(old, next, oldHref, nextHref);
     S.route = next;
     // Auth / anti-abuse are account-level. Other blockers belong to the old
     // conversation and must not poison a different project chat.
@@ -2481,23 +2553,17 @@
   }
 
   function shouldQueueEnter() {
-    return !!S.txn || S.generating || !!S.hib || S.queue.length > 0 || S.queuePaused || isPaused() || !!S.error || S.actionInFlight;
-  }
-
-  function takeHibernationQueueItemForHuman() {
-    if (!S.hib || !['sleeping', 'wait-user'].includes(S.hib.phase)) return null;
-    const qid = S.hib.queueItemId || null;
-    clearHibernation('human-resume', { suppressQueueKick: true });
-    return qid;
+    return !!S.txn || S.generating || !!S.hib || S.queue.length > 0 || S.queuePaused ||
+      isPaused() || !!S.error || S.actionInFlight || !tailCommittedForQueue();
   }
 
   function installInputHooks() {
     document.addEventListener('input', e => {
       if (isComposerTarget(e.target)) {
         const txt = promptText(composerText(e.target));
-        if (norm(txt)) setDraft(txt, S.route);
+        if (norm(txt)) scheduleDraftSave(txt, S.route);
         else {
-          clearDraft(S.route);
+          if (!validSendIntent()) clearDraft(S.route);
           kickQueue('composer-cleared', 80);
           if (S.txn || S.controlFault) scheduleEvaluate('composer-cleared-recovery', 50);
         }
@@ -2704,12 +2770,13 @@
     if (S.hib?.phase === 'waking') return ['Checking GitHub', 'active'];
     if (S.hib?.phase === 'wait-user') return ['Waiting for you', 'warn'];
     if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
+    if (S.txn?.holdReason) return [`Waiting · ${S.txn.holdReason}`, 'warn'];
     if (S.controlFault === 'send-draft-without-marker') return ['Unfinished · queue draft', 'warn'];
     if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
     if (S.verify) return [`Verifying ${Math.max(0, Math.ceil((CFG.incompleteVerifyMs - (now() - S.verify.since)) / 1000))}s`, 'warn'];
-    if (findRetryButton()) return ['Retry detected', 'warn'];
+    if (S.error?.id === 'retry-control') return ['Retry detected', 'warn'];
     if (S.error) return [S.error.id, S.error.kind === 'hard' ? 'error' : 'warn'];
     if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
     if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
@@ -2842,6 +2909,7 @@
       ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
+      ['project key stable', projectKeyFromUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), 'g-p-project'],
       ['voice after work means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-without-marker'],
       ['voice no-start after grace means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: false, generationObserved: false, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-no-start'],
       ['send+busy+draft is valid steer UI', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'send', hasDraft: true, busyEvidence: true }), ''],
@@ -2878,7 +2946,7 @@
     window.addEventListener('offline', () => paintUI(true));
     window.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleEvaluate('visible', 100); scheduleWatchdog(); });
     window.addEventListener('focus', () => scheduleEvaluate('focus', 100));
-    window.addEventListener('beforeunload', releaseLease);
+    window.addEventListener('beforeunload', () => { flushDraftSave(); releaseLease(); });
   }
 
   try {
@@ -2901,7 +2969,7 @@
         verify: S.verify ? { ...S.verify } : null,
         recovery: S.recovery ? { ...S.recovery } : null,
         controlFault: S.controlFault,
-        retryVisible: !!findRetryButton(),
+        retryVisible: S.error?.id === 'retry-control',
         pausedUntil: S.pausedUntil,
         pausedReason: S.pausedReason,
         blockedReason: S.blockedReason,
