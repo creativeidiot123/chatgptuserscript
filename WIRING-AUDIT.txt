@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.12 — wiring / edge-case audit
+ChatGPT Resilience v1.3.15 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -62,6 +62,19 @@ Queue editing
 
 Input edge cases
 ----------------
+- Human typing can replace ChatGPT's Stop control with the user's Send control.
+  While a draft exists, that UI change is NEVER allowed to demote an already
+  active generation.
+- Enter, native Send click, and form submit share one fail-safe guard. If the
+  evaluator already says generating, the input path must queue.
+- When an intercepted human Send is queued, the composer is cleared first so
+  ChatGPT's real control is visible again. The script then re-checks:
+    busy -> leave queued
+    stable idle -> immediately dispatch that queued item
+- The idle re-check requires two stable observations and preserves FIFO; a newly
+  queued message cannot jump older queued work.
+- This means an ambiguous state fails safe toward queueing instead of risking
+  interruption of a live answer.
 - Held/repeated Enter is swallowed so repeated keydown events cannot bypass the
   queue interceptor.
 - Shift+Enter remains available for multiline input.
@@ -118,7 +131,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.12
+- Userscript version: 1.3.15
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
