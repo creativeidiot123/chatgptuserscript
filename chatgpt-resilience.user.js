@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.9
+// @version      1.3.10
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.9
+   * ChatGPT Resilience 1.3.10
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.9';
+  const VERSION = '1.3.10';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -833,9 +833,8 @@
     const hasDraft = !!norm(composerText(input));
     const busyEvidence = hasAssistantBusyEvidence();
 
-    // Primary composer affordance is authoritative. This prevents a stale
-    // aria/data streaming flag elsewhere in the turn from masking that ChatGPT
-    // has already switched back to Send/Voice.
+    // The composer affordance is only one signal. Typing a human follow-up can
+    // legitimately replace Stop with Send while the assistant is still working.
     const stop = findStopButton();
     if (stop && !disabled(stop)) return { kind: 'stop', label: exactButtonLabel(stop), hasDraft, busyEvidence };
 
@@ -864,10 +863,13 @@
     // overrule it; that contradiction is handled as a recovery signal.
     if (next.kind === 'voice') return false;
 
-    // On web Chat, typing a follow-up during a stream can legitimately expose
-    // Send. Only retain "generating" when there is both a draft and structural
-    // assistant-busy evidence.
-    if (next.kind === 'send') return !!(next.hasDraft && next.busyEvidence);
+    // A human draft is never evidence that generation ended. ChatGPT normally
+    // exposes Send for the draft while the current response is still running.
+    // Keep the prior busy state latched until independent evidence can clear it.
+    if (next.kind === 'send') {
+      if (!next.hasDraft) return false;
+      return !!(next.busyEvidence || S.generating);
+    }
 
     if (next.kind === 'spinner' || next.kind === 'streaming') return true;
     return false;
@@ -890,10 +892,9 @@
     }
 
     if (c.kind === 'send') {
-      // ChatGPT web can legitimately expose Send while a live response is
-      // streaming if the user has typed a follow-up. Never destroy that draft.
-      if (c.hasDraft && c.busyEvidence) return '';
-      if (c.hasDraft) return 'send-draft-without-marker';
+      // A human draft changes the composer to Send during normal generation.
+      // It cannot prove that the assistant stopped, so never fault on it.
+      if (c.hasDraft) return '';
       if (!worked) return 'send-no-start';
       return c.busyEvidence ? 'send-while-busy' : 'send-without-marker';
     }
@@ -2399,11 +2400,6 @@
       const controlSignal = unfinishedControlSignal(t, marker);
       S.controlFault = controlSignal || '';
       if (controlSignal) {
-        if (controlSignal === 'send-draft-without-marker') {
-          // The turn is unfinished, but the composer contains human text.
-          // Preserve it. Enter/Queue will clear it, then recovery can proceed.
-          paintUI(); scheduleWatchdog(); return;
-        }
         if (now() - S.lastControlChangeAt >= CFG.controlMismatchGraceMs) {
           await stopThenContinue(`control:${controlSignal}`);
         } else {
@@ -2994,7 +2990,6 @@
     if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
     if (S.txn?.holdReason) return [`Waiting · ${S.txn.holdReason}`, 'warn'];
     if (S.controlFault === 'composer-missing') return ['Waiting for composer', 'warn'];
-    if (S.controlFault === 'send-draft-without-marker') return ['Unfinished · queue draft', 'warn'];
     if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
@@ -3164,8 +3159,8 @@
       ['project key stable', projectKeyFromUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), 'g-p-project'],
       ['voice after work means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-without-marker'],
       ['voice no-start after grace means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: false, generationObserved: false, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-no-start'],
-      ['send+busy+draft is valid steer UI', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'send', hasDraft: true, busyEvidence: true }), ''],
-      ['send with draft after busy ended is detected but preserved', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'send', hasDraft: true, busyEvidence: false }), 'send-draft-without-marker'],
+      ['send+busy+draft is normal composer UI', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'send', hasDraft: true, busyEvidence: true }), ''],
+      ['send+draft without busy evidence is still not a stop signal', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'send', hasDraft: true, busyEvidence: false }), ''],
       ['send after work without draft means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'send', hasDraft: false, busyEvidence: false }), 'send-without-marker'],
       ['terminal marker defeats control signal', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, 'done', { kind: 'voice', hasDraft: false, busyEvidence: false }), ''],
     ];
