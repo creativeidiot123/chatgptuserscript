@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.1.0
+// @version      1.1.1
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.1.0
+   * ChatGPT Resilience 1.1.1
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.1.0';
+  const VERSION = '1.1.1';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -154,7 +154,7 @@
   });
 
 
-  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something went wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
   const ERROR_RULES = [
     { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare|automated traffic|security check|you have been blocked/i },
     { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
@@ -167,7 +167,7 @@
     { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|message[- ]delivery (?:timed? out|timeout)|too late/i },
     { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted)/i },
     { id: 'thinking-failed', kind: 'continue', re: /thinking failed|reasoning failed|failed while thinking|stopped thinking|reasoning stopped|stopped reasoning/i },
-    { id: 'generation', kind: 'continue', re: /there was an error generating a response|something went wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)/i },
+    { id: 'generation', kind: 'continue', re: /there was an error generating a response|something (?:seems to have )?gone wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)/i },
     { id: 'server', kind: 'continue', re: /server error|internal server error|service unavailable|temporarily unavailable|overloaded|bad gateway|gateway timeout|model (?:is )?(?:currently |temporarily )?unavailable|model capacity/i },
     { id: 'image-generation', kind: 'continue', re: /image generation failed|failed to generate (?:the )?image|couldn(?:'|’)t generate (?:the )?image/i },
     { id: 'message-send', kind: 'send', re: /message (?:failed|couldn(?:'|’)t|could not) (?:to )?send|failed to send (?:the )?message|unable to send (?:the )?message/i },
@@ -864,13 +864,14 @@
 
   function findRetryButton() {
     const turn = tailTurnRoot();
-    if (!turn) return null;
 
-    for (const sel of SELECTORS.retry) {
-      try {
-        const hit = Array.from(turn.querySelectorAll(sel)).find(el => controlVisible(el) && !disabled(el));
-        if (hit) return hit;
-      } catch (_) {}
+    if (turn) {
+      for (const sel of SELECTORS.retry) {
+        try {
+          const hit = Array.from(turn.querySelectorAll(sel)).find(el => controlVisible(el) && !disabled(el));
+          if (hit) return hit;
+        } catch (_) {}
+      }
     }
 
     const main = document.querySelector('main');
@@ -990,9 +991,11 @@
     // live node remains visible and still contains the status text. A static
     // banner must not age out merely because React stopped mutating it.
     const cached = DC.longThinkingNode;
-    if (cached?.isConnected && visible(cached) && !cached.closest?.('[data-message-author-role]')) {
+    if (cached?.isConnected && visible(cached)) {
       const t = norm(cached.textContent || '');
-      if (t.length <= 1200 && LONG_THINKING_RE.test(t)) return cached;
+      const semanticStatus = cached.matches?.('[role="status"],[aria-live]');
+      const outsideMessage = !cached.closest?.('[data-message-author-role]');
+      if ((semanticStatus || outsideMessage) && t.length <= 1200 && LONG_THINKING_RE.test(t)) return cached;
     }
     DC.longThinkingNode = null;
     const root = document.querySelector('main');
@@ -1002,7 +1005,6 @@
       for (let i = Math.max(0, nodes.length - 40); i < nodes.length; i++) {
         const el = nodes[i];
         if (!visible(el)) continue;
-        if (el.closest?.('[data-message-author-role]')) continue;
         const t = norm(el.textContent || '');
         if (t.length <= 800 && LONG_THINKING_RE.test(t)) { DC.longThinkingNode = el; return el; }
       }
@@ -1101,10 +1103,11 @@
   function captureLongThinkingFromNode(node) {
     if (!node || node.nodeType !== 1) return false;
     const el = node;
-    if (el.closest?.('[data-message-author-role]')) return false;
+    const insideMessage = !!el.closest?.('[data-message-author-role]');
 
     const candidates = [];
-    if (el.matches?.('[role="status"],[aria-live]') || (el.childElementCount || 0) <= 12) candidates.push(el);
+    if (el.matches?.('[role="status"],[aria-live]')) candidates.push(el);
+    if (!insideMessage && (el.childElementCount || 0) <= 12) candidates.push(el);
     try {
       const nested = el.querySelectorAll?.('[role="status"],[aria-live]') || [];
       for (let i = Math.max(0, nested.length - 8); i < nested.length; i++) candidates.push(nested[i]);
@@ -1144,7 +1147,15 @@
           const el = node;
           if (el.matches?.('[data-message-author-role]') || el.querySelector?.('[data-message-author-role]')) structureChanged = true;
           if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
-          if (el.matches?.('[role="alert"],[data-testid*="error" i],button') || el.querySelector?.('[role="alert"],[data-testid*="error" i],button')) statusChanged = true;
+          const alertish = el.matches?.('[role="alert"],[data-testid*="error" i]') || el.querySelector?.('[role="alert"],[data-testid*="error" i]');
+          let retryish = el.matches?.('button') && !!retryControlLabel(el);
+          if (!retryish) {
+            try {
+              const buttons = Array.from(el.querySelectorAll?.('button') || []).slice(-12);
+              retryish = buttons.some(btn => !!retryControlLabel(btn));
+            } catch (_) {}
+          }
+          if (alertish || retryish) statusChanged = true;
         }
         for (const node of rec.removedNodes || []) {
           if (node.nodeType !== 1) continue;
@@ -1255,7 +1266,8 @@
     let qid = i.queueItemId || null;
     if (i.resumeHib && S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase)) qid = qid || S.hib.queueItemId || null;
 
-    let t = null;    if (i.subturn && S.txn) t = beginSubturn(i.prompt, i.source);
+    let t = null;
+    if (i.subturn && S.txn) t = beginSubturn(i.prompt, i.source);
     else if (!S.txn) t = armNewTxn(i.prompt, i.source, qid);
     else t = beginSubturn(i.prompt, i.source);
     if (!t) return null;
@@ -1322,7 +1334,7 @@
   }
 
   function adoptUntrackedTurn(msgs, source = 'adopt-untracked') {
-    if (S.txn || !msgs?.lastUserText || !msgs?.lastAssistant) return null;
+    if (S.txn || !msgs?.lastUserText) return null;
     if (latestMarker(msgs)) return null;
 
     const p = promptText(msgs.lastUserText);
@@ -1338,7 +1350,7 @@
     t.sendAttempted = true;
     t.sendObserved = true;
     t.generationObserved = false;
-    t.assistantObserved = true;
+    t.assistantObserved = !!msgs.lastAssistant;
     t.currentPrompt = p;
     t.currentPromptHash = fnv1a(norm(p));
     t.nextRecoveryAt = 0;
@@ -1665,7 +1677,6 @@
     S.queuePaused = !!value;
     store.set('queueUserPaused', S.queuePaused);
     S.queueHoldReason = S.queuePaused ? reason : '';
-    saveQueue();
     renderQueueList();
     paintUI(true);
     if (!S.queuePaused) kickQueue('resume', 30);
@@ -1811,7 +1822,7 @@
   async function steerOrSendQueuedItem(id) {
     cancelRecovery('queue-action');
     const item = S.queue.find(x => x.id === id && x.status === 'pending');
-    if (!item || S.actionInFlight || S.hib || isPaused() || S.blockedReason || !navigator.onLine) return false;
+    if (!item || S.actionInFlight || S.hib || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
     if (!(await verifyLease())) return false;
@@ -1829,6 +1840,12 @@
       return ok;
     }
 
+    if (!tailCommittedForQueue()) {
+      S.queueHoldReason = 'tail-uncommitted-no-journal';
+      paintUI(true);
+      return false;
+    }
+
     markQueueItemInflight(id);
     const ok = await dispatchPrompt(item.text, 'queue-send-now', { newLogicalTask: true, queueItemId: id });
     if (!ok) {
@@ -1839,13 +1856,10 @@
 
 
   function tailCommittedForQueue() {
-    try {
-      const roles = Array.from(document.querySelectorAll('[data-message-author-role]')).filter(visible);
-      if (!roles.length) return true;
-      const last = roles.at(-1);
-      if (last.getAttribute('data-message-author-role') !== 'assistant') return false;
-      return !!terminalMarker(rawNodeText(last), last);
-    } catch (_) { return false; }
+    const msgs = getMessages();
+    if (!msgs.lastUser && !msgs.lastAssistant) return true;
+    if (!assistantIsCurrentTail(msgs)) return false;
+    return !!terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
   }
 
   function queueBlocked() {
@@ -2702,7 +2716,8 @@
     if (pause) pause.textContent = S.queuePaused ? 'Resume' : 'Pause';
     tray.hidden = !queueCount();
     if (!list || !queueCount()) { if (list) list.textContent = ''; return; }
-    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.status}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|action:${S.actionInFlight}|online:${navigator.onLine}`;
+    const idleTailBlocked = !S.txn && !S.generating && !tailCommittedForQueue();
+    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.status}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|tail:${idleTailBlocked}|action:${S.actionInFlight}|online:${navigator.onLine}`;
     if (fp === DC.queueFingerprint && list.childNodes.length) return;
     DC.queueFingerprint = fp;
     list.textContent = '';
@@ -2724,7 +2739,7 @@
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (item.status === 'pending' && S.queueEditingId !== item.id) {
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.txn || S.generating ? 'Steer' : 'Send';
-        send.disabled = !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !navigator.onLine;
+        send.disabled = !!S.hib || isPaused() || !!S.blockedReason || !!S.error || idleTailBlocked || S.actionInFlight || !navigator.onLine;
         send.addEventListener('click', () => steerOrSendQueuedItem(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
@@ -2896,7 +2911,7 @@
       ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_5M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
-      ['rate pauses', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
+      ['rate classified', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
       ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
       ['maximum length ignored', classifyError('This conversation has reached its maximum length')?.kind || null, null],
       ['wait parser', parseWaitMs('Try again in 45 seconds'), 45000],
