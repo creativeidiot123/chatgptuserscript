@@ -551,6 +551,7 @@
     hib: null,
     actionInFlight: false,
     generating: false,
+    draftBeganWhileGenerating: false,
     composerControl: { kind: 'unknown', label: '' },
     error: null,
     pausedUntil: Number(store.get('pausedUntil', 0)) || 0,
@@ -1764,7 +1765,10 @@
   function clearComposer(input = getComposer()) {
     if (!input) return false;
     const ok = setComposerText(input, '');
-    if (ok) clearDraft(S.route);
+    if (ok) {
+      clearDraft(S.route);
+      S.draftBeganWhileGenerating = false;
+    }
     return ok;
   }
 
@@ -2577,6 +2581,7 @@
     S.queueEditingOriginalText = '';
     S.queueHoldReason = '';
     S.generating = false;
+    S.draftBeganWhileGenerating = false;
     S.lastGenerationEvidenceAt = 0;
     S.error = null;
     S.verify = null;
@@ -2688,6 +2693,7 @@
     S.composerMissingSince = 0;
     S.controlFault = '';
     S.generating = false;
+    S.draftBeganWhileGenerating = false;
     S.lastGenerationEvidenceAt = 0;
     clearTransientNetworkError();
     S.suppressTransportErrorsUntil = 0;
@@ -2835,8 +2841,9 @@
 
   function shouldQueueHumanSend() {
     // Never let an input event demote a state the evaluator already classified
-    // as generating. That exact split-brain bug can interrupt the live answer.
-    if (S.generating) return true;
+    // as generating. A draft that began while generating carries the same truth
+    // even if typing has since hidden ChatGPT's Stop control.
+    if (S.generating || S.draftBeganWhileGenerating) return true;
 
     // Input handlers may only promote idle -> generating from fresh independent
     // evidence. The evaluator remains the sole owner of clearing S.generating.
@@ -2869,6 +2876,24 @@
   }
 
   function installInputHooks() {
+    document.addEventListener('beforeinput', e => {
+      if (!S.projectActive || !isProjectUrl() || !e.isTrusted || !isComposerTarget(e.target)) return;
+      if (norm(composerText(e.target))) return;
+
+      // Capture generation before the first character/paste changes ChatGPT's
+      // composer controls. This is the clean boundary where Stop is still visible.
+      const control = getComposerControlState();
+      const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
+      S.draftBeganWhileGenerating = !!(
+        S.generating ||
+        control.kind === 'stop' ||
+        control.kind === 'spinner' ||
+        control.kind === 'streaming' ||
+        control.busyEvidence ||
+        longThinkingBusy
+      );
+    }, true);
+
     document.addEventListener('input', e => {
       if (!S.projectActive || !isProjectUrl()) return;
       if (isComposerTarget(e.target)) {
@@ -2881,6 +2906,7 @@
         const txt = promptText(composerText(e.target));
         if (norm(txt)) scheduleDraftSave(txt, S.route);
         else {
+          S.draftBeganWhileGenerating = false;
           if (!validSendIntent()) clearDraft(S.route);
           kickQueue('composer-cleared', 80);
           if (S.txn || S.controlFault || S.pendingRecoveryReason) scheduleEvaluate('composer-cleared-recovery', 50);
