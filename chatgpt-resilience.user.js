@@ -5,15 +5,12 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.2.5
+// @version      1.3.0
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
 // @run-at       document-start
 // @noframes
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_deleteValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
@@ -24,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.2.5
+   * ChatGPT Resilience 1.3.0
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -42,6 +39,8 @@
    *   - Send/Voice appearing after turn work without a terminal marker is an immediate incomplete-turn signal
    *   - Retry/Try again/Regenerate controls are failure signals only; they are never clicked
    *   - There is one continuation path: Stop if needed -> 10s grace -> literal "continue"
+   *   - Runtime is hard-gated to https://chatgpt.com/g/* even across SPA navigation.
+   *   - All task/queue/recovery state is tab-session local; tabs never coordinate or share ownership.
    *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
@@ -56,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.2.5';
+  const VERSION = '1.3.0';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -99,8 +98,6 @@
     githubHibernateMs: 5 * 60_000,
     githubWakeBlockedRetryMs: 15_000,
     githubWrongRouteRetryMs: 60_000,
-    leaseMs: 20_000,
-    leaseVerifyMs: 50,
     logLimit: 160,
   });
 
@@ -156,14 +153,14 @@
   });
 
 
-  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection (?:reset|closed|lost|failed|interrupted|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection (?:reset|closed|lost|failed|interrupted|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|ptab context try again|ptab context start a new (?:chat|conversation))*$/i;
   const ERROR_RULES = [
     { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare challenge|automated traffic|security check|you have been blocked/i },
-    { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
+    { id: 'auth', kind: 'hard', re: /session (?:has )?expired|ptab context (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
     { id: 'policy', kind: 'hard', re: /content policy|may violate|can(?:not|'t|’t) assist with that|can(?:not|'t|’t) help with that request/i },
     { id: 'artifact-expired', kind: 'hard', re: /download failed|file not found|generated file (?:has )?expired|file (?:has )?expired/i },
     { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
-    { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|please wait before trying again/i },
+    { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|ptab context wait before trying again/i },
     { id: 'conversation-load', kind: 'reload', re: /conversation not found|(?:unable|failed|error) to load (?:this )?(?:conversation|chat)|problem preparing your chat|couldn(?:'|’)t load (?:this )?(?:conversation|chat)|chat not found/i },
     { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|fetch failed|connection (?:error|reset|closed|lost|failed|interrupted|terminated)|websocket|socket (?:error|closed)|disconnected|upstream connect error|disconnect\/reset before headers|transport error|err_network/i },
     { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|connection timed out|message[- ]delivery (?:timed? out|timeout)|gateway time[- ]?out|err_timed_out|too late/i },
@@ -175,60 +172,29 @@
     { id: 'message-send', kind: 'send', re: /message (?:failed|couldn(?:'|’)t|could not) (?:to )?send|failed to send (?:the )?message|unable to send (?:the )?message|error sending (?:the )?message/i },
   ];
 
+  // Runtime persistence is intentionally tab-local. sessionStorage survives a
+  // reload in this tab but is not a shared coordination bus between tabs.
   const store = {
     get(key, fallback = null) {
-      try { return GM_getValue(PREFIX + key, fallback); } catch (_) { return fallback; }
-    },
-    set(key, value) {
-      try { GM_setValue(PREFIX + key, value); } catch (_) {}
-    },
-    del(key) {
-      try { GM_deleteValue(PREFIX + key); } catch (_) {}
-    },
-    json(key, fallback = null) {
       try {
-        const raw = GM_getValue(PREFIX + key, '');
-        if (!raw) return fallback;
-        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const raw = sessionStorage.getItem(PREFIX + key);
+        if (raw == null) return fallback;
+        return JSON.parse(raw);
       } catch (_) { return fallback; }
     },
+    set(key, value) {
+      try { sessionStorage.setItem(PREFIX + key, JSON.stringify(value)); } catch (_) {}
+    },
+    del(key) {
+      try { sessionStorage.removeItem(PREFIX + key); } catch (_) {}
+    },
+    json(key, fallback = null) {
+      return this.get(key, fallback);
+    },
     setJson(key, value) {
-      try { GM_setValue(PREFIX + key, JSON.stringify(value)); } catch (_) {}
+      this.set(key, value);
     },
   };
-
-
-  function migrateLegacyV012Once(scope) {
-    const flag = `${PREFIX}legacy-v012-migrated:${scope}`;
-    try {
-      if (GM_getValue(flag, false)) return;
-      const newQueueKey = `${PREFIX}queue:${scope}`;
-      const oldQueueRaw = GM_getValue(`cgr:queue:${scope}`, '');
-      const newQueueRaw = GM_getValue(newQueueKey, '');
-      if (!newQueueRaw && oldQueueRaw) GM_setValue(newQueueKey, oldQueueRaw);
-      if (GM_getValue(`${PREFIX}queueUserPaused`, null) == null) {
-        const oldPause = GM_getValue('cgr:queueUserPaused', null);
-        if (oldPause != null) GM_setValue(`${PREFIX}queueUserPaused`, oldPause);
-      }
-      if (!GM_getValue(`${PREFIX}draft`, '') && GM_getValue('cgr:draft', '')) GM_setValue(`${PREFIX}draft`, GM_getValue('cgr:draft', ''));
-      const oldHibRaw = GM_getValue(`cgr:github-hibernate:${scope}`, '');
-      if (!GM_getValue(`${PREFIX}github:${scope}`, '') && oldHibRaw) {
-        try {
-          const old = typeof oldHibRaw === 'string' ? JSON.parse(oldHibRaw) : oldHibRaw;
-          if (old && ['sleeping', 'waking', 'wait-user'].includes(old.phase)) {
-            GM_setValue(`${PREFIX}github:${scope}`, JSON.stringify({
-              route: scope, phase: old.phase, wakeAt: Number(old.wakeAt || 0), cycle: Number(old.cycle || 0), queueItemId: old.queueItemId || null, armedAt: Number(old.armedAt || now()),
-            }));
-          }
-        } catch (_) {}
-      }
-      // Deliberately do not migrate v0.12's global active transaction. Its schema
-      // had multiple overlapping recovery modes; replaying it would be less safe
-      // than starting v1 with a clean transaction journal.
-      GM_setValue(flag, true);
-    } catch (_) {}
-  }
-
   const now = () => Date.now();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const norm = s => String(s || '').replace(/\s+/g, ' ').trim();
@@ -248,6 +214,13 @@
   function signature(text) {
     const t = norm(text);
     return `${t.length}:${fnv1a(t.slice(0, 5000))}`;
+  }
+
+  function isProjectUrl(href = location.href) {
+    try {
+      const u = new URL(href, location.origin);
+      return u.origin === location.origin && /^\/g\//.test(u.pathname);
+    } catch (_) { return false; }
   }
 
   function routeKey(href = location.href) {
@@ -567,85 +540,9 @@
     else store.del(hibKey(S.route));
   }
 
-  function migrateBrokenProjectChatScopeOnce() {
-    try {
-      const current = routeKey();
-      if (!current.startsWith('c:')) return;
-      const u = new URL(location.href, location.origin);
-      if (!/\/g\/g-p-[^/]+\/.*\/c\/[^/?#]+|\/g\/g-p-[^/]+\/c\/[^/?#]+/i.test(u.pathname)) return;
-      const oldScope = `p:${u.pathname.replace(/\/+$/, '') || '/'}`;
-      if (oldScope === current) return;
-      const flag = `project-route-migrated:${current}`;
-      if (store.get(flag, false)) return;
-
-      // v1.0 stored project chats under p:/g/.../c/<id> because it only
-      // recognized top-level /c/<id>. Move that state into the corrected c:<id>.
-      const oldTxn = store.json(txnKey(oldScope), null);
-      if (!store.json(txnKey(current), null) && oldTxn) {
-        oldTxn.route = current;
-        store.setJson(txnKey(current), oldTxn);
-      }
-
-      const mergeQueues = (...queues) => {
-        const merged = [];
-        const ids = new Set();
-        for (const arr of queues) {
-          if (!Array.isArray(arr)) continue;
-          for (const item of arr) {
-            if (!item || ids.has(item.id)) continue;
-            ids.add(item.id); merged.push(item);
-          }
-        }
-        return merged;
-      };
-      const newQueue = store.json(queueKey(current), []);
-      const oldV1Queue = store.json(queueKey(oldScope), []);
-      let oldV012Queue = [];
-      try {
-        const raw = GM_getValue(`cgr:queue:${oldScope}`, '');
-        oldV012Queue = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : [];
-      } catch (_) {}
-      const merged = mergeQueues(newQueue, oldV1Queue, oldV012Queue);
-      if (merged.length) store.setJson(queueKey(current), merged);
-
-      const oldHib = store.json(hibKey(oldScope), null);
-      if (!store.json(hibKey(current), null) && oldHib) {
-        oldHib.route = current;
-        store.setJson(hibKey(current), oldHib);
-      } else if (!store.json(hibKey(current), null)) {
-        try {
-          const raw = GM_getValue(`cgr:github-hibernate:${oldScope}`, '');
-          const legacy = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null;
-          if (legacy && ['sleeping', 'waking', 'wait-user'].includes(legacy.phase)) {
-            legacy.route = current;
-            store.setJson(hibKey(current), legacy);
-          }
-        } catch (_) {}
-      }
-
-      store.del(txnKey(oldScope));
-      store.del(queueKey(oldScope));
-      store.del(hibKey(oldScope));
-      store.set(flag, true);
-    } catch (_) {}
-  }
-
-  migrateLegacyV012Once(routeKey());
-  migrateBrokenProjectChatScopeOnce();
-  try {
-    const scope = routeKey();
-    if (!store.get(draftKey(scope), '')) {
-      const oldV1 = String(store.get('draft', '') || '');
-      let oldV012 = '';
-      try { oldV012 = String(GM_getValue('cgr:draft', '') || ''); } catch (_) {}
-      const legacyDraft = oldV1 || oldV012;
-      if (norm(legacyDraft)) store.set(draftKey(scope), legacyDraft);
-    }
-    store.del('draft');
-  } catch (_) {}
-
   const S = {
     enabled: store.get('enabled', true) !== false,
+    projectActive: isProjectUrl(),
     route: routeKey(),
     href: location.href,
     txn: null,
@@ -1152,11 +1049,13 @@
 
   // ---------- observers ---------------------------------------------------------------
   function rebindAssistantObserver() {
+    if (!S.projectActive || !isProjectUrl()) return;
     if (DC.assistantNode === DC.lastAssistant) return;
     try { DC.assistantObserver?.disconnect(); } catch (_) {}
     DC.assistantNode = DC.lastAssistant;
     if (!DC.lastAssistant) return;
     DC.assistantObserver = new MutationObserver(() => {
+      if (!S.projectActive || !isProjectUrl()) return;
       S.lastAssistantProgressAt = now();
       scheduleEvaluate('assistant-progress', CFG.tailDebounceMs);
     });
@@ -1197,11 +1096,13 @@
   }
 
   function installRootObserver() {
+    if (!S.projectActive || !isProjectUrl()) return;
     const root = document.querySelector('main') || document.body;
     if (!root) return;
     try { DC.rootObserver?.disconnect(); } catch (_) {}
     DC.rootNode = root;
     DC.rootObserver = new MutationObserver(records => {
+      if (!S.projectActive || !isProjectUrl()) return;
       let structureChanged = false;
       let statusChanged = false;
       let composerChanged = false;
@@ -1244,6 +1145,7 @@
 
 
   function installComposerObserver() {
+    if (!S.projectActive || !isProjectUrl()) return;
     const input = getComposer();
     const form = composerForm(input);
     const host = form?.parentElement || form;
@@ -1252,6 +1154,7 @@
     try { DC.composerObserver?.disconnect(); } catch (_) {}
     DC.composerNode = host;
     DC.composerObserver = new MutationObserver(records => {
+      if (!S.projectActive || !isProjectUrl()) return;
       let relevant = false;
       for (const rec of records) {
         // Typing in ProseMirror/contenteditable can produce childList mutations.
@@ -1278,29 +1181,9 @@
     } catch (_) {}
   }
 
-  // ---------- lease -------------------------------------------------------------------
-  function lockKey() { return `lock:${S.route}`; }
-  function claimLease() {
-    const key = lockKey();
-    const t = now();
-    try {
-      const old = store.json(key, null);
-      if (old && old.tabId !== TAB_ID && t - Number(old.at || 0) < CFG.leaseMs) return false;
-      store.setJson(key, { tabId: TAB_ID, at: t });
-      return true;
-    } catch (_) { return true; }
-  }
-
-  async function verifyLease() {
-    if (!claimLease()) return false;
-    await sleep(CFG.leaseVerifyMs);
-    const cur = store.json(lockKey(), null);
-    return !cur || cur.tabId === TAB_ID;
-  }
-
-  function releaseLease() {
-    const cur = store.json(lockKey(), null);
-    if (cur?.tabId === TAB_ID) store.del(lockKey());
+  // ---------- tab-local ownership -----------------------------------------------------
+  function verifyTabContext(expectedRoute = S.route) {
+    return S.projectActive && isProjectUrl() && S.route === expectedRoute;
   }
 
   // Human native sends are first represented only as a short-lived in-memory
@@ -1620,7 +1503,7 @@
   }
 
   async function dispatchPrompt(prompt, source, options = {}) {
-    if (!S.enabled || S.actionInFlight || isPaused()) return false;
+    if (!S.enabled || !verifyTabContext() || S.actionInFlight || isPaused()) return false;
     const dispatchRoute = S.route;
     const input = getComposer();
     const p = promptText(prompt);
@@ -1634,7 +1517,7 @@
     try {
       const action = await waitForSendAction(input, p);
       if (!action || S.route !== dispatchRoute) return false;
-      if (!(await verifyLease())) return false;
+      if (!verifyTabContext()) return false;
       if (S.route !== dispatchRoute) return false;
       if (!input.isConnected || norm(composerText(input)) !== norm(p)) return false;
 
@@ -1694,6 +1577,7 @@
 
 
   async function sendLiteralContinue(reason = 'incomplete') {
+    if (!verifyTabContext()) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || S.generating || S.actionInFlight || isPaused() || S.blockedReason) return false;
     if (Number(t.continueCount || 0) >= CFG.maxContinuesPerLogicalTask) {
@@ -1730,6 +1614,7 @@
   }
 
   async function stopThenContinue(reason = 'recovery') {
+    if (!verifyTabContext()) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
     if (latestMarker(getMessages())) return false;
@@ -1757,7 +1642,7 @@
       if (stop && visible(stop) && !disabled(stop)) {
         S.actionInFlight = true;
         try {
-          if (!(await verifyLease())) return false;
+          if (!verifyTabContext()) return false;
           const diskTxn = loadTxn(S.route);
           if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
           S.txn = diskTxn;
@@ -1872,6 +1757,7 @@
   }
 
   function queueCurrentComposer() {
+    if (!verifyTabContext()) return false;
     const input = getComposer();
     const p = promptText(composerText(input));
     if (!input || !norm(p)) return false;
@@ -1962,13 +1848,14 @@
   }
 
   async function steerOrSendQueuedItem(id) {
+    if (!verifyTabContext()) return false;
     const actionRoute = S.route;
     if (S.actionInFlight || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
-    if (!(await verifyLease()) || S.route !== actionRoute) return false;
+    if (!verifyTabContext(actionRoute)) return false;
 
-    // Lease first, then trust durable state. Never steer/send from a stale tab.
+    // Tab context first, then trust durable state. Never steer/send from a stale tab.
     const diskTxn = loadTxn(actionRoute);
     const diskHib = loadHibernation(actionRoute);
     S.txn = diskTxn;
@@ -2047,7 +1934,7 @@
   }
 
   async function processQueue() {
-    if (S.queueProcessing || !S.enabled || !S.queue.length) return false;
+    if (!verifyTabContext() || S.queueProcessing || !S.enabled || !S.queue.length) return false;
     const pumpRoute = S.route;
     if (queueBlocked()) {
       S.queueHoldReason = S.queuePaused ? 'paused' : S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
@@ -2067,12 +1954,12 @@
 
     S.queueProcessing = true;
     try {
-      if (!(await verifyLease()) || S.route !== pumpRoute) {
-        if (S.route === pumpRoute) kickQueue('other-tab-lease', CFG.queueBlockedRetryMs);
+      if (!verifyTabContext(pumpRoute)) {
+        if (S.route === pumpRoute) kickQueue('tab-context', CFG.queueBlockedRetryMs);
         return false;
       }
 
-      // Durable state after the lease is the only source of dispatch truth.
+      // This tab's durable state after async staging is the dispatch truth.
       const diskTxn = loadTxn(pumpRoute);
       const diskHib = loadHibernation(pumpRoute);
       S.txn = diskTxn;
@@ -2085,7 +1972,7 @@
       if (freshError) { S.error = freshError; S.queueHoldReason = `error:${freshError.id}`; return false; }
 
       if (S.txn || S.hib) {
-        S.queueHoldReason = S.txn ? 'active-task-other-tab' : S.hib.phase;
+        S.queueHoldReason = S.txn ? 'active-task' : S.hib.phase;
         return false;
       }
 
@@ -2103,8 +1990,8 @@
         return false;
       }
 
-      // Another tab may have edited/reordered the queue while this tab waited for
-      // the lease. We intentionally use the freshly reloaded head and fresh text.
+      // Re-select the freshly persisted head after async staging so edit/reorder
+      // operations in this tab cannot race dispatch.
       const ok = await dispatchPrompt(freshItem.text, 'queue', {
         newLogicalTask: true,
         queueItemId: freshItem.id,
@@ -2182,14 +2069,14 @@
   }
 
   async function attemptGithubWake(reason = 'timer', force = false) {
-    if (!S.enabled || !S.hib || S.hib.phase !== 'sleeping') return false;
+    if (!verifyTabContext() || !S.enabled || !S.hib || S.hib.phase !== 'sleeping') return false;
     if (S.hib.route !== S.route) { scheduleWakeTimer(CFG.githubWrongRouteRetryMs); return false; }
     if (!force && now() < S.hib.wakeAt) { scheduleWakeTimer(); return false; }
     if (!navigator.onLine || isPaused() || S.blockedReason || S.actionInFlight || S.txn || S.generating || S.error) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
     const wakeRoute = S.route;
-    if (!(await verifyLease()) || S.route !== wakeRoute) { if (S.route === wakeRoute) scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
+    if (!verifyTabContext(wakeRoute)) { if (S.route === wakeRoute) scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
     const diskTxn = loadTxn(wakeRoute);
     const diskHib = loadHibernation(wakeRoute);
     if (diskTxn) { S.txn = diskTxn; scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
@@ -2296,7 +2183,7 @@
   async function completeLogicalTask(marker, msgs) {
     const t = S.txn;
     if (!t) return false;
-    if (!(await verifyLease())) return false;
+    if (!verifyTabContext()) return false;
     const diskTxn = loadTxn(S.route);
     if (!diskTxn || diskTxn.id !== t.id) { S.txn = diskTxn; return false; }
     S.txn = diskTxn;
@@ -2387,7 +2274,7 @@
     const expectedTxnId = t.id;
     S.actionInFlight = true;
     try {
-      if (!(await verifyLease())) return false;
+      if (!verifyTabContext()) return false;
       const diskTxn = loadTxn(S.route);
       if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
       S.txn = diskTxn;
@@ -2418,7 +2305,7 @@
     }
     S.actionInFlight = true;
     try {
-      if (!(await verifyLease())) return false;
+      if (!verifyTabContext()) return false;
       hist.push(now());
       store.setJson(key, hist);
       log('page-reload', { reason, count: hist.length });
@@ -2469,6 +2356,7 @@
   }
   async function evaluate(reason = 'event') {
     detectRouteChange();
+    if (!S.projectActive || !isProjectUrl()) return;
     ensureObservers();
     refreshMessageCache();
     const msgs = getMessages();
@@ -2658,6 +2546,69 @@
     scheduleWatchdog();
   }
 
+  function removeRuntimeUi() {
+    document.getElementById('cgr-root')?.remove();
+    document.getElementById('cgr-queue-tray')?.remove();
+    document.getElementById('cgr-queue-button')?.remove();
+    DC.queueTray = null;
+    DC.queueFingerprint = '';
+    DC.uiFingerprint = '';
+  }
+
+  function deactivateProjectRuntime(reason = 'left-project') {
+    try { DC.rootObserver?.disconnect(); } catch (_) {}
+    try { DC.assistantObserver?.disconnect(); } catch (_) {}
+    try { DC.composerObserver?.disconnect(); } catch (_) {}
+    DC.rootObserver = null;
+    DC.assistantObserver = null;
+    DC.composerObserver = null;
+    DC.rootNode = null;
+    DC.assistantNode = null;
+    DC.composerNode = null;
+    DC.composer = null;
+    DC.form = null;
+    DC.longThinkingNode = null;
+
+    for (const key of ['watchdogTimer', 'queuePumpTimer', 'wakeTimer']) {
+      if (DC[key]) clearTimeout(DC[key]);
+      DC[key] = null;
+    }
+    DC.queuePumpDueAt = 0;
+    DC.wakeDueAt = 0;
+    S.queueProcessing = false;
+    S.queueEditingId = '';
+    S.queueEditingOriginalText = '';
+    S.queueHoldReason = '';
+    S.generating = false;
+    S.error = null;
+    S.verify = null;
+    S.sendIntent = null;
+    S.recovery = null;
+    S.pendingRecoveryReason = '';
+    S.controlFault = '';
+    removeRuntimeUi();
+    log('runtime-off', { reason, href: location.href });
+  }
+
+  function activateProjectRuntime(reason = 'entered-project') {
+    if (!S.projectActive || !isProjectUrl()) return false;
+    DC.messagesDirty = true;
+    DC.composer = null;
+    DC.form = null;
+    refreshMessageCache(true);
+    installRootObserver();
+    installComposerObserver();
+    rebindAssistantObserver();
+    reconcileQueueOwnership('runtime-activate');
+    restoreDraftIfSafe();
+    ensureQueueButton();
+    renderQueueList();
+    scheduleWakeTimer();
+    paintUI(true);
+    log('runtime-on', { reason, route: S.route });
+    return true;
+  }
+
   // ---------- route migration ---------------------------------------------------------
   function projectKeyFromUrl(href = location.href) {
     try {
@@ -2692,19 +2643,29 @@
 
   function detectRouteChange() {
     if (location.href === S.href) return false;
+
     const old = S.route;
     const oldHref = S.href;
+    const wasProject = S.projectActive;
     const nextHref = location.href;
+    const nextIsProject = isProjectUrl(nextHref);
     const next = routeKey(nextHref);
     S.href = nextHref;
 
-    // Query/hash churn inside one conversation is not a state transition.
-    if (next === old) return false;
+    if (!nextIsProject) {
+      if (wasProject) flushDraftSave();
+      S.projectActive = false;
+      deactivateProjectRuntime('left-project-route');
+      return true;
+    }
 
-    flushDraftSave();
+    S.projectActive = true;
 
-    // Invalidate queue work that belonged to the previous chat. In-flight async
-    // functions are route-bound and will fail closed when they resume.
+    // Query/hash churn inside the same project conversation is not a state change.
+    if (wasProject && next === old) return false;
+
+    if (wasProject) flushDraftSave();
+
     if (DC.queuePumpTimer) clearTimeout(DC.queuePumpTimer);
     DC.queuePumpTimer = null;
     DC.queuePumpDueAt = 0;
@@ -2715,14 +2676,9 @@
     DC.queueDragId = '';
     DC.queueFingerprint = '';
 
-    migrateScope(old, next, oldHref, nextHref);
+    if (wasProject) migrateScope(old, next, oldHref, nextHref);
     S.route = next;
-    // Auth / anti-abuse are account-level. Other blockers belong to the old
-    // conversation and must not poison a different project chat.
-    if (S.blockedReason && !['auth', 'anti-abuse'].includes(S.blockedReason)) {
-      S.blockedReason = '';
-      store.set('blockedReason', '');
-    }
+
     S.txn = loadTxn(next);
     S.queue = loadQueue(next);
     S.hib = loadHibernation(next);
@@ -2735,24 +2691,19 @@
     S.controlFault = '';
     clearTransientNetworkError();
     S.suppressTransportErrorsUntil = 0;
-    DC.longThinkingNode = null;
-    DC.messagesDirty = true;
-    DC.composer = null; DC.form = null;
-    DC.rootNode = null;
-    DC.composerNode = null;
-    installRootObserver();
-    installComposerObserver();
-    refreshMessageCache(true);
-    restoreDraftIfSafe();
-    scheduleWakeTimer();
-    renderQueueList();
-    paintUI(true);
-    log('route', { from: old, to: next });
+    S.lastAssistantSig = '';
+    S.lastUserSig = '';
+    S.lastAssistantProgressAt = now();
+    S.lastControlChangeAt = now();
+
+    activateProjectRuntime(wasProject ? 'project-route-change' : 'returned-to-project');
+    scheduleEvaluate('project-route-ready', 50);
     return true;
   }
 
   // ---------- minimal network observer ------------------------------------------------
   function isConversationRequest(url, method = 'GET') {
+    if (!S.projectActive || !isProjectUrl()) return false;
     const m = String(method || 'GET').toUpperCase();
     if (m !== 'POST') return false;
     const u = String(url || '');
@@ -2889,6 +2840,7 @@
 
   function installInputHooks() {
     document.addEventListener('input', e => {
+      if (!S.projectActive || !isProjectUrl()) return;
       if (isComposerTarget(e.target)) {
         const txt = promptText(composerText(e.target));
         if (norm(txt)) scheduleDraftSave(txt, S.route);
@@ -2906,6 +2858,7 @@
     // Script-generated HTMLElement.click() events are untrusted and must not be
     // mistaken for human intervention.
     document.addEventListener('click', e => {
+      if (!S.projectActive || !isProjectUrl()) return;
       if (isStopButtonTarget(e.target)) {
         if (e.isTrusted && !S.actionInFlight && S.txn) {
           cancelRecovery('manual-stop');
@@ -2937,6 +2890,7 @@
     }, true);
 
     document.addEventListener('keydown', e => {
+      if (!S.projectActive || !isProjectUrl()) return;
       if (e.isComposing || e.repeat || !isComposerTarget(e.target) || !S.enabled) return;
       if (e.key === 'Escape' && S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); cancelQueueEdit(); return; }
       if (e.key !== 'Enter' || e.shiftKey || e.altKey || e.metaKey) return;
@@ -3024,6 +2978,7 @@
   }
 
   function renderQueueList() {
+    if (!S.projectActive || !isProjectUrl()) { document.getElementById('cgr-queue-tray')?.remove(); DC.queueTray = null; return; }
     const tray = ensureQueueTray();
     if (!tray) return;
     const list = tray.querySelector('#cgr-queue-list');
@@ -3072,6 +3027,7 @@
   }
 
   function ensureQueueButton() {
+    if (!S.projectActive || !isProjectUrl()) { document.getElementById('cgr-queue-button')?.remove(); return; }
     const input = getComposer();
     if (!input) return;
     let btn = document.getElementById('cgr-queue-button');
@@ -3124,6 +3080,7 @@
   }
 
   function ensureUI() {
+    if (!S.projectActive || !isProjectUrl()) { removeRuntimeUi(); return; }
     if (!document.body || document.getElementById('cgr-root')) return;
     const root = document.createElement('div'); root.id = 'cgr-root';
     root.innerHTML = `<button id="cgr-pill" type="button"><span id="cgr-dot"></span><span id="cgr-status">Starting</span></button><div id="cgr-panel" hidden><div class="cgr-head"><strong>${APP}</strong><span>v${VERSION}</span></div><div class="cgr-row"><span>Automation</span><button id="cgr-toggle"></button></div><div class="cgr-row"><span>Queue</span><button id="cgr-queue-toggle"></button></div><div class="cgr-note" id="cgr-detail"></div><div class="cgr-actions"><button id="cgr-recover">Continue now</button><button id="cgr-wake">GitHub wake now</button><button id="cgr-clear-queue">Clear pending</button><button id="cgr-clear-state">Clear state</button></div></div>`;
@@ -3138,6 +3095,7 @@
   }
 
   function paintUI(force = false) {
+    if (!S.projectActive || !isProjectUrl()) { removeRuntimeUi(); return; }
     ensureUI(); ensureQueueButton(); renderQueueList();
     const root = document.getElementById('cgr-root'); if (!root) return;
     const [text, state] = statusText();
@@ -3183,6 +3141,8 @@
 
   function scheduleWatchdog() {
     if (DC.watchdogTimer) clearTimeout(DC.watchdogTimer);
+    DC.watchdogTimer = null;
+    if (!S.projectActive || !isProjectUrl()) return;
     let delay;
     if (document.hidden) delay = CFG.hiddenWatchdogMs;
     else if (S.blockedReason) delay = CFG.idleWatchdogMs;
@@ -3194,6 +3154,7 @@
   }
 
   function ensureObservers() {
+    if (!S.projectActive || !isProjectUrl()) return;
     const currentRoot = document.querySelector('main') || document.body;
     if (!DC.rootObserver || !DC.rootNode?.isConnected || DC.rootNode !== currentRoot) installRootObserver();
     installComposerObserver();
@@ -3236,14 +3197,14 @@
       ['flattened done marker', terminalMarker('all done.[[CGR_DONE]]'), 'done'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
-      ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
+      ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists ptab context contact us through our help center.')?.kind, 'continue'],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
       ['upstream reset continues', classifyError('upstream connect error or disconnect/reset before headers')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
       ['HTTP 520 server', classifyHttpStatus(520)?.id, 'server'],
       ['HTTP 422 recoverable request', classifyHttpStatus(422)?.kind, 'continue'],
       ['rate classified', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
-      ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
+      ['auth blocks', classifyError('Session expired. Ptab context sign in')?.kind, 'hard'],
       ['maximum length ignored', classifyError('This conversation has reached its maximum length')?.kind || null, null],
       ['wait parser', parseWaitMs('Try again in 45 seconds'), 45000],
       ['classifier can recognize network phrase', classifyError('We should handle network error conditions carefully')?.id || null, 'network'],
@@ -3257,7 +3218,9 @@
       ['queue owner prefers txn', (() => { const oldT=S.txn, oldH=S.hib; S.txn={queueItemId:'txn-q'}; S.hib={queueItemId:'hib-q'}; const got=queueOwnerId(); S.txn=oldT; S.hib=oldH; return got; })(), 'txn-q'],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_5M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
-      ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
+      ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
+      ['project runtime on', isProjectUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), true],
+      ['regular chat route parser remains harmless', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
       ['project key stable', projectKeyFromUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), 'g-p-project'],
@@ -3275,30 +3238,33 @@
   }
 
   function boot() {
-    // `reconciledAt` is written immediately before a controlled reload. Reset it
-    // to this boot time so a slow navigation cannot consume the entire
-    // post-reload reconciliation window before ChatGPT has rendered history.
+    // State is tab-local and survives reloads only in this browser tab.
     if (S.txn && !S.txn.userTurnConfirmed && S.txn.reconciledAt) {
       S.txn.reconciledAt = now();
       saveTxn();
     }
+
     addStyles();
-    ensureUI();
     installInputHooks();
-    installRootObserver();
-    installComposerObserver();
-    refreshMessageCache(true);
-    reconcileQueueOwnership('boot');
-    restoreDraftIfSafe();
-    ensureQueueButton(); renderQueueList();
-    scheduleWakeTimer();
-    scheduleEvaluate('boot', 250);
-    installMenu();
-    window.addEventListener('online', () => scheduleEvaluate('online', 250));
-    window.addEventListener('offline', () => paintUI(true));
-    window.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleEvaluate('visible', 100); scheduleWatchdog(); });
-    window.addEventListener('focus', () => scheduleEvaluate('focus', 100));
-    window.addEventListener('beforeunload', () => { flushDraftSave(); releaseLease(); });
+        installMenu();
+
+    if (S.projectActive && isProjectUrl()) {
+      activateProjectRuntime('boot');
+      scheduleEvaluate('boot', 250);
+    } else {
+      deactivateProjectRuntime('boot-outside-project');
+    }
+
+    window.addEventListener('online', () => { if (S.projectActive && isProjectUrl()) scheduleEvaluate('online', 250); });
+    window.addEventListener('offline', () => { if (S.projectActive && isProjectUrl()) paintUI(true); });
+    window.addEventListener('visibilitychange', () => {
+      if (S.projectActive && isProjectUrl()) {
+        if (!document.hidden) scheduleEvaluate('visible', 100);
+        scheduleWatchdog();
+      }
+    });
+    window.addEventListener('focus', () => { if (S.projectActive && isProjectUrl()) scheduleEvaluate('focus', 100); });
+    window.addEventListener('beforeunload', flushDraftSave);
   }
 
   try {
@@ -3313,6 +3279,8 @@
       pauseQueue: () => setQueuePaused(true),
       resumeQueue: () => setQueuePaused(false),
       state: () => ({
+        projectActive: S.projectActive && isProjectUrl(),
+        storage: 'tab-session',
         route: S.route,
         enabled: S.enabled,
         generating: S.generating,
