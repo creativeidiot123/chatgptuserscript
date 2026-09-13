@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.4
+// @version      1.3.5
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.4
+   * ChatGPT Resilience 1.3.5
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.4';
+  const VERSION = '1.3.5';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1894,12 +1894,8 @@
       return ok || journalOwnsSteer;
     }
 
-    if (!tailCommittedForQueue()) {
-      S.queueHoldReason = 'tail-uncommitted-no-journal';
-      paintUI(true);
-      return false;
-    }
-
+    // This is an explicit human Send. Unlike the automatic queue pump, it may
+    // intentionally move past an idle uncommitted tail.
     // dispatchPrompt claims queue ownership only after its transaction journal
     // exists, eliminating inflight-without-journal crash windows.
     const ok = await dispatchPrompt(item.text, 'queue-send-now', {
@@ -2841,23 +2837,14 @@
     return false;
   }
 
-  function queueEnterDecision({ queueLength = 0, txn = false, generating = false, hib = false, error = false, action = false, tailDone = false } = {}) {
-    return queueLength > 0 || txn || generating || hib || error || action || !tailDone;
+  function queueEnterDecision({ generating = false } = {}) {
+    return !!generating;
   }
 
   function shouldQueueEnter() {
-    // Enter is normal ChatGPT Send whenever the previous logical turn is done
-    // and there is no queued work. Queue pause is a property of an existing
-    // queue, not a mode that turns ordinary Enter into "create a queue".
-    return queueEnterDecision({
-      queueLength: S.queue.length,
-      txn: !!S.txn,
-      generating: S.generating,
-      hib: !!S.hib,
-      error: !!S.error,
-      action: S.actionInFlight,
-      tailDone: tailCommittedForQueue(),
-    });
+    // Queue normal Enter only while ChatGPT is actively generating. Existing
+    // queue work, an unfinished journal, or an idle tail must not hijack Send.
+    return queueEnterDecision({ generating: isGenerating() });
   }
 
   function installInputHooks() {
@@ -3011,8 +2998,7 @@
     if (pause) pause.textContent = S.queuePaused ? 'Resume' : 'Pause';
     tray.hidden = !queueCount();
     if (!list || !queueCount()) { if (list) list.textContent = ''; return; }
-    const idleTailBlocked = !S.txn && !S.generating && !tailCommittedForQueue();
-    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.status}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|tail:${idleTailBlocked}|action:${S.actionInFlight}|online:${navigator.onLine}`;
+    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.status}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|action:${S.actionInFlight}|online:${navigator.onLine}`;
     if (fp === DC.queueFingerprint && list.childNodes.length) return;
     DC.queueFingerprint = fp;
     list.textContent = '';
@@ -3034,8 +3020,8 @@
 
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (item.status === 'pending' && S.queueEditingId !== item.id) {
-        const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.txn || S.generating ? 'Steer' : 'Send';
-        send.disabled = !!S.hib || isPaused() || !!S.blockedReason || !!S.error || idleTailBlocked || S.actionInFlight || !navigator.onLine;
+        const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
+        send.disabled = !!S.hib || isPaused() || !!S.blockedReason || !!S.error || S.actionInFlight || !navigator.onLine;
         send.addEventListener('click', () => steerOrSendQueuedItem(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
@@ -3243,10 +3229,11 @@
       ['queue head is first pending', firstPendingQueueItem([{id:'a',status:'inflight'},{id:'b',status:'pending'},{id:'c',status:'pending'}])?.id, 'b'],
       ['queue head ignores later pending', firstPendingQueueItem([{id:'a',status:'pending'},{id:'b',status:'pending'}])?.id, 'a'],
       ['queue owner prefers txn', (() => { const oldT=S.txn, oldH=S.hib; S.txn={queueItemId:'txn-q'}; S.hib={queueItemId:'hib-q'}; const got=queueOwnerId(); S.txn=oldT; S.hib=oldH; return got; })(), 'txn-q'],
-      ['Enter sends when done and queue empty', queueEnterDecision({ tailDone:true }), false],
-      ['Enter queues when existing queue has work', queueEnterDecision({ tailDone:true, queueLength:1 }), true],
-      ['Enter queues while generation active', queueEnterDecision({ tailDone:false, generating:true }), true],
-      ['Enter queues when tail is unfinished', queueEnterDecision({ tailDone:false }), true],
+      ['Enter sends while idle', queueEnterDecision({ generating:false }), false],
+      ['Enter ignores existing queue while idle', queueEnterDecision({ generating:false, queueLength:1 }), false],
+      ['Enter queues while generation active', queueEnterDecision({ generating:true }), true],
+      ['Enter ignores unfinished idle tail', queueEnterDecision({ generating:false, tailDone:false }), false],
+      ['Enter ignores idle transaction journal', queueEnterDecision({ generating:false, txn:true }), false],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
