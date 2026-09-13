@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.1
+// @version      1.3.2
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.1
+   * ChatGPT Resilience 1.3.2
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.1';
+  const VERSION = '1.3.2';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -2832,9 +2832,23 @@
     return false;
   }
 
+  function queueEnterDecision({ queueLength = 0, txn = false, generating = false, hib = false, error = false, action = false, tailDone = false } = {}) {
+    return queueLength > 0 || txn || generating || hib || error || action || !tailDone;
+  }
+
   function shouldQueueEnter() {
-    return !!S.txn || S.generating || !!S.hib || S.queue.length > 0 || S.queuePaused ||
-      isPaused() || !!S.error || S.actionInFlight || !tailCommittedForQueue();
+    // Enter is normal ChatGPT Send whenever the previous logical turn is done
+    // and there is no queued work. Queue pause is a property of an existing
+    // queue, not a mode that turns ordinary Enter into "create a queue".
+    return queueEnterDecision({
+      queueLength: S.queue.length,
+      txn: !!S.txn,
+      generating: S.generating,
+      hib: !!S.hib,
+      error: !!S.error,
+      action: S.actionInFlight,
+      tailDone: tailCommittedForQueue(),
+    });
   }
 
   function installInputHooks() {
@@ -3215,6 +3229,10 @@
       ['queue head is first pending', firstPendingQueueItem([{id:'a',status:'inflight'},{id:'b',status:'pending'},{id:'c',status:'pending'}])?.id, 'b'],
       ['queue head ignores later pending', firstPendingQueueItem([{id:'a',status:'pending'},{id:'b',status:'pending'}])?.id, 'a'],
       ['queue owner prefers txn', (() => { const oldT=S.txn, oldH=S.hib; S.txn={queueItemId:'txn-q'}; S.hib={queueItemId:'hib-q'}; const got=queueOwnerId(); S.txn=oldT; S.hib=oldH; return got; })(), 'txn-q'],
+      ['Enter sends when done and queue empty', queueEnterDecision({ tailDone:true }), false],
+      ['Enter queues when existing queue has work', queueEnterDecision({ tailDone:true, queueLength:1 }), true],
+      ['Enter queues while generation active', queueEnterDecision({ tailDone:false, generating:true }), true],
+      ['Enter queues when tail is unfinished', queueEnterDecision({ tailDone:false }), true],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_5M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
