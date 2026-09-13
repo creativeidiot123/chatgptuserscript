@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.12
+// @version      1.3.13
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.12
+   * ChatGPT Resilience 1.3.13
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.12';
+  const VERSION = '1.3.13';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -2819,10 +2819,29 @@
     return !!generating;
   }
 
+  function shouldQueueHumanSend() {
+    // Never let an input event demote a state the evaluator already classified
+    // as generating. That exact split-brain bug can interrupt the live answer.
+    if (S.generating) return true;
+
+    // Input handlers may only promote idle -> generating from fresh independent
+    // evidence. The evaluator remains the sole owner of clearing S.generating.
+    const next = getComposerControlState();
+    const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
+    const recentAssistantProgress = !!S.txn && now() - Number(S.lastAssistantProgressAt || 0) <= CFG.answerSettleMs;
+    const busy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
+      next.busyEvidence || longThinkingBusy || recentAssistantProgress;
+    if (!busy) return false;
+
+    S.composerControl = next;
+    S.generating = true;
+    S.lastGenerationEvidenceAt = now();
+    return true;
+  }
+
   function shouldQueueEnter() {
-    // Queue normal Enter only while ChatGPT is actively generating. Existing
-    // queue work, an unfinished journal, or an idle tail must not hijack Send.
-    return queueEnterDecision({ generating: isGenerating() });
+    // Normal Enter uses the exact same fail-safe decision as native Send.
+    return queueEnterDecision({ generating: shouldQueueHumanSend() });
   }
 
   function installInputHooks() {
@@ -2876,7 +2895,7 @@
 
       // Native Send and Enter obey the same queue rule. Attachments stay native
       // because this queue intentionally stores reconstructable text only.
-      if (e.isTrusted && isGenerating() && !hasComposerAttachments(input)) {
+      if (e.isTrusted && shouldQueueHumanSend() && !hasComposerAttachments(input)) {
         e.preventDefault();
         e.stopImmediatePropagation();
         queueCurrentComposer();
@@ -2939,6 +2958,16 @@
       if (!input || !e.target?.contains?.(input)) return;
       const p = promptText(composerText(input));
       if (!norm(p)) return;
+
+      // Form submit is a third native send path. Guard it with the same rule so
+      // keyboard, button, and submit events cannot disagree about generation.
+      if (e.isTrusted && !S.actionInFlight && shouldQueueHumanSend() && !hasComposerAttachments(input)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        queueCurrentComposer();
+        return;
+      }
+
       if (!validSendIntent()) {
         setSendIntent(p, (S.generating || S.txn) ? 'native-submit-followup' : 'native-submit', {
           subturn: !!S.txn, resumeHib: !!S.hib, clearBlocked: !!S.blockedReason,
@@ -3214,6 +3243,7 @@
       ['Enter sends while idle', queueEnterDecision({ generating:false }), false],
       ['Enter ignores existing queue while idle', queueEnterDecision({ generating:false, queueLength:1 }), false],
       ['Enter queues while generation active', queueEnterDecision({ generating:true }), true],
+      ['input guard never demotes cached generation', queueEnterDecision({ generating:true }), true],
       ['Enter ignores unfinished idle tail', queueEnterDecision({ generating:false, tailDone:false }), false],
       ['Enter ignores idle transaction journal', queueEnterDecision({ generating:false, txn:true }), false],
       ['draft Send keeps recent active generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 8_000, 10_000), true],
