@@ -1,0 +1,64 @@
+ChatGPT Resilience v1.0.2 — wiring audit
+
+This build is a wiring/stability patch over v1.0.1. The completion protocol remains authoritative:
+  [[CGR_DONE]]
+  [[CGR_HIBERNATE_GITHUB_5M]]
+  [[CGR_WAIT_USER]]
+  continue
+
+Fixed during the full wiring audit:
+
+1. Native-send journaling
+   - Removed durable send journaling from pointer-down.
+   - Native Enter/Send first creates only a short-lived in-memory send intent.
+   - The intent becomes a durable transaction only after submit, matching conversation POST, or matching user-turn DOM evidence.
+   - Pre-send user/assistant baselines are captured before the native UI can mutate.
+
+2. Manual Stop correctness
+   - Manual Stop is recorded only on an actual trusted click.
+   - Script-generated Stop clicks used for long-thinking recovery are not mistaken for human Stop.
+
+3. Long-thinking signal lifetime
+   - The exact discovered long-thinking banner node is cached while connected/visible.
+   - A static banner no longer disappears from Resilience's state after five seconds merely because React stopped mutating it.
+
+4. React root replacement
+   - The observer is rebound if ChatGPT replaces <main> or disconnects the old root.
+
+5. Terminal-marker wiring
+   - Terminal markers are proven from the rendered DOM, so adjacent Markdown blocks whose textContent is flattened still commit correctly.
+   - Completion is serialized through the per-chat lease and revalidated against the durable transaction before queue ownership is changed.
+
+6. Queue multi-tab race
+   - Automated queue dispatch acquires the lease before marking an item in-flight.
+   - Durable queue/transaction/hibernation state is re-read after winning the lease.
+   - A second tab cannot safely send a stale local copy of the same queued item.
+
+7. GitHub wake race
+   - Wake acquires the lease before changing sleeping -> waking.
+   - Durable state is re-read after lease acquisition.
+
+8. Ctrl+Enter / WAIT_USER ownership
+   - Hibernation and blocked-state ownership are not cleared until the immediate send/steer actually dispatches successfully.
+   - A failed dispatch therefore cannot orphan an in-flight queued task.
+
+9. Error false positives
+   - Assistant prose is not interpreted as product-error boilerplate while the assistant is actively generating.
+
+10. Reload dead ends
+   - Conversation-load recovery is bounded.
+   - With a transaction, reload exhaustion fails closed while preserving task/queue state.
+   - Without a transaction, at most two page-level recovery reloads occur in five minutes before automation blocks instead of looping.
+
+11. Performance
+   - A pending queue by itself no longer forces the 1-second active watchdog.
+   - Clearing the composer wakes the queue event-driven, so the queue can remain on the slow idle watchdog while blocked by a draft.
+   - No response-stream clone, no network-open liveness, no per-token persistent writes, no global style/class mutation observer.
+
+12. Strict completion contract
+   - Removed the historical-tail adoption bypass. In this dedicated project browser, an assistant tail without a terminal marker is not silently treated as committed for queue progression.
+
+Static audit: 29/29 architecture/wiring invariants passed.
+JavaScript syntax: PASS (node --check).
+
+Real authenticated ChatGPT DOM can still change independently of this build, so runtime behavior should be validated in the dedicated project browser.
