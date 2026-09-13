@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.16
+// @version      1.3.19
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.16
+   * ChatGPT Resilience 1.3.19
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.16';
+  const VERSION = '1.3.19';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1875,51 +1875,20 @@
     );
   }
 
-  async function dispatchQueuedItemNow(id) {
-    if (!verifyTabContext()) return false;
-    const actionRoute = S.route;
-    if (S.actionInFlight || isPaused() || S.error || !navigator.onLine) return false;
-    const input = getComposer();
-    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
-    if (!verifyTabContext(actionRoute)) return false;
-
-    S.txn = loadTxn(actionRoute);
-    S.hib = loadHibernation(actionRoute);
-    S.queue = loadQueue(actionRoute);
-    reconcileQueueClaim('manual-action');
-
-    const freshError = currentError(getMessages(true));
-    if (freshError) { S.error = freshError; return false; }
-
-    const resumeHib = !!S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase);
-    if (S.route !== actionRoute || (S.hib && !resumeHib)) return false;
-    const item = S.queue.find(x => x.id === id);
-    if (!item) { renderQueueList(); return false; }
-
-    cancelRecovery('queue-action');
-    S.generating = humanSendMustQueue();
-    if (S.generating && !S.txn) return false;
-
-    const hadBlock = !!S.blockedReason;
-    const source = S.generating ? 'queue-steer' : 'queue-send';
-    const accepted = await dispatchQueuedItem(item, source, !S.txn);
-    if (!accepted) return false;
-
-    if (resumeHib && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
-    if (hadBlock && S.blockedReason) clearBlock('queue-send-confirmed');
-    S.queueHoldReason = '';
-    return true;
-  }
-
-  function tailCommittedForQueue() {
-    const msgs = getMessages();
-    if (!msgs.lastUser && !msgs.lastAssistant) return true;
-    if (!assistantIsCurrentTail(msgs)) return false;
-    return latestMarker(msgs) === 'done';
-  }
-
-  function queueBlocked() {
-    return !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error;
+  function queueReleaseBlockReason(msgs = getMessages()) {
+    if (!assistantIsCurrentTail(msgs) || latestMarker(msgs) !== 'done') return 'waiting-for-cgr-done';
+    if (S.error) return `error:${S.error.id || 'unknown'}`;
+    if (S.recovery || S.pendingRecoveryReason || S.controlFault) return 'recovery';
+    if (S.hib) return `hibernate:${S.hib.phase || 'active'}`;
+    if (S.txn) return 'active-task';
+    if (S.generating) return 'generating';
+    if (S.verify) return 'verifying';
+    if (isPaused()) return `paused:${S.pausedReason || 'active'}`;
+    if (S.blockedReason) return `blocked:${S.blockedReason}`;
+    if (S.actionInFlight) return 'action-in-flight';
+    if (S.sendIntent) return 'send-intent';
+    if (!navigator.onLine) return 'offline';
+    return '';
   }
 
   function kickQueue(reason = 'event', delay = 0) {
@@ -1937,12 +1906,12 @@
   async function processQueue() {
     if (!verifyTabContext() || S.queueProcessing || !S.enabled || !S.queue.length) return false;
     const pumpRoute = S.route;
-    if (queueBlocked()) {
-      S.queueHoldReason = S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
-      return false;
-    }
-    if (!tailCommittedForQueue()) {
-      S.queueHoldReason = 'tail-uncommitted-no-journal';
+
+    // DONE is necessary but not sufficient. The same canonical gate also
+    // requires every recovery/error/hibernate activity to be fully settled.
+    const initialBlock = queueReleaseBlockReason();
+    if (initialBlock) {
+      S.queueHoldReason = initialBlock;
       return false;
     }
     if (S.lastGenerationEndAt && now() - S.lastGenerationEndAt < CFG.interTurnSettleMs) {
@@ -1969,11 +1938,17 @@
       reconcileQueueClaim('queue-pump');
 
       if (S.route !== pumpRoute) return false;
-      const freshError = currentError(getMessages(true));
-      if (freshError) { S.error = freshError; S.queueHoldReason = `error:${freshError.id}`; return false; }
 
-      if (S.txn || S.hib) {
-        S.queueHoldReason = S.txn ? 'active-task' : S.hib.phase;
+      const freshMsgs = getMessages(true);
+      const freshError = currentError(freshMsgs);
+      if (freshError) S.error = freshError;
+
+      // Re-run the exact same gate after durable state and live DOM refresh.
+      // This closes races where recovery, an error, or hibernation begins while
+      // the pump is staging.
+      const freshBlock = queueReleaseBlockReason(freshMsgs);
+      if (freshBlock) {
+        S.queueHoldReason = freshBlock;
         return false;
       }
 
@@ -2029,6 +2004,7 @@
   }
 
   function setWaitUser() {
+    const entering = S.hib?.phase !== 'wait-user';
     S.hib = {
       route: S.route,
       phase: 'wait-user',
@@ -2039,6 +2015,7 @@
     saveHibernation();
     if (DC.wakeTimer) clearTimeout(DC.wakeTimer);
     DC.wakeTimer = null; DC.wakeDueAt = 0;
+    if (entering) maybeNotify(`${APP}: waiting for you`, 'The current task needs your input.');
     paintUI(true);
   }
 
@@ -2185,6 +2162,7 @@
       if (S.hib) clearHibernation('done-marker');
       S.lastGenerationEndAt = now();
       clearTxn('done-marker');
+      maybeNotify(`${APP}: task done`, 'The current task reached [[CGR_DONE]].');
       return true;
     }
     return false;
@@ -3056,15 +3034,11 @@
 
       const body = document.createElement('div'); body.className = 'cgr-queue-body';
       const text = document.createElement('div'); text.className = 'cgr-queue-text'; text.textContent = item.text; text.title = item.text; text.addEventListener('dblclick', () => beginQueueEdit(item.id));
-      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : item.id === nextQueueId ? 'Next follow-up' : `Follow-up ${index + 1}`;
+      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : item.id === nextQueueId ? 'Next · waits for [[CGR_DONE]]' : `Follow-up ${index + 1}`;
       body.append(text, meta); row.appendChild(body);
 
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (S.queueEditingId !== item.id) {
-        const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
-        send.disabled = S.hib?.phase === 'waking' || isPaused() || !!S.error || S.actionInFlight ||
-          (S.generating && !S.txn) || !navigator.onLine;
-        send.addEventListener('click', () => dispatchQueuedItemNow(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.disabled = S.actionInFlight; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
       const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.disabled = S.actionInFlight; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
@@ -3125,8 +3099,11 @@
     }
     if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
     if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
-    if (S.queue.length) return [`Queue ${S.queue.length}`, 'active'];
-    if (!tailCommittedForQueue()) return ['Untracked unfinished turn', 'warn'];
+    if (S.queue.length) {
+      const reason = queueReleaseBlockReason();
+      return [reason ? `Queue ${S.queue.length} · ${reason === 'waiting-for-cgr-done' ? 'waiting for DONE' : 'held'}` : `Queue ${S.queue.length} · ready`, 'active'];
+    }
+    if (!assistantIsCurrentTail(getMessages()) || latestMarker(getMessages()) !== 'done') return ['Untracked unfinished turn', 'warn'];
     return ['Healthy', 'ok'];
   }
 
@@ -3278,6 +3255,8 @@
       ['post-stop spinner is not settled', postStopControlSettled({ kind:'spinner', hasDraft:false, busyEvidence:false }), false],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
+      ['error text never unlocks queue', markerFromProtocolText('Something went wrong. Retry') === 'done', false],
+      ['only DONE marker unlocks queue policy', markerFromProtocolText('x[[CGR_DONE]]') === 'done', true],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
       ['normal new-chat runtime off', isProjectUrl('https://chatgpt.com/'), false],
       ['project runtime on', isProjectUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), true],

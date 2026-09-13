@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.16 — wiring / edge-case audit
+ChatGPT Resilience v1.3.19 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -9,21 +9,48 @@ Core contract
 - Normal Enter / native Send:
     generating -> queue
     idle       -> native send
-- Automatic queue advancement is stricter than human sending and requires the
-  previous rendered assistant tail to end in [[CGR_DONE]].
-- [[CGR_HIBERNATE_GITHUB_10M]] and [[CGR_WAIT_USER]] do not count as queue
-  completion.
+- Queued messages have exactly one dispatch path: the automatic queue pump.
+- The pump is locked unless the CURRENT rendered assistant tail ends in
+  [[CGR_DONE]].
+- Errors, [[CGR_HIBERNATE_GITHUB_10M]], [[CGR_WAIT_USER]], recovery, generation,
+  and ambiguous states never release queued work.
+- There is no manual queued Send/Steer bypass.
+
+Queue release readiness
+-----------------------
+A queued item may dispatch only when ONE canonical gate reports no block:
+- current assistant tail ends in [[CGR_DONE]]
+- no recognized error
+- no active/pending recovery or control fault
+- no hibernation state (sleeping, waking, or wait-user)
+- no active transaction
+- not generating
+- no verifier
+- not paused or blocked
+- no action in flight or send intent
+- browser is online
+
+Unresolved long-thinking is represented by recovery/pending-recovery state, so it
+must finish its Stop -> wait -> continue flow before the queue can release.
+If [[CGR_DONE]] is later committed, that protocol result is the proof that the
+recovered logical task has actually finished.
+
+The gate is checked twice: before queue staging and again after durable state +
+live DOM are refreshed, closing races with newly-started recovery/hibernation.
 
 Queue dispatch
 --------------
-1. Programmatic dispatch reserves actionInFlight.
-2. Queue mutations are frozen during the short dispatch window.
-3. The transaction journal is persisted before a queued item is removed.
-4. queueItemId is only a transient crash-recovery claim.
-5. Queue removal is persisted before the claim pointer is cleared.
-6. Native Send is clicked only after the durable transaction/queue handoff.
-7. If the click is swallowed or the tab dies, the journal owns recovery; the
-   future queue item is not duplicated.
+1. The current assistant tail must end in [[CGR_DONE]].
+2. Every other state leaves the queue inert.
+3. Programmatic dispatch reserves actionInFlight.
+4. Queue mutations are frozen during the short dispatch window.
+5. The transaction journal is persisted before a queued item is removed.
+6. queueItemId is only a transient crash-recovery claim.
+7. Queue removal is persisted before the claim pointer is cleared.
+8. Native Send is clicked only after the durable transaction/queue handoff.
+9. Once one queued item sends, its new user turn closes the DONE gate again.
+10. If the click is swallowed or the tab dies, the journal owns recovery; the
+    future queue item is not duplicated.
 
 Generation detection
 --------------------
@@ -47,10 +74,10 @@ Therefore:
 
 Human overrides / hibernation
 -----------------------------
-- Native human sends can resume sleeping or wait-user hibernation.
-- Manual Send on a queued item follows the same rule.
+- Native human sends remain separate from queued-message dispatch.
+- Queued messages never override sleeping, waking, wait-user, or errors.
 - Waking state remains serialized by actionInFlight.
-- Automatic queue advancement stays blocked during hibernation.
+- Automatic queue advancement stays blocked until a later [[CGR_DONE]].
 
 Queue editing
 -------------
@@ -119,17 +146,29 @@ Long-thinking recovery
 - The long-thinking banner may remain mounted after Stop, so post-Stop settling
   intentionally ignores that banner and trusts the actual composer controls.
 
+Notifications
+-------------
+- [[CGR_WAIT_USER]] sends a desktop notification when the runtime transitions
+  into wait-user.
+- Repeated evaluation/reload passes do not re-notify while the persisted
+  wait-user state is already active.
+- [[CGR_DONE]] sends a desktop notification only after the transaction has been
+  durably completed.
+- [[CGR_HIBERNATE_GITHUB_10M]] does not notify.
+
 Known intentional behavior
 --------------------------
-- Automatic queue progression does NOT run past hibernate/wait-user or an
-  unfinished tail.
+- Queue progression happens only after [[CGR_DONE]] on the current assistant tail.
+- A single DONE can release at most one queued item because that send creates the
+  next user turn and closes the gate again.
+- Hibernate, wait-user, errors, recovery, and unfinished tails never release it.
 - Recovery/rate-limit pauses are separate from the removed queue pause feature.
 - Existing bounded page-reload recovery remains part of the recovery subsystem;
   it is not part of queue dispatch.
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.16
+- Userscript version: 1.3.19
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
