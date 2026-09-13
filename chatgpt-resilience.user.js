@@ -882,7 +882,7 @@
     const decision = strongBusy ? true : generationDecision(next, S.generating);
 
     // Typing can replace Stop with Send while the response is still running.
-    // generationDecision gives that ambiguous state a bounded grace period.
+    // Keep that active state until the draft is cleared and real controls return.
     return decision;
   }
 
