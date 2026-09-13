@@ -871,13 +871,14 @@
     const next = getComposerControlState();
     const prev = S.composerControl || {};
     const t = now();
+    const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
     if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = t;
     S.composerControl = next;
 
-    const decision = generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
     const explicitIdle = next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft);
-    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence);
+    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence || longThinkingBusy);
     if (strongBusy) S.lastGenerationEvidenceAt = t;
+    const decision = strongBusy ? true : generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
 
     // Typing can replace Stop with Send while the response is still running.
     // generationDecision gives that ambiguous state a bounded grace period.
@@ -1710,7 +1711,7 @@
   }
 
   function removeQueueItem(id, reason = 'removed') {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const i = queueIndexById(id);
     if (i < 0) return false;
     S.queue.splice(i, 1);
@@ -1722,7 +1723,7 @@
   }
 
   function clearPendingQueue() {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     if (S.queueEditingId) cancelQueueEdit();
     S.queue = [];
     saveQueue();
@@ -1739,7 +1740,7 @@
   }
 
   function queueCurrentComposer() {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const input = getComposer();
     const p = promptText(composerText(input));
     if (!input || !norm(p)) return false;
@@ -1777,7 +1778,7 @@
   }
 
   function moveQueueItem(id, targetIndex) {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const from = queueIndexById(id);
     if (from < 0) return false;
     const before = captureQueueRects();
@@ -1791,7 +1792,7 @@
   }
 
   function beginQueueEdit(id) {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const item = S.queue.find(x => x.id === id);
     const input = getComposer();
     if (!item || !input || norm(composerText(input))) return false;
@@ -1814,7 +1815,7 @@
   }
 
   function commitQueueEdit() {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const id = S.queueEditingId;
     const item = S.queue.find(x => x.id === id);
     const input = getComposer();
@@ -2949,10 +2950,10 @@
     S.queue.forEach((item, index) => {
       const row = document.createElement('div');
       row.className = `cgr-queue-item ${S.queueEditingId === item.id ? 'is-editing' : ''}`;
-      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = S.queueEditingId !== item.id;
+      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = !S.actionInFlight && S.queueEditingId !== item.id;
 
       const grip = document.createElement('button');
-      grip.type = 'button'; grip.className = 'cgr-queue-grip'; grip.title = 'Drag to reorder · Arrow keys move'; grip.innerHTML = '<span></span><span></span><span></span><span></span><span></span><span></span>';
+      grip.type = 'button'; grip.className = 'cgr-queue-grip'; grip.disabled = S.actionInFlight; grip.title = 'Drag to reorder · Arrow keys move'; grip.innerHTML = '<span></span><span></span><span></span><span></span><span></span><span></span>';
       grip.addEventListener('keydown', e => { if (!['ArrowUp', 'ArrowDown'].includes(e.key)) return; e.preventDefault(); moveQueueItem(item.id, queueIndexById(item.id) + (e.key === 'ArrowUp' ? -1 : 2)); });
       row.appendChild(grip);
 
@@ -2966,9 +2967,9 @@
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
         send.disabled = S.hib?.phase === 'waking' || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
         send.addEventListener('click', () => dispatchQueuedItemNow(item.id)); actions.appendChild(send);
-        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
+        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.disabled = S.actionInFlight; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
-      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
+      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.disabled = S.actionInFlight; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
 
       row.addEventListener('dragstart', e => { DC.queueDragId = item.id; row.classList.add('is-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) {} });
       row.addEventListener('dragend', () => { DC.queueDragId = ''; row.classList.remove('is-dragging'); });
@@ -2986,7 +2987,7 @@
     if (btn?.isConnected) {
       const badge = btn.querySelector('b');
       if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
-      btn.disabled = !norm(composerText(input)) || hasComposerAttachments(input);
+      btn.disabled = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
       return;
     }
     const send = findSafeSendButton(input);
@@ -2999,7 +3000,7 @@
     btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); if (S.queueEditingId) commitQueueEdit(); else queueCurrentComposer(); });
     try { if (send && send.parentElement === parent) parent.insertBefore(btn, send); else parent.appendChild(btn); } catch (_) {}
     const badge = btn.querySelector('b'); if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
-    btn.disabled = !norm(composerText(input)) || hasComposerAttachments(input);
+    btn.disabled = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
   }
 
   function statusText() {
