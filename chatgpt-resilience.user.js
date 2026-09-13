@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.0.4
+// @version      1.0.5
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.0.4
+   * ChatGPT Resilience 1.0.5
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -36,9 +36,10 @@
    *
    * Recovery policy:
    *   - Native Continue generating is preferred when ChatGPT exposes it.
-   *   - A confirmed unfinished turn that becomes idle is verified for 5 quiet seconds,
-   *     then resumed with the literal user message: continue
-   *   - A stuck long-thinking/generation state is stopped, then resumed with: continue
+   *   - A confirmed unfinished turn with no text/control progress for 5 minutes
+   *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
+   *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
+   *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
    *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, context-limit, policy and unsafe upload states fail closed.
@@ -52,7 +53,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.0.4';
+  const VERSION = '1.0.5';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -72,7 +73,8 @@
     structureDebounceMs: 250,
     tailDebounceMs: 300,
     answerSettleMs: 1_200,
-    incompleteVerifyMs: 5_000,
+    incompleteVerifyMs: 5 * 60_000,
+    recoveryPauseMs: 10_000,
     sendConfirmMs: 18_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
@@ -1311,13 +1313,12 @@
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
     const nextCount = Number(t.continueCount || 0) + 1;
-    const wait = CFG.retryBackoffMs[Math.min(nextCount - 1, CFG.retryBackoffMs.length - 1)];
     const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, { newLogicalTask: false });
     if (!ok || !S.txn) return false;
     S.txn.continueCount = nextCount;
-    S.txn.nextRecoveryAt = now() + wait;
+    S.txn.nextRecoveryAt = now() + CFG.recoveryPauseMs;
     saveTxn();
-    log('literal-continue', { reason, count: nextCount, backoff: wait });
+    log('literal-continue', { reason, count: nextCount, cooldown: CFG.recoveryPauseMs });
     return true;
   }
 
@@ -1330,26 +1331,53 @@
     return false;
   }
 
-  async function stopThenContinue(reason = 'stall') {
+  async function stopThenContinue(reason = 'recovery') {
     const t = S.txn;
-    if (!t || t.manualStopped || S.actionInFlight || isPaused()) return false;
-    const stop = findStopButton();
-    if (!stop) return false;
+    if (!t || !t.userTurnConfirmed || t.manualStopped || S.actionInFlight || isPaused() || S.blockedReason) return false;
+    if (latestMarker(getMessages())) return false;
+
     const expectedTxnId = t.id;
-    S.actionInFlight = true;
-    try {
-      if (!(await verifyLease())) return false;
-      const diskTxn = loadTxn(S.route);
-      if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
-      S.txn = diskTxn;
-      if (!stop.isConnected || disabled(stop) || !visible(stop)) return false;
-      stop.click();
-      log('auto-stop', { reason });
-    } finally { S.actionInFlight = false; }
-    await waitForGenerationStop();
-    await sleep(300);
+    const before = getMessages();
+    const beforeSig = signature(before.lastAssistantText);
+    const stop = findStopButton();
+
+    if (stop && visible(stop) && !disabled(stop)) {
+      S.actionInFlight = true;
+      try {
+        if (!(await verifyLease())) return false;
+        const diskTxn = loadTxn(S.route);
+        if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
+        S.txn = diskTxn;
+        if (!stop.isConnected || disabled(stop) || !visible(stop)) return false;
+        stop.click();
+        log('auto-stop', { reason });
+      } finally { S.actionInFlight = false; }
+
+      await waitForGenerationStop();
+    } else if (isGenerating()) {
+      // We cannot safely invent a Stop target. Re-evaluate until ChatGPT exposes
+      // the real Stop control or becomes idle on its own.
+      scheduleEvaluate(`await-stop:${reason}`, 1_000);
+      return false;
+    }
+
     S.generating = isGenerating();
     if (S.generating) return false;
+
+    log('recovery-wait', { reason, ms: CFG.recoveryPauseMs });
+    await sleep(CFG.recoveryPauseMs);
+
+    // The ten-second grace period is real: if ChatGPT resumed, changed the
+    // response, emitted a terminal marker, or another tab took ownership, abort.
+    if (!S.txn || S.txn.id !== expectedTxnId || S.txn.manualStopped) return false;
+    const after = getMessages(true);
+    if (latestMarker(after)) return false;
+    if (isGenerating()) return false;
+    if (signature(after.lastAssistantText) !== beforeSig) {
+      S.lastAssistantProgressAt = now();
+      scheduleEvaluate(`recovery-progress:${reason}`, 500);
+      return false;
+    }
     return sendLiteralContinue(reason);
   }
 
@@ -1734,7 +1762,7 @@
     if (now() - v.since < CFG.incompleteVerifyMs) return false;
     if (err?.kind === 'hard' || err?.kind === 'rate' || err?.kind === 'reload') return false;
     resetVerification('confirmed-dead');
-    return sendLiteralContinue(v.reason);
+    return stopThenContinue(v.reason);
   }
 
   async function completeLogicalTask(marker, msgs) {
@@ -1861,49 +1889,41 @@
   async function handleError(err, msgs) {
     const t = S.txn;
     if (!err) return false;
-    if (err.kind === 'hard') {
-      blockAutomation(err.id, `${err.id} cannot be repaired safely by automatic retries. Queue is preserved.`);
+
+    // These are not recoverable generation glitches. Do not automate through
+    // authentication, anti-abuse, policy, or hard conversation-context gates.
+    if (['auth', 'anti-abuse', 'policy', 'context-limit'].includes(err.id)) {
+      blockAutomation(err.id, `${err.id} needs human attention. Queue and task state are preserved.`);
       return true;
     }
-    if (err.kind === 'rate') {
-      const wait = rateWaitMs(err.sourceText);
-      pauseUntil(now() + wait, 'rate-limit');
-      if (t) { t.nextRecoveryAt = S.pausedUntil; saveTxn(); }
-      return true;
-    }
-    if (err.kind === 'reload') {
-      if (!t) return reloadWithoutTxn(err.id);
-      const ok = await reloadForRecovery(err.id);
-      if (!ok && Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
-        blockAutomation('reload-safety-cap', 'ChatGPT still cannot load this conversation after bounded recovery reloads. Queue and task state are preserved.');
-      }
-      return ok;
-    }
+
     if (!t) return false;
     if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
     if (t.manualStopped) return false;
-    // Confirmed turns never Retry/Regenerate. We preserve whatever survived and
-    // resume the logical task with the completion contract's literal continue.
-    if (!S.generating) armVerification(msgs, `error:${err.id}`);
-    return false;
-  }
 
+    // Every other recognized ChatGPT/product error follows one deterministic
+    // recovery path: Stop if possible -> fully idle -> wait 10s -> "continue".
+    resetVerification(`error:${err.id}`);
+    return stopThenContinue(`error:${err.id}`);
+  }
   async function maybeRecoverStall(msgs, longThinking) {
     const t = S.txn;
-    if (!t || !t.userTurnConfirmed || t.manualStopped || !S.generating) return false;
-    const hasOutput = assistantChangedForTxn(msgs, t);
-    const quietFor = now() - Math.max(S.lastAssistantProgressAt, S.lastControlChangeAt, Number(t.confirmedAt || t.subturnAt || 0));
-    let threshold = hasOutput ? CFG.genericPartialStallMs : CFG.genericNoOutputStallMs;
-    if (longThinking && now() - S.longThinkingSeenAt >= CFG.longThinkingMinVisibleMs) {
-      threshold = hasOutput ? CFG.longThinkingPartialStallMs : CFG.longThinkingNoOutputStallMs;
-    }
-    if (quietFor < threshold) return false;
-    const stop = findStopButton();
-    if (stop) return stopThenContinue(longThinking ? 'long-thinking-stall' : 'generation-stall');
-    if (quietFor >= CFG.noStopReloadStallMs) return reloadForRecovery('stuck-without-stop-control');
-    return false;
-  }
+    if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
+    if (latestMarker(msgs)) return false;
 
+    // The purple "our systems are thinking a bit more..." state is treated as
+    // a failed turn immediately: Stop -> 10 seconds -> literal continue.
+    if (longThinking) return stopThenContinue('long-thinking');
+
+    const quietFor = now() - Math.max(
+      S.lastAssistantProgressAt,
+      S.lastControlChangeAt,
+      Number(t.confirmedAt || t.subturnAt || 0),
+    );
+
+    if (quietFor < CFG.incompleteVerifyMs) return false;
+    return stopThenContinue('stuck-5m');
+  }
   async function evaluate(reason = 'event') {
     detectRouteChange();
     ensureObservers();
@@ -1950,15 +1970,16 @@
       // Manual Stop is sacred. Do not immediately undo the user's action.
       if (t.manualStopped) { paintUI(); scheduleWatchdog(); return; }
 
-      // Native continuation is strictly less destructive than creating a new turn.
-      if (!S.generating && findContinueButton() && !['hard', 'rate'].includes(err?.kind || '')) {
-        await clickNativeContinue();
+      // A visible/recognized error owns recovery before any native continuation.
+      if (err) {
+        await handleError(err, msgs);
         paintUI(); scheduleWatchdog(); return;
       }
 
-      if (err) {
-        await handleError(err, msgs);
-        if (isPaused() || err.kind === 'reload' || !t.userTurnConfirmed) { paintUI(); scheduleWatchdog(); return; }
+      // Native continuation remains useful only for clean, non-error truncation.
+      if (!S.generating && findContinueButton()) {
+        await clickNativeContinue();
+        paintUI(); scheduleWatchdog(); return;
       }
 
       if (!t.userTurnConfirmed) {
@@ -1966,15 +1987,18 @@
         paintUI(); scheduleWatchdog(); return;
       }
 
-      if (S.generating) {
-        await maybeRecoverStall(msgs, longThinking);
+      if (await maybeRecoverStall(msgs, longThinking)) {
         paintUI(); scheduleWatchdog(); return;
       }
 
-      // Idle + confirmed + no terminal marker = unfinished by contract. Five
-      // seconds of absolute quiet proves the UI did not merely blink between states.
+      if (S.generating) {
+        paintUI(); scheduleWatchdog(); return;
+      }
+
+      // Idle + confirmed + no terminal marker remains unfinished. The verifier
+      // now waits five full quiet minutes, then uses the same Stop/10s/continue path.
       if (!marker) {
-        armVerification(msgs, err ? `error:${err.id}` : 'missing-terminal-marker');
+        armVerification(msgs, 'missing-terminal-marker');
         await maybeFinishVerification(msgs, err);
         paintUI(); scheduleWatchdog(); return;
       }
