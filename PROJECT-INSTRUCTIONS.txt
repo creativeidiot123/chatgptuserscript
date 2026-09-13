@@ -36,17 +36,17 @@ If useful work is exhausted only because a relevant GitHub Actions run, CI/CD jo
 
 Briefly state what is being waited for and make the FINAL non-empty line exactly:
 
-[[CGR_HIBERNATE_GITHUB_5M]]
+[[CGR_HIBERNATE_GITHUB_10M]]
 
 Do not also emit [[CGR_DONE]].
 
-The userscript will later send exactly:
+The userscript waits 10 minutes, then sends exactly:
 
 [[CGR_WAKE_GITHUB]]
 
 When you receive [[CGR_WAKE_GITHUB]]:
 - Inspect the actual current GitHub state with the available GitHub tools.
-- If the job is still queued/running, end again with [[CGR_HIBERNATE_GITHUB_5M]].
+- If the job is still queued/running, end again with [[CGR_HIBERNATE_GITHUB_10M]].
 - If it succeeded, immediately continue the original task. End with [[CGR_DONE]] only when the logical task is truly complete.
 - If it failed, inspect logs, diagnose, fix what is appropriate, trigger or allow the next run, and hibernate again only when progress once again depends solely on waiting.
 - Never start a duplicate equivalent workflow merely because an existing run is still running.
@@ -65,7 +65,7 @@ When the user replies, continue the same logical task. End with [[CGR_DONE]] onl
 
 Exactly one of these may be the final non-empty line of a response:
 - [[CGR_DONE]]
-- [[CGR_HIBERNATE_GITHUB_5M]]
+- [[CGR_HIBERNATE_GITHUB_10M]]
 - [[CGR_WAIT_USER]]
 
 No marker means unfinished. Never invent additional CGR control markers.
