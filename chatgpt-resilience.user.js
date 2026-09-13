@@ -1,0 +1,2600 @@
+// ==UserScript==
+// @name         ChatGPT Resilience
+// @namespace    https://chatgpt.com/
+// @homepageURL  https://github.com/creativeidiot123/chatgptuserscript
+// @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
+// @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
+// @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
+// @version      1.0.3
+// @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
+// @author       Ankit + ChatGPT
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @run-at       document-start
+// @noframes
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_addStyle
+// @grant        GM_registerMenuCommand
+// @grant        GM_notification
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  /*
+   * ChatGPT Resilience 1.0.3
+   *
+   * Core invariant for this dedicated project browser:
+   *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
+   *
+   * Terminal markers:
+   *   [[CGR_DONE]]                 normal successful completion
+   *   [[CGR_HIBERNATE_GITHUB_5M]] suspend the logical task and wake in 5 minutes
+   *   [[CGR_WAIT_USER]]            suspend the logical task for human input
+   *
+   * Recovery policy:
+   *   - Native Continue generating is preferred when ChatGPT exposes it.
+   *   - A confirmed unfinished turn that becomes idle is verified for 5 quiet seconds,
+   *     then resumed with the literal user message: continue
+   *   - A stuck long-thinking/generation state is stopped, then resumed with: continue
+   *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
+   *   - A send is retried only when the original can be proven not to have landed.
+   *   - Auth, anti-abuse, context-limit, policy and unsafe upload states fail closed.
+   *
+   * Performance policy:
+   *   - no response-stream cloning
+   *   - no full-page text sweeps
+   *   - no per-token persistent writes
+   *   - tail/composer observers only, with coalescing
+   *   - adaptive watchdog: fast only while a logical task is unresolved
+   */
+
+  const APP = 'ChatGPT Resilience';
+  const VERSION = '1.0.3';
+  const PREFIX = 'cgr1:';
+  const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const PROTOCOL = Object.freeze({
+    DONE: '[[CGR_DONE]]',
+    HIBERNATE: '[[CGR_HIBERNATE_GITHUB_5M]]',
+    WAKE: '[[CGR_WAKE_GITHUB]]',
+    WAIT_USER: '[[CGR_WAIT_USER]]',
+    CONTINUE: 'continue',
+  });
+
+  const CFG = Object.freeze({
+    activeWatchdogMs: 1_000,
+    idleWatchdogMs: 15_000,
+    hiddenWatchdogMs: 30_000,
+    structureDebounceMs: 250,
+    tailDebounceMs: 300,
+    answerSettleMs: 1_200,
+    incompleteVerifyMs: 5_000,
+    sendConfirmMs: 18_000,
+    sendIntentMs: 8_000,
+    postReloadReconcileMs: 5_000,
+    interTurnSettleMs: 1_200,
+    queuePumpRetryMs: 750,
+    queueBlockedRetryMs: 2_000,
+    queueStageReadyMs: 3_000,
+    longThinkingMinVisibleMs: 30_000,
+    longThinkingPartialStallMs: 90_000,
+    longThinkingNoOutputStallMs: 180_000,
+    genericPartialStallMs: 180_000,
+    genericNoOutputStallMs: 300_000,
+    noStopReloadStallMs: 300_000,
+    stopSettleTimeoutMs: 12_000,
+    maxContinuesPerLogicalTask: 8,
+    maxResendAttempts: 1,
+    maxReloadsPerLogicalTask: 2,
+    reloadCooldownMs: 30_000,
+    rateFallbackMs: 60_000,
+    githubHibernateMs: 5 * 60_000,
+    githubWakeBlockedRetryMs: 15_000,
+    githubWrongRouteRetryMs: 60_000,
+    leaseMs: 20_000,
+    leaseVerifyMs: 50,
+    logLimit: 160,
+    retryBackoffMs: [2_000, 5_000, 15_000, 30_000, 60_000, 120_000],
+  });
+
+  const SELECTORS = Object.freeze({
+    composer: [
+      '#prompt-textarea',
+      'div[contenteditable="true"][id="prompt-textarea"]',
+      'textarea[data-id="root"]',
+      'form textarea',
+    ],
+    send: [
+      '#composer-submit-button',
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send message"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label="Send"]',
+    ],
+    stop: [
+      'button[data-testid="stop-button"]',
+      'button[aria-label="Stop generating"]',
+      'button[aria-label="Stop response"]',
+    ],
+    user: [
+      '[data-message-author-role="user"]',
+    ],
+    assistant: [
+      '[data-message-author-role="assistant"]',
+    ],
+    streaming: [
+      '[data-is-streaming="true"]',
+      '[data-streaming="true"]',
+    ],
+    alerts: [
+      '[role="alert"]',
+      '[aria-live="assertive"]',
+      '[data-testid*="error" i]',
+    ],
+  });
+
+  const CONTINUE_LABELS = new Set(['continue generating', 'continue response']);
+
+
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something went wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|conversation (?:has )?(?:reached )?(?:its )?maximum length|conversation is too long|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
+  const ERROR_RULES = [
+    { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare|automated traffic|security check|you have been blocked/i },
+    { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
+    { id: 'context-limit', kind: 'hard', re: /conversation (?:has )?(?:reached )?(?:its )?maximum length|maximum length for (?:this )?conversation|conversation is too long|start a new (?:chat|conversation)/i },
+    { id: 'policy', kind: 'hard', re: /content policy|may violate|can(?:not|'t|’t) assist with that|can(?:not|'t|’t) help with that request/i },
+    { id: 'artifact-expired', kind: 'hard', re: /download failed|file not found|generated file (?:has )?expired|file (?:has )?expired/i },
+    { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
+    { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|please wait before trying again/i },
+    { id: 'conversation-load', kind: 'reload', re: /conversation not found|unable to load conversation|failed to load conversation|problem preparing your chat|couldn(?:'|’)t load (?:this )?conversation/i },
+    { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|connection (?:error|lost|failed|interrupted)|websocket|socket (?:error|closed)|disconnected/i },
+    { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|message[- ]delivery (?:timed? out|timeout)|too late/i },
+    { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted)/i },
+    { id: 'thinking-failed', kind: 'continue', re: /thinking failed|reasoning failed|failed while thinking|stopped thinking|reasoning stopped|stopped reasoning/i },
+    { id: 'generation', kind: 'continue', re: /there was an error generating a response|something went wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)/i },
+    { id: 'server', kind: 'continue', re: /server error|internal server error|service unavailable|temporarily unavailable|overloaded|bad gateway|gateway timeout|model (?:is )?(?:currently |temporarily )?unavailable|model capacity/i },
+    { id: 'image-generation', kind: 'continue', re: /image generation failed|failed to generate (?:the )?image|couldn(?:'|’)t generate (?:the )?image/i },
+    { id: 'message-send', kind: 'send', re: /message (?:failed|couldn(?:'|’)t|could not) (?:to )?send|failed to send (?:the )?message|unable to send (?:the )?message/i },
+  ];
+
+  const store = {
+    get(key, fallback = null) {
+      try { return GM_getValue(PREFIX + key, fallback); } catch (_) { return fallback; }
+    },
+    set(key, value) {
+      try { GM_setValue(PREFIX + key, value); } catch (_) {}
+    },
+    del(key) {
+      try { GM_deleteValue(PREFIX + key); } catch (_) {}
+    },
+    json(key, fallback = null) {
+      try {
+        const raw = GM_getValue(PREFIX + key, '');
+        if (!raw) return fallback;
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch (_) { return fallback; }
+    },
+    setJson(key, value) {
+      try { GM_setValue(PREFIX + key, JSON.stringify(value)); } catch (_) {}
+    },
+  };
+
+
+  function migrateLegacyV012Once(scope) {
+    const flag = `${PREFIX}legacy-v012-migrated:${scope}`;
+    try {
+      if (GM_getValue(flag, false)) return;
+      const newQueueKey = `${PREFIX}queue:${scope}`;
+      const oldQueueRaw = GM_getValue(`cgr:queue:${scope}`, '');
+      const newQueueRaw = GM_getValue(newQueueKey, '');
+      if (!newQueueRaw && oldQueueRaw) GM_setValue(newQueueKey, oldQueueRaw);
+      if (GM_getValue(`${PREFIX}queueUserPaused`, null) == null) {
+        const oldPause = GM_getValue('cgr:queueUserPaused', null);
+        if (oldPause != null) GM_setValue(`${PREFIX}queueUserPaused`, oldPause);
+      }
+      if (!GM_getValue(`${PREFIX}draft`, '') && GM_getValue('cgr:draft', '')) GM_setValue(`${PREFIX}draft`, GM_getValue('cgr:draft', ''));
+      const oldHibRaw = GM_getValue(`cgr:github-hibernate:${scope}`, '');
+      if (!GM_getValue(`${PREFIX}github:${scope}`, '') && oldHibRaw) {
+        try {
+          const old = typeof oldHibRaw === 'string' ? JSON.parse(oldHibRaw) : oldHibRaw;
+          if (old && ['sleeping', 'waking', 'wait-user'].includes(old.phase)) {
+            GM_setValue(`${PREFIX}github:${scope}`, JSON.stringify({
+              route: scope, phase: old.phase, wakeAt: Number(old.wakeAt || 0), cycle: Number(old.cycle || 0), queueItemId: old.queueItemId || null, armedAt: Number(old.armedAt || now()),
+            }));
+          }
+        } catch (_) {}
+      }
+      // Deliberately do not migrate v0.12's global active transaction. Its schema
+      // had multiple overlapping recovery modes; replaying it would be less safe
+      // than starting v1 with a clean transaction journal.
+      GM_setValue(flag, true);
+    } catch (_) {}
+  }
+
+  const now = () => Date.now();
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const norm = s => String(s || '').replace(/\s+/g, ' ').trim();
+  const promptText = s => String(s || '').replace(/\r\n?/g, '\n').trim();
+  const lower = s => norm(s).toLowerCase();
+
+  function fnv1a(str) {
+    let h = 0x811c9dc5;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function signature(text) {
+    const t = norm(text);
+    return `${t.length}:${fnv1a(t.slice(0, 5000))}`;
+  }
+
+  function routeKey(href = location.href) {
+    try {
+      const u = new URL(href, location.origin);
+      // Regular chats: /c/<id>. Project chats: /g/g-p-.../c/<id>.
+      // Conversation IDs are globally unique, so use the trailing /c/<id> as
+      // the durable scope in both cases. This is critical for migrating a queue
+      // or transaction from a project landing page into the newly-created chat.
+      const m = u.pathname.match(/(?:^|\/)c\/([^/?#]+)(?:[/?#]|$)/);
+      if (m) return `c:${m[1]}`;
+      return `p:${u.pathname.replace(/\/+$/, '') || '/'}`;
+    } catch (_) { return 'unknown'; }
+  }
+
+  function visible(el) {
+    if (!el || !el.isConnected || el.hidden || el.getAttribute?.('aria-hidden') === 'true') return false;
+    try {
+      if (typeof el.checkVisibility === 'function') return el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+      return !!(el.offsetWidth || el.offsetHeight || el.getClientRects?.().length);
+    } catch (_) { return true; }
+  }
+
+  function disabled(el) {
+    return !el || !!el.disabled || el.getAttribute?.('aria-disabled') === 'true';
+  }
+
+  function qFirst(selectors, root = document) {
+    for (const sel of selectors) {
+      try {
+        const list = root.querySelectorAll(sel);
+        for (let i = list.length - 1; i >= 0; i--) if (visible(list[i])) return list[i];
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function qAll(selectors, root = document) {
+    const out = [], seen = new Set();
+    for (const sel of selectors) {
+      try {
+        for (const el of root.querySelectorAll(sel)) {
+          if (!seen.has(el)) { seen.add(el); out.push(el); }
+        }
+      } catch (_) {}
+    }
+    return out;
+  }
+
+  function exactButtonLabel(btn) {
+    if (!btn) return '';
+    // Prefer one semantic label instead of concatenating aria/text/testid. Exact
+    // matching against "continue generating" otherwise fails when more than one
+    // source is present on the same button.
+    const candidates = [
+      btn.getAttribute?.('aria-label'),
+      btn.textContent,
+      btn.getAttribute?.('title'),
+      btn.getAttribute?.('data-testid'),
+      btn.id,
+    ];
+    for (const value of candidates) {
+      const label = lower(value || '');
+      if (label) return label;
+    }
+    return '';
+  }
+
+  function terminalMarker(text, root = null) {
+    const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
+    if (!clean) return null;
+    const tokens = [
+      [PROTOCOL.DONE, 'done'],
+      [PROTOCOL.HIBERNATE, 'hibernate'],
+      [PROTOCOL.WAIT_USER, 'wait-user'],
+    ];
+
+    // With no DOM root (tests / diagnostics), enforce the written protocol:
+    // the marker must be the exact final non-empty line.
+    if (!root) {
+      const line = clean.split(/\r?\n/).at(-1).trim();
+      return tokens.find(([token]) => line === token)?.[1] || null;
+    }
+
+    // ChatGPT's rendered block DOM often flattens adjacent <p> elements in
+    // textContent with *no newline*. So checking the last text line alone can
+    // miss a perfectly valid final marker. First require the response's raw text
+    // to end in the token, then independently prove there is a visible element
+    // whose entire content is exactly that token and which is not quoted/code.
+    const hit = tokens.find(([token]) => clean.endsWith(token));
+    if (!hit) return null;
+    const [token, marker] = hit;
+    try {
+      const nodes = Array.from(root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6')).slice(-80).reverse();
+      const exact = nodes.find(el => {
+        if (!visible(el)) return false;
+        if (el.closest?.('pre,code,blockquote')) return false;
+        const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+        return value === token;
+      });
+      if (!exact) return null;
+      return marker;
+    } catch (_) { return null; }
+  }
+
+  function classifyError(text) {
+    const t = norm(text);
+    if (!t) return null;
+    for (const rule of ERROR_RULES) {
+      const m = t.match(rule.re);
+      if (m) return { id: rule.id, kind: rule.kind, text: m[0], sourceText: t.slice(-800) };
+    }
+    return null;
+  }
+
+  function parseWaitMs(text) {
+    const t = lower(text);
+    let m = t.match(/(?:try again|resets?|wait)[^\d]{0,30}(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)/i);
+    if (!m) m = t.match(/(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b/i);
+    if (!m) return 0;
+    const n = Number(m[1]);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    const u = m[2].toLowerCase();
+    if (u.startsWith('h')) return Math.ceil(n * 3_600_000);
+    if (u.startsWith('m')) return Math.ceil(n * 60_000);
+    return Math.ceil(n * 1_000);
+  }
+
+
+  function parseResetClockMs(text) {
+    const t = String(text || '');
+    const m = t.match(/(?:resets?|available again|try again|retry)[^\d]{0,50}(?:at\s*)?(\d{1,2})(?::(\d{2}))\s*(am|pm)?/i);
+    if (!m) return 0;
+    let hour = Number(m[1]);
+    const minute = Number(m[2]);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute) || minute > 59) return 0;
+    const ap = String(m[3] || '').toLowerCase();
+    if (ap === 'pm' && hour < 12) hour += 12;
+    if (ap === 'am' && hour === 12) hour = 0;
+    if (hour > 23) return 0;
+    const d = new Date();
+    d.setHours(hour, minute, 0, 0);
+    if (d.getTime() <= now() + 5_000) d.setDate(d.getDate() + 1);
+    return Math.max(0, d.getTime() - now());
+  }
+
+  function parseRetryAfterMs(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return 0;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+    const at = Date.parse(raw);
+    return Number.isFinite(at) ? Math.max(0, at - now()) : 0;
+  }
+
+  function rateWaitMs(text) {
+    return Math.max(
+      parseWaitMs(text),
+      parseResetClockMs(text),
+      Math.max(0, Number(S?.rateRetryAt || 0) - now()),
+      CFG.rateFallbackMs,
+    );
+  }
+
+  function log(event, meta = {}) {
+    const entry = { at: now(), event, ...meta };
+    S.logs.push(entry);
+    if (S.logs.length > CFG.logLimit) S.logs.splice(0, S.logs.length - CFG.logLimit);
+    try { console.debug(`[${APP}] ${event}`, meta); } catch (_) {}
+  }
+
+  function maybeNotify(title, text) {
+    try { if (typeof GM_notification === 'function') GM_notification({ title, text, timeout: 9_000 }); } catch (_) {}
+  }
+
+  // ---------- durable state ----------------------------------------------------------
+  const txnKey = scope => `txn:${scope}`;
+  const queueKey = scope => `queue:${scope}`;
+  const hibKey = scope => `github:${scope}`;
+  const draftKey = scope => `draft:${scope}`;
+
+  function getDraft(scope = routeKey()) { return String(store.get(draftKey(scope), '') || ''); }
+  function setDraft(text, scope = routeKey()) {
+    const value = promptText(text);
+    if (norm(value)) store.set(draftKey(scope), value); else store.del(draftKey(scope));
+  }
+  function clearDraft(scope = routeKey()) { store.del(draftKey(scope)); }
+
+
+  function loadTxn(scope = routeKey()) {
+    const t = store.json(txnKey(scope), null);
+    if (!t || typeof t !== 'object') return null;
+    return t.route === scope ? t : null;
+  }
+
+  function saveTxn() {
+    if (S.txn) store.setJson(txnKey(S.route), S.txn);
+    else store.del(txnKey(S.route));
+  }
+
+  function clearTxn(reason = 'complete') {
+    if (S.txn) log('txn-clear', { reason, source: S.txn.source, continues: S.txn.continueCount || 0 });
+    S.txn = null;
+    store.del(txnKey(S.route));
+    S.verify = null;
+    kickQueue(`txn-clear:${reason}`, 40);
+  }
+
+  function loadQueue(scope = routeKey()) {
+    const raw = store.json(queueKey(scope), []);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(x => x && typeof x.text === 'string' && norm(x.text)).map(x => ({
+      id: String(x.id || crypto.randomUUID?.() || `q-${now()}`),
+      text: String(x.text),
+      hash: String(x.hash || fnv1a(norm(x.text))),
+      createdAt: Number(x.createdAt || now()),
+      editedAt: Number(x.editedAt || 0),
+      status: x.status === 'inflight' ? 'inflight' : 'pending',
+      sentAt: Number(x.sentAt || 0),
+    }));
+  }
+
+  function saveQueue() {
+    store.setJson(queueKey(S.route), S.queue);
+    DC.queueFingerprint = '';
+  }
+
+  function loadHibernation(scope = routeKey()) {
+    const h = store.json(hibKey(scope), null);
+    if (!h || typeof h !== 'object' || h.route !== scope) return null;
+    if (!['sleeping', 'waking', 'wait-user'].includes(h.phase)) return null;
+    return h;
+  }
+
+  function saveHibernation() {
+    if (S.hib) store.setJson(hibKey(S.route), S.hib);
+    else store.del(hibKey(S.route));
+  }
+
+  function migrateBrokenProjectChatScopeOnce() {
+    try {
+      const current = routeKey();
+      if (!current.startsWith('c:')) return;
+      const u = new URL(location.href, location.origin);
+      if (!/\/g\/g-p-[^/]+\/.*\/c\/[^/?#]+|\/g\/g-p-[^/]+\/c\/[^/?#]+/i.test(u.pathname)) return;
+      const oldScope = `p:${u.pathname.replace(/\/+$/, '') || '/'}`;
+      if (oldScope === current) return;
+      const flag = `project-route-migrated:${current}`;
+      if (store.get(flag, false)) return;
+
+      // v1.0 stored project chats under p:/g/.../c/<id> because it only
+      // recognized top-level /c/<id>. Move that state into the corrected c:<id>.
+      const oldTxn = store.json(txnKey(oldScope), null);
+      if (!store.json(txnKey(current), null) && oldTxn) {
+        oldTxn.route = current;
+        store.setJson(txnKey(current), oldTxn);
+      }
+
+      const mergeQueues = (...queues) => {
+        const merged = [];
+        const ids = new Set();
+        for (const arr of queues) {
+          if (!Array.isArray(arr)) continue;
+          for (const item of arr) {
+            if (!item || ids.has(item.id)) continue;
+            ids.add(item.id); merged.push(item);
+          }
+        }
+        return merged;
+      };
+      const newQueue = store.json(queueKey(current), []);
+      const oldV1Queue = store.json(queueKey(oldScope), []);
+      let oldV012Queue = [];
+      try {
+        const raw = GM_getValue(`cgr:queue:${oldScope}`, '');
+        oldV012Queue = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : [];
+      } catch (_) {}
+      const merged = mergeQueues(newQueue, oldV1Queue, oldV012Queue);
+      if (merged.length) store.setJson(queueKey(current), merged);
+
+      const oldHib = store.json(hibKey(oldScope), null);
+      if (!store.json(hibKey(current), null) && oldHib) {
+        oldHib.route = current;
+        store.setJson(hibKey(current), oldHib);
+      } else if (!store.json(hibKey(current), null)) {
+        try {
+          const raw = GM_getValue(`cgr:github-hibernate:${oldScope}`, '');
+          const legacy = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null;
+          if (legacy && ['sleeping', 'waking', 'wait-user'].includes(legacy.phase)) {
+            legacy.route = current;
+            store.setJson(hibKey(current), legacy);
+          }
+        } catch (_) {}
+      }
+
+      store.del(txnKey(oldScope));
+      store.del(queueKey(oldScope));
+      store.del(hibKey(oldScope));
+      store.set(flag, true);
+    } catch (_) {}
+  }
+
+  migrateLegacyV012Once(routeKey());
+  migrateBrokenProjectChatScopeOnce();
+  try {
+    const scope = routeKey();
+    if (!store.get(draftKey(scope), '')) {
+      const oldV1 = String(store.get('draft', '') || '');
+      let oldV012 = '';
+      try { oldV012 = String(GM_getValue('cgr:draft', '') || ''); } catch (_) {}
+      const legacyDraft = oldV1 || oldV012;
+      if (norm(legacyDraft)) store.set(draftKey(scope), legacyDraft);
+    }
+    store.del('draft');
+  } catch (_) {}
+
+  const S = {
+    enabled: store.get('enabled', true) !== false,
+    route: routeKey(),
+    href: location.href,
+    txn: null,
+    queue: [],
+    queuePaused: store.get('queueUserPaused', false) === true,
+    queueProcessing: false,
+    queueHoldReason: '',
+    queueEditingId: '',
+    queueEditingOriginalText: '',
+    hib: null,
+    actionInFlight: false,
+    generating: false,
+    composerControl: { kind: 'unknown', label: '' },
+    error: null,
+    pausedUntil: Number(store.get('pausedUntil', 0)) || 0,
+    pausedReason: String(store.get('pausedReason', '') || ''),
+    blockedReason: String(store.get('blockedReason', '') || ''),
+    lastAssistantProgressAt: now(),
+    lastControlChangeAt: now(),
+    lastNetworkAt: 0,
+    lastHttpStatus: 0,
+    lastHttpStatusAt: 0,
+    lastNetworkFailureAt: 0,
+    rateRetryAt: 0,
+    lastGenerationEndAt: 0,
+    lastAssistantSig: '',
+    lastUserSig: '',
+    longThinkingSeenAt: 0,
+    longThinkingLastSeenAt: 0,
+    logs: [],
+    verify: null,
+    sendIntent: null,
+  };
+  S.txn = loadTxn(S.route);
+  S.queue = loadQueue(S.route);
+  S.hib = loadHibernation(S.route);
+
+  const DC = {
+    composer: null,
+    form: null,
+    users: [],
+    assistants: [],
+    lastUser: null,
+    lastAssistant: null,
+    messagesDirty: true,
+    lastMessageRefreshAt: 0,
+    rootObserver: null,
+    rootNode: null,
+    assistantObserver: null,
+    composerObserver: null,
+    composerNode: null,
+    assistantNode: null,
+    longThinkingNode: null,
+    evaluateTimer: null,
+    evaluateDueAt: 0,
+    watchdogTimer: null,
+    queuePumpTimer: null,
+    queuePumpDueAt: 0,
+    wakeTimer: null,
+    wakeDueAt: 0,
+    queueFingerprint: '',
+    uiFingerprint: '',
+    queueTray: null,
+    queueDragId: '',
+  };
+
+  // ---------- DOM adapter -------------------------------------------------------------
+  function getComposer() {
+    if (DC.composer?.isConnected) return DC.composer;
+    DC.composer = qFirst(SELECTORS.composer);
+    DC.form = DC.composer?.closest?.('form') || DC.composer?.form || null;
+    return DC.composer;
+  }
+
+  function composerForm(input = getComposer()) {
+    if (input && DC.form?.isConnected && (DC.form.contains(input) || input.form === DC.form)) return DC.form;
+    DC.form = input?.closest?.('form') || input?.form || null;
+    return DC.form;
+  }
+
+  function composerText(el = getComposer()) {
+    if (!el) return '';
+    if ('value' in el && typeof el.value === 'string') return el.value;
+    return el.innerText || el.textContent || '';
+  }
+
+  function setComposerText(el, text) {
+    if (!el) return false;
+    const value = String(text ?? '');
+    try {
+      el.focus?.();
+      if ('value' in el && typeof el.value === 'string') {
+        const proto = Object.getPrototypeOf(el);
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLTextAreaElement?.prototype || {}, 'value');
+        if (desc?.set) desc.set.call(el, value); else el.value = value;
+      } else {
+        el.textContent = value;
+      }
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return norm(composerText(el)) === norm(value);
+    } catch (_) {
+      try {
+        if ('value' in el) el.value = value; else el.textContent = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return norm(composerText(el)) === norm(value);
+      } catch (_) { return false; }
+    }
+  }
+
+  function refreshMessageCache(force = false) {
+    const t = now();
+    if (!force && !DC.messagesDirty && t - DC.lastMessageRefreshAt < 15_000) return;
+    DC.lastMessageRefreshAt = t;
+    DC.messagesDirty = false;
+    DC.users = qAll(SELECTORS.user).filter(visible);
+    DC.assistants = qAll(SELECTORS.assistant).filter(visible);
+    DC.lastUser = DC.users.at(-1) || null;
+    DC.lastAssistant = DC.assistants.at(-1) || null;
+    rebindAssistantObserver();
+  }
+
+  function rawNodeText(el) {
+    return String(el?.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  }
+
+  function getMessages(force = false) {
+    refreshMessageCache(force);
+    return {
+      users: DC.users,
+      assistants: DC.assistants,
+      lastUser: DC.lastUser,
+      lastAssistant: DC.lastAssistant,
+      lastUserText: rawNodeText(DC.lastUser),
+      lastAssistantText: rawNodeText(DC.lastAssistant),
+    };
+  }
+
+  function findSafeSendButton(input = getComposer()) {
+    const form = composerForm(input);
+    const roots = form ? [form] : [document];
+    for (const root of roots) {
+      for (const sel of SELECTORS.send) {
+        try {
+          for (const b of root.querySelectorAll(sel)) {
+            if (!visible(b) || disabled(b)) continue;
+            const label = lower(`${b.id || ''} ${b.getAttribute?.('aria-label') || ''} ${b.getAttribute?.('data-testid') || ''}`);
+            if (/stop|voice|mic|attach|upload|model|tool|retry|regenerat/.test(label)) continue;
+            return b;
+          }
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  function findStopButton() {
+    const form = composerForm(getComposer());
+    return form ? qFirst(SELECTORS.stop, form) : qFirst(SELECTORS.stop);
+  }
+
+  function isContinueButton(btn) {
+    if (!btn || !visible(btn) || disabled(btn)) return false;
+    const labels = [
+      btn.getAttribute?.('aria-label'),
+      btn.textContent,
+      btn.getAttribute?.('title'),
+      btn.getAttribute?.('data-testid'),
+    ].map(v => lower(v || '')).filter(Boolean);
+    return labels.some(label => CONTINUE_LABELS.has(label) || /^continue (?:generating|response)(?:\b|$)/i.test(label));
+  }
+
+  function findContinueButton() {
+    const turn = DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || null;
+    if (turn) {
+      const local = Array.from(turn.querySelectorAll?.('button') || []).filter(isContinueButton);
+      if (local.length) return local.at(-1);
+    }
+    const global = Array.from(document.querySelectorAll?.('button') || []).filter(isContinueButton);
+    return global.at(-1) || null;
+  }
+
+
+  function findComposerSpinner(input = getComposer()) {
+    const form = composerForm(input);
+    if (!form) return null;
+    const selectors = ['[role="progressbar"]', '[aria-busy="true"]', '[data-state="loading"]', '[data-loading="true"]', '.animate-spin', '[class*="spinner" i]'];
+    for (const sel of selectors) {
+      try {
+        const el = Array.from(form.querySelectorAll(sel)).find(visible);
+        if (el) return el;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function getComposerControlState() {
+    const stop = findStopButton();
+    if (stop && !disabled(stop)) return { kind: 'stop', label: exactButtonLabel(stop) };
+    if (qFirst(SELECTORS.streaming)) return { kind: 'streaming', label: '' };
+    const spinner = findComposerSpinner();
+    if (spinner) return { kind: 'spinner', label: lower(spinner.getAttribute?.('aria-label') || '') };
+    const send = findSafeSendButton();
+    if (send) return { kind: 'send', label: exactButtonLabel(send) };
+    return { kind: 'idle', label: '' };
+  }
+
+  function isGenerating() {
+    const next = getComposerControlState();
+    if (next.kind !== S.composerControl.kind) S.lastControlChangeAt = now();
+    S.composerControl = next;
+    return ['stop', 'streaming', 'spinner'].includes(next.kind);
+  }
+
+  const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think|still thinking/i;
+  function findLongThinkingNotice() {
+    // Preserve a previously discovered non-ARIA banner for as long as the exact
+    // live node remains visible and still contains the status text. A static
+    // banner must not age out merely because React stopped mutating it.
+    const cached = DC.longThinkingNode;
+    if (cached?.isConnected && visible(cached) && !cached.closest?.('[data-message-author-role]')) {
+      const t = norm(cached.textContent || '');
+      if (t.length <= 1200 && LONG_THINKING_RE.test(t)) return cached;
+    }
+    DC.longThinkingNode = null;
+    const root = document.querySelector('main');
+    if (!root) return null;
+    try {
+      const nodes = root.querySelectorAll('[role="status"],[aria-live]');
+      for (let i = Math.max(0, nodes.length - 40); i < nodes.length; i++) {
+        const el = nodes[i];
+        if (!visible(el)) continue;
+        if (el.closest?.('[data-message-author-role]')) continue;
+        const t = norm(el.textContent || '');
+        if (t.length <= 800 && LONG_THINKING_RE.test(t)) { DC.longThinkingNode = el; return el; }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function updateLongThinking() {
+    const hit = findLongThinkingNotice();
+    if (hit) {
+      DC.longThinkingNode = hit;
+      if (!S.longThinkingSeenAt) S.longThinkingSeenAt = now();
+      S.longThinkingLastSeenAt = now();
+      return true;
+    }
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    return false;
+  }
+
+  function collectErrorText(msgs = getMessages()) {
+    const chunks = [];
+    // Do not classify an ordinary answer merely because it discusses timeouts or
+    // network errors. Assistant text is trusted only when its tail has the shape
+    // of ChatGPT's own product-error boilerplate.
+    const tail = msgs.lastAssistantText.slice(-1400);
+    if (!S.generating && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
+    for (const el of qAll(SELECTORS.alerts).filter(visible).slice(-6)) {
+      if (el.closest?.('[data-message-author-role="user"]')) continue;
+      const t = norm(el.textContent || '');
+      if (t && t.length < 4000) chunks.push(t);
+    }
+    return chunks.join('\n').slice(-10_000);
+  }
+
+  function currentError(msgs = getMessages()) {
+    const dom = classifyError(collectErrorText(msgs));
+    if (dom) return dom;
+    const age = now() - Number(S.lastHttpStatusAt || 0);
+    if (age < 20_000) {
+      const status = Number(S.lastHttpStatus || 0);
+      if (status === 401) return { id: 'auth', kind: 'hard', sourceText: 'HTTP 401' };
+      if (status === 403) return { id: 'anti-abuse', kind: 'hard', sourceText: 'HTTP 403' };
+      if (status === 429) return { id: 'rate', kind: 'rate', sourceText: 'HTTP 429' };
+      if ([408, 425, 500, 502, 503, 504].includes(status)) return { id: status === 408 ? 'timeout' : 'server', kind: 'continue', sourceText: `HTTP ${status}` };
+    }
+    if (S.lastNetworkFailureAt && now() - S.lastNetworkFailureAt < 20_000) return { id: 'network', kind: 'continue', sourceText: 'transport failure' };
+    return null;
+  }
+
+  function hasComposerAttachments(input = getComposer()) {
+    const form = composerForm(input);
+    if (!form) return false;
+    try { return !!form.querySelector('[data-testid*="attachment" i],[aria-label*="remove file" i],[aria-label*="remove attachment" i]'); }
+    catch (_) { return false; }
+  }
+
+  function restoreDraftIfSafe() {
+    const input = getComposer();
+    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
+    const draft = getDraft(S.route);
+    if (!norm(draft)) return false;
+    return setComposerText(input, draft);
+  }
+
+  // ---------- observers ---------------------------------------------------------------
+  function rebindAssistantObserver() {
+    if (DC.assistantNode === DC.lastAssistant) return;
+    try { DC.assistantObserver?.disconnect(); } catch (_) {}
+    DC.assistantNode = DC.lastAssistant;
+    if (!DC.lastAssistant) return;
+    DC.assistantObserver = new MutationObserver(() => {
+      S.lastAssistantProgressAt = now();
+      scheduleEvaluate('assistant-progress', CFG.tailDebounceMs);
+    });
+    try { DC.assistantObserver.observe(DC.lastAssistant, { childList: true, subtree: true, characterData: true }); } catch (_) {}
+  }
+
+  function captureLongThinkingFromNode(node) {
+    if (!node || node.nodeType !== 1) return;
+    const el = node;
+    if (el.closest?.('[data-message-author-role]')) return;
+    const text = norm(el.textContent || '');
+    if (text && text.length < 1200 && LONG_THINKING_RE.test(text)) {
+      DC.longThinkingNode = el;
+      S.longThinkingSeenAt ||= now();
+      S.longThinkingLastSeenAt = now();
+    }
+  }
+
+  function installRootObserver() {
+    const root = document.querySelector('main') || document.body;
+    if (!root) return;
+    try { DC.rootObserver?.disconnect(); } catch (_) {}
+    DC.rootNode = root;
+    DC.rootObserver = new MutationObserver(records => {
+      let structureChanged = false;
+      let statusChanged = false;
+      let composerChanged = false;
+      for (const rec of records) {
+        // Token-level DOM churn inside the active assistant is handled by the
+        // dedicated tail observer. Do not invalidate the entire message cache.
+        if (DC.lastAssistant && (rec.target === DC.lastAssistant || DC.lastAssistant.contains?.(rec.target))) continue;
+        // Some status banners keep the same wrapper and only replace a text
+        // child. Inspect that small mutation target as well as newly added nodes.
+        if (rec.target?.nodeType === 1) captureLongThinkingFromNode(rec.target);
+        for (const node of rec.addedNodes || []) {
+          captureLongThinkingFromNode(node);
+          if (node.nodeType !== 1) continue;
+          const el = node;
+          if (el.matches?.('[data-message-author-role]') || el.querySelector?.('[data-message-author-role]')) structureChanged = true;
+          if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
+          const txt = norm(el.textContent || '');
+          if (txt.length < 1200 && LONG_THINKING_RE.test(txt)) statusChanged = true;
+        }
+        for (const node of rec.removedNodes || []) {
+          if (node.nodeType !== 1) continue;
+          if (DC.longThinkingNode && (node === DC.longThinkingNode || node.contains?.(DC.longThinkingNode))) DC.longThinkingNode = null;
+          if (node.matches?.('[data-message-author-role]') || node.querySelector?.('[data-message-author-role]')) structureChanged = true;
+          if (node.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || node.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
+        }
+      }
+      if (structureChanged) DC.messagesDirty = true;
+      if (composerChanged) { DC.composer = null; DC.form = null; DC.composerNode = null; }
+      if (structureChanged || statusChanged || composerChanged) scheduleEvaluate(structureChanged ? 'structure' : composerChanged ? 'composer-structure' : 'status', CFG.structureDebounceMs);
+    });
+    try { DC.rootObserver.observe(root, { childList: true, subtree: true }); } catch (_) {}
+  }
+
+
+  function installComposerObserver() {
+    const input = getComposer();
+    const form = composerForm(input);
+    const host = form?.parentElement || form;
+    if (!host) return;
+    if (DC.composerNode === host && DC.composerObserver) return;
+    try { DC.composerObserver?.disconnect(); } catch (_) {}
+    DC.composerNode = host;
+    DC.composerObserver = new MutationObserver(records => {
+      let relevant = false;
+      for (const rec of records) {
+        // Typing in ProseMirror/contenteditable can produce childList mutations.
+        // The input hook already owns draft updates, so ignore those hot-path
+        // mutations instead of scheduling a full state evaluation per keystroke.
+        if (input && (rec.target === input || input.contains?.(rec.target))) continue;
+        const targetEl = rec.target?.nodeType === 1 ? rec.target : rec.target?.parentElement;
+        if (targetEl?.closest?.('#cgr-queue-tray')) continue; // our own queue UI churn
+        relevant = true;
+        break;
+      }
+      if (!relevant) return;
+      DC.composer = null;
+      DC.form = null;
+      scheduleEvaluate('composer-structure', 80);
+    });
+    try { DC.composerObserver.observe(host, { childList: true, subtree: true }); } catch (_) {}
+  }
+
+  // ---------- lease -------------------------------------------------------------------
+  function lockKey() { return `lock:${S.route}`; }
+  function claimLease() {
+    const key = lockKey();
+    const t = now();
+    try {
+      const old = store.json(key, null);
+      if (old && old.tabId !== TAB_ID && t - Number(old.at || 0) < CFG.leaseMs) return false;
+      store.setJson(key, { tabId: TAB_ID, at: t });
+      return true;
+    } catch (_) { return true; }
+  }
+
+  async function verifyLease() {
+    if (!claimLease()) return false;
+    await sleep(CFG.leaseVerifyMs);
+    const cur = store.json(lockKey(), null);
+    return !cur || cur.tabId === TAB_ID;
+  }
+
+  function releaseLease() {
+    const cur = store.json(lockKey(), null);
+    if (cur?.tabId === TAB_ID) store.del(lockKey());
+  }
+
+  // Human native sends are first represented only as a short-lived in-memory
+  // intent. This prevents pointer/click cancellation, autocomplete, or React
+  // swallowing Enter from creating a durable transaction for a message that was
+  // never actually submitted. The intent is promoted on submit, matching POST,
+  // or matching user-turn DOM evidence.
+  function setSendIntent(prompt, source, options = {}) {
+    const p = promptText(prompt);
+    if (!norm(p)) return null;
+    const msgs = getMessages(true);
+    S.sendIntent = {
+      route: S.route, prompt: p, hash: fnv1a(norm(p)), source, at: now(),
+      subturn: !!options.subturn, resumeHib: !!options.resumeHib,
+      clearBlocked: !!options.clearBlocked, queueItemId: options.queueItemId || null,
+      baselineUserCount: msgs.users.length, baselineUserSig: signature(msgs.lastUserText),
+      baselineAssistantCount: msgs.assistants.length, baselineAssistantSig: signature(msgs.lastAssistantText),
+    };
+    log('send-intent', { source, subturn: !!options.subturn });
+    return S.sendIntent;
+  }
+
+  function validSendIntent() {
+    const i = S.sendIntent;
+    if (!i) return null;
+    if (i.route !== S.route || now() - Number(i.at || 0) > CFG.sendIntentMs) { S.sendIntent = null; return null; }
+    return i;
+  }
+
+  function promoteSendIntent(evidence = 'unknown') {
+    const i = validSendIntent();
+    if (!i) return null;
+    let qid = i.queueItemId || null;
+    if (i.resumeHib && S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase)) qid = qid || S.hib.queueItemId || null;
+
+    let t = null;    if (i.subturn && S.txn) t = beginSubturn(i.prompt, i.source);
+    else if (!S.txn) t = armNewTxn(i.prompt, i.source, qid);
+    else t = beginSubturn(i.prompt, i.source);
+    if (!t) return null;
+
+    // Preserve the pre-send snapshot even if promotion happens after the user
+    // turn has already appeared in DOM. This prevents a fast response from being
+    // mistaken for the baseline of the new subturn.
+    t.baselineUserCount = Number(i.baselineUserCount || 0);
+    t.baselineUserSig = String(i.baselineUserSig || '');
+    t.baselineAssistantCount = Number(i.baselineAssistantCount || 0);
+    t.baselineAssistantSig = String(i.baselineAssistantSig || '');
+    t.sendAttempted = true;
+    if (evidence === 'network') t.sendObserved = true;
+    saveTxn();
+
+    if (i.resumeHib && S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase)) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
+    if (i.clearBlocked && S.blockedReason) clearBlock(`human-send:${evidence}`);
+    S.sendIntent = null;
+    log('send-intent-promote', { evidence, source: i.source, subturn: i.subturn });
+    return t;
+  }
+
+  function promoteSendIntentFromDom(msgs) {
+    const i = validSendIntent();
+    if (!i || !msgs?.lastUserText) return null;
+    if (fnv1a(norm(msgs.lastUserText)) !== i.hash) return null;
+    return promoteSendIntent('user-dom');
+  }
+
+  // ---------- transaction journal -----------------------------------------------------
+  function newTxn(prompt, source, queueItemId = null) {
+    const msgs = getMessages(true);
+    const p = promptText(prompt);
+    return {
+      schema: 2,
+      id: crypto.randomUUID?.() || `txn-${now()}-${Math.random().toString(16).slice(2)}`,
+      route: S.route,
+      source,
+      rootPrompt: p,
+      rootPromptHash: fnv1a(norm(p)),
+      currentPrompt: p,
+      currentPromptHash: fnv1a(norm(p)),
+      queueItemId: queueItemId || null,
+      createdAt: now(),
+      subturnAt: now(),
+      dispatchAt: now(),
+      baselineUserCount: msgs.users.length,
+      baselineUserSig: signature(msgs.lastUserText),
+      baselineAssistantCount: msgs.assistants.length,
+      baselineAssistantSig: signature(msgs.lastAssistantText),
+      userTurnConfirmed: false,
+      sendAttempted: false,
+      sendObserved: false,
+      generationObserved: false,
+      assistantObserved: false,
+      continueCount: 0,
+      resendCount: 0,
+      reloadCount: 0,
+      reconciledAt: 0,
+      nextRecoveryAt: 0,
+      manualStopped: false,
+    };
+  }
+
+  function armNewTxn(prompt, source, queueItemId = null) {
+    const p = promptText(prompt);
+    if (!norm(p)) return null;
+    if (S.txn && now() - Number(S.txn.subturnAt || 0) < 2_000 && S.txn.currentPromptHash === fnv1a(norm(p))) return S.txn;
+    // A caller asking for a new logical task must never accidentally inherit an
+    // unrelated transaction that appeared during an await/race. Fail closed.
+    if (S.txn) return null;
+    S.txn = newTxn(p, source, queueItemId);
+    setDraft(p, S.route);
+    saveTxn();
+    S.verify = null;
+    log('txn-arm', { source, queueItem: !!queueItemId, length: p.length });
+    return S.txn;
+  }
+
+  function beginSubturn(prompt, source) {
+    const t = S.txn;
+    if (!t) return armNewTxn(prompt, source);
+    const msgs = getMessages(true);
+    const p = promptText(prompt);
+    t.currentPrompt = p;
+    t.currentPromptHash = fnv1a(norm(p));
+    t.source = source;
+    t.subturnAt = now();
+    t.dispatchAt = now();
+    t.baselineUserCount = msgs.users.length;
+    t.baselineUserSig = signature(msgs.lastUserText);
+    t.baselineAssistantCount = msgs.assistants.length;
+    t.baselineAssistantSig = signature(msgs.lastAssistantText);
+    t.userTurnConfirmed = false;
+    t.sendAttempted = false;
+    t.sendObserved = false;
+    t.generationObserved = false;
+    t.assistantObserved = false;
+    t.manualStopped = false;
+    t.nextRecoveryAt = 0;
+    setDraft(p, S.route);
+    saveTxn();
+    S.verify = null;
+    return t;
+  }
+
+  function confirmTxn(msgs) {
+    const t = S.txn;
+    if (!t || t.route !== S.route) return;
+    const lastUserHash = fnv1a(norm(msgs.lastUserText));
+    const lastUserChanged = signature(msgs.lastUserText) !== String(t.baselineUserSig || '');
+    const countAdvanced = msgs.users.length > Number(t.baselineUserCount || 0) && lastUserChanged;
+    const hashMatches = !!msgs.lastUserText && lastUserHash === t.currentPromptHash;
+    if (!t.userTurnConfirmed && (hashMatches || countAdvanced)) {
+      t.userTurnConfirmed = true;
+      t.confirmedAt = now();
+      clearDraft(S.route);
+      saveTxn();
+      log('txn-user-confirmed', { source: t.source, evidence: hashMatches ? 'hash' : 'user-count' });
+    }
+    const asig = signature(msgs.lastAssistantText);
+    if (msgs.assistants.length > Number(t.baselineAssistantCount || 0) || asig !== t.baselineAssistantSig) {
+      t.assistantObserved = true;
+      S.lastAssistantProgressAt = now();
+    }
+    if (S.generating) t.generationObserved = true;
+  }
+
+  function logicalQuietSince() {
+    const t = S.txn;
+    return Math.max(
+      Number(t?.confirmedAt || t?.subturnAt || 0),
+      S.lastAssistantProgressAt,
+      S.lastControlChangeAt,
+      S.lastNetworkAt,
+    );
+  }
+
+  function latestMarker(msgs = getMessages()) {
+    return terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+  }
+
+  function markQueueItemInflight(id) {
+    const item = S.queue.find(x => x.id === id);
+    if (!item) return;
+    item.status = 'inflight';
+    item.sentAt = now();
+    saveQueue();
+  }
+
+  function completeQueueItem(id, reason = 'done') {
+    if (!id) return;
+    const i = S.queue.findIndex(x => x.id === id);
+    if (i < 0) return;
+    S.queue.splice(i, 1);
+    saveQueue();
+    log('queue-complete', { id, reason, depth: S.queue.length });
+  }
+
+  function clearPause() {
+    S.pausedUntil = 0;
+    S.pausedReason = '';
+    store.set('pausedUntil', 0);
+    store.set('pausedReason', '');
+  }
+
+  function pauseUntil(ts, reason) {
+    S.pausedUntil = Math.max(now(), Number(ts || 0));
+    S.pausedReason = String(reason || 'paused');
+    store.set('pausedUntil', S.pausedUntil);
+    store.set('pausedReason', S.pausedReason);
+    log('pause', { reason, until: S.pausedUntil });
+    paintUI(true);
+  }
+
+  function isPaused() {
+    if (S.pausedUntil && S.pausedUntil <= now()) clearPause();
+    return S.pausedUntil > now();
+  }
+
+
+  function blockAutomation(reason, message = '') {
+    const next = String(reason || 'blocked');
+    const changed = S.blockedReason !== next;
+    S.blockedReason = next;
+    store.set('blockedReason', next);
+    if (changed) {
+      log('blocked', { reason: next });
+      if (message) maybeNotify(`${APP}: waiting for you`, message);
+    }
+    paintUI(true);
+  }
+
+  function clearBlock(reason = 'manual') {
+    if (!S.blockedReason) return;
+    log('block-clear', { previous: S.blockedReason, reason });
+    S.blockedReason = '';
+    store.set('blockedReason', '');
+    scheduleEvaluate('block-clear', 50);
+  }
+
+  // ---------- native send / continue --------------------------------------------------
+  function resolveSendAction(input = getComposer()) {
+    if (!input) return null;
+    const button = findSafeSendButton(input);
+    if (button) return { kind: 'button', run: () => button.click() };
+    return null;
+  }
+
+  async function waitForSendAction(input, expected, timeoutMs = CFG.queueStageReadyMs) {
+    const wanted = norm(expected);
+    const deadline = now() + timeoutMs;
+    while (now() < deadline) {
+      if (!input?.isConnected || norm(composerText(input)) !== wanted) return null;
+      const action = resolveSendAction(input);
+      if (action) return action;
+      await sleep(80);
+    }
+    return input?.isConnected && norm(composerText(input)) === wanted ? resolveSendAction(input) : null;
+  }
+
+  async function dispatchPrompt(prompt, source, options = {}) {
+    if (!S.enabled || S.actionInFlight || isPaused()) return false;
+    const input = getComposer();
+    const p = promptText(prompt);
+    if (!input || !norm(p) || hasComposerAttachments(input)) return false;
+    if (norm(composerText(input)) !== norm(p) && !setComposerText(input, p)) return false;
+
+    // Reserve the composer before the first await. This prevents the queue pump,
+    // GitHub wake, or a second programmatic send from racing the staged prompt
+    // while React is still enabling the native Send control.
+    S.actionInFlight = true;
+    try {
+      const action = await waitForSendAction(input, p);
+      if (!action) return false;
+      if (!(await verifyLease())) return false;
+      if (!input.isConnected || norm(composerText(input)) !== norm(p)) return false;
+
+      const diskTxn = loadTxn(S.route);
+      if (options.newLogicalTask) {
+        if (diskTxn) { S.txn = diskTxn; return false; }
+      } else if (S.txn) {
+        if (!diskTxn || diskTxn.id !== S.txn.id) { S.txn = diskTxn; return false; }
+        S.txn = diskTxn;
+      } else if (diskTxn) {
+        S.txn = diskTxn;
+        return false;
+      }
+
+      let t;
+      if (options.newLogicalTask) t = armNewTxn(p, source, options.queueItemId || null);
+      else if (S.txn) t = beginSubturn(p, source);
+      else t = armNewTxn(p, source, options.queueItemId || null);
+      if (!t) return false;
+      if (options.queueItemId) { t.queueItemId = options.queueItemId; saveTxn(); }
+
+      t.sendObserved = false;
+      t.dispatchAt = now();
+      saveTxn();
+      action.run();
+      t.sendAttempted = true;
+      saveTxn();
+      log('dispatch', { source, method: action.kind, queueItem: !!t.queueItemId });
+      scheduleEvaluate('dispatch', 120);
+      return true;
+    } catch (e) {
+      log('dispatch-failed', { source, message: String(e?.message || e) });
+      return false;
+    } finally {
+      S.actionInFlight = false;
+    }
+  }
+
+  async function clickNativeContinue() {
+    const btn = findContinueButton();
+    if (!btn || S.actionInFlight || S.generating || isPaused()) return false;
+    const expectedTxnId = S.txn?.id || null;
+    S.actionInFlight = true;
+    try {
+      if (!(await verifyLease())) return false;
+      if (expectedTxnId) {
+        const diskTxn = loadTxn(S.route);
+        if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
+        S.txn = diskTxn;
+      }
+      if (!btn.isConnected || disabled(btn) || !visible(btn)) return false;
+      btn.click();
+      if (S.txn) {
+        S.txn.generationObserved = true;
+        S.txn.nextRecoveryAt = now() + 3_000;
+        saveTxn();
+      }
+      S.verify = null;
+      log('native-continue', {});
+      scheduleEvaluate('native-continue', 250);
+      return true;
+    } finally { S.actionInFlight = false; }
+  }
+
+  async function sendLiteralContinue(reason = 'incomplete') {
+    const t = S.txn;
+    if (!t || !t.userTurnConfirmed || t.manualStopped || S.generating || S.actionInFlight || isPaused() || S.blockedReason) return false;
+    if (Number(t.continueCount || 0) >= CFG.maxContinuesPerLogicalTask) {
+      blockAutomation('continue-safety-cap', 'The same logical task needed too many continuation turns. Queue is preserved; inspect the chat before resuming.');
+      return false;
+    }
+    if (now() < Number(t.nextRecoveryAt || 0)) return false;
+    const input = getComposer();
+    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
+    const nextCount = Number(t.continueCount || 0) + 1;
+    const wait = CFG.retryBackoffMs[Math.min(nextCount - 1, CFG.retryBackoffMs.length - 1)];
+    const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, { newLogicalTask: false });
+    if (!ok || !S.txn) return false;
+    S.txn.continueCount = nextCount;
+    S.txn.nextRecoveryAt = now() + wait;
+    saveTxn();
+    log('literal-continue', { reason, count: nextCount, backoff: wait });
+    return true;
+  }
+
+  async function waitForGenerationStop() {
+    const deadline = now() + CFG.stopSettleTimeoutMs;
+    while (now() < deadline) {
+      if (!isGenerating()) return true;
+      await sleep(250);
+    }
+    return false;
+  }
+
+  async function stopThenContinue(reason = 'stall') {
+    const t = S.txn;
+    if (!t || t.manualStopped || S.actionInFlight || isPaused()) return false;
+    const stop = findStopButton();
+    if (!stop) return false;
+    const expectedTxnId = t.id;
+    S.actionInFlight = true;
+    try {
+      if (!(await verifyLease())) return false;
+      const diskTxn = loadTxn(S.route);
+      if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
+      S.txn = diskTxn;
+      if (!stop.isConnected || disabled(stop) || !visible(stop)) return false;
+      stop.click();
+      log('auto-stop', { reason });
+    } finally { S.actionInFlight = false; }
+    await waitForGenerationStop();
+    await sleep(300);
+    S.generating = isGenerating();
+    if (S.generating) return false;
+    return sendLiteralContinue(reason);
+  }
+
+  // ---------- queue -------------------------------------------------------------------
+  function queueCount() { return S.queue.length; }
+  function inflightQueueItem() { return S.queue.find(x => x.status === 'inflight') || null; }
+  function queueIndexById(id) { return S.queue.findIndex(x => x.id === id); }
+
+  function setQueuePaused(value, reason = 'user') {
+    S.queuePaused = !!value;
+    store.set('queueUserPaused', S.queuePaused);
+    S.queueHoldReason = S.queuePaused ? reason : '';
+    saveQueue();
+    renderQueueList();
+    paintUI(true);
+    if (!S.queuePaused) kickQueue('resume', 30);
+  }
+
+  function enqueuePrompt(text) {
+    const p = promptText(text);
+    if (!norm(p)) return null;
+    const item = {
+      id: crypto.randomUUID?.() || `q-${now()}-${Math.random().toString(16).slice(2)}`,
+      text: p,
+      hash: fnv1a(norm(p)),
+      createdAt: now(),
+      editedAt: 0,
+      status: 'pending',
+      sentAt: 0,
+    };
+    S.queue.push(item);
+    saveQueue();
+    log('queue-add', { id: item.id, depth: S.queue.length });
+    renderQueueList();
+    return item;
+  }
+
+  function removeQueueItem(id, reason = 'removed') {
+    const i = queueIndexById(id);
+    if (i < 0) return false;
+    const [item] = S.queue.splice(i, 1);
+    saveQueue();
+    if (item.status === 'inflight') {
+      if (S.txn?.queueItemId === id) { S.txn.queueItemId = null; saveTxn(); }
+      if (S.hib?.queueItemId === id) { S.hib.queueItemId = null; saveHibernation(); }
+    }
+    if (S.queueEditingId === id) cancelQueueEdit('removed');
+    log('queue-remove', { id, reason, status: item.status });
+    renderQueueList();
+    return true;
+  }
+
+  function clearPendingQueue() {
+    S.queue = S.queue.filter(x => x.status === 'inflight');
+    saveQueue();
+    renderQueueList();
+  }
+
+  function clearComposer(input = getComposer()) {
+    if (!input) return false;
+    const ok = setComposerText(input, '');
+    if (ok) clearDraft(S.route);
+    return ok;
+  }
+
+  function queueCurrentComposer() {
+    const input = getComposer();
+    const p = promptText(composerText(input));
+    if (!input || !norm(p)) return false;
+    if (hasComposerAttachments(input)) {
+      maybeNotify(`${APP}: not queued`, 'Messages with attachments are not queued because attachments cannot be reconstructed safely.');
+      return false;
+    }
+    const item = enqueuePrompt(p);
+    if (!item) return false;
+    if (!clearComposer(input)) {
+      removeQueueItem(item.id, 'composer-clear-failed');
+      return false;
+    }
+    kickQueue('queued', 40);
+    return true;
+  }
+
+  function captureQueueRects() {
+    const m = new Map();
+    document.querySelectorAll?.('#cgr-queue-list [data-queue-id]').forEach(el => m.set(el.dataset.queueId, el.getBoundingClientRect()));
+    return m;
+  }
+
+  function animateQueueReflow(before) {
+    if (!before?.size) return;
+    requestAnimationFrame(() => {
+      document.querySelectorAll?.('#cgr-queue-list [data-queue-id]').forEach(el => {
+        const old = before.get(el.dataset.queueId); if (!old) return;
+        const next = el.getBoundingClientRect();
+        const dy = old.top - next.top;
+        if (Math.abs(dy) < 1 || !el.animate) return;
+        el.animate([{ transform: `translateY(${dy}px)` }, { transform: 'translateY(0)' }], { duration: 150, easing: 'cubic-bezier(.2,.8,.2,1)' });
+      });
+    });
+  }
+
+  function moveQueueItem(id, targetIndex) {
+    const from = queueIndexById(id);
+    if (from < 0 || S.queue[from].status !== 'pending') return false;
+    const before = captureQueueRects();
+    const [item] = S.queue.splice(from, 1);
+    const pendingStart = S.queue.findIndex(x => x.status === 'pending');
+    const min = pendingStart < 0 ? S.queue.length : pendingStart;
+    const to = Math.max(min, Math.min(S.queue.length, targetIndex > from ? targetIndex - 1 : targetIndex));
+    S.queue.splice(to, 0, item);
+    saveQueue();
+    renderQueueList();
+    animateQueueReflow(before);
+    return true;
+  }
+
+  function beginQueueEdit(id) {
+    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    const input = getComposer();
+    if (!item || !input || norm(composerText(input))) return false;
+    S.queueEditingId = id;
+    S.queueEditingOriginalText = item.text;
+    setComposerText(input, item.text);
+    renderQueueList();
+    return true;
+  }
+
+  function cancelQueueEdit() {
+    if (!S.queueEditingId) return;
+    const input = getComposer();
+    if (input && norm(composerText(input)) === norm(S.queueEditingOriginalText)) clearComposer(input);
+    S.queueEditingId = '';
+    S.queueEditingOriginalText = '';
+    renderQueueList();
+  }
+
+  function commitQueueEdit() {
+    const id = S.queueEditingId;
+    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    const input = getComposer();
+    if (!item || !input) return false;
+    const p = promptText(composerText(input));
+    if (!norm(p)) { removeQueueItem(id, 'edit-empty'); clearComposer(input); cancelQueueEdit(); return true; }
+    item.text = p;
+    item.hash = fnv1a(norm(p));
+    item.editedAt = now();
+    saveQueue();
+    clearComposer(input);
+    S.queueEditingId = '';
+    S.queueEditingOriginalText = '';
+    renderQueueList();
+    return true;
+  }
+
+  async function steerOrSendQueuedItem(id) {
+    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    if (!item || S.actionInFlight || S.hib || isPaused() || S.blockedReason || !navigator.onLine) return false;
+    const input = getComposer();
+    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
+    if (!(await verifyLease())) return false;
+
+    if (S.txn || S.generating) {
+      // A Steer is still a real user subturn and therefore must be journaled.
+      // Only remove the future queue copy after the send was actually dispatched;
+      // the transaction then owns resend/reconciliation if acceptance is ambiguous.
+      if (!S.txn) return false; // orphan generation: do not inject unjournaled work
+      const ok = await dispatchPrompt(item.text, 'queue-steer', { newLogicalTask: false });
+      if (ok) {
+        removeQueueItem(id, 'steered-into-active-task');
+        log('queue-steer', { id });
+      }
+      return ok;
+    }
+
+    markQueueItemInflight(id);
+    const ok = await dispatchPrompt(item.text, 'queue-send-now', { newLogicalTask: true, queueItemId: id });
+    if (!ok) {
+      const cur = S.queue.find(x => x.id === id); if (cur) { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
+    }
+    return ok;
+  }
+
+
+  function tailCommittedForQueue() {
+    try {
+      const roles = Array.from(document.querySelectorAll('[data-message-author-role]')).filter(visible);
+      if (!roles.length) return true;
+      const last = roles.at(-1);
+      if (last.getAttribute('data-message-author-role') !== 'assistant') return false;
+      return !!terminalMarker(rawNodeText(last), last);
+    } catch (_) { return false; }
+  }
+
+  function queueBlocked() {
+    return S.queuePaused || !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error || !!findContinueButton();
+  }
+
+  function kickQueue(reason = 'event', delay = 0) {
+    if (!S.queue.length) return;
+    const due = now() + Math.max(0, delay);
+    if (DC.queuePumpTimer && DC.queuePumpDueAt <= due) return;
+    if (DC.queuePumpTimer) clearTimeout(DC.queuePumpTimer);
+    DC.queuePumpDueAt = due;
+    DC.queuePumpTimer = setTimeout(() => {
+      DC.queuePumpTimer = null; DC.queuePumpDueAt = 0;
+      processQueue().catch(e => log('queue-error', { reason, message: String(e?.message || e) }));
+    }, Math.max(0, due - now()));
+  }
+
+  async function processQueue() {
+    if (S.queueProcessing || !S.enabled || !S.queue.length) return false;
+    if (queueBlocked()) {
+      S.queueHoldReason = S.queuePaused ? 'paused' : S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
+      return false;
+    }
+    if (!tailCommittedForQueue()) {
+      S.queueHoldReason = 'tail-uncommitted-no-journal';
+      return false;
+    }
+    if (S.lastGenerationEndAt && now() - S.lastGenerationEndAt < CFG.interTurnSettleMs) return kickQueue('settle', CFG.interTurnSettleMs);
+    const inflight = inflightQueueItem();
+    if (inflight) {
+      S.queueHoldReason = 'inflight-without-journal';
+      maybeNotify(`${APP}: queue held`, 'A queued item is marked in-flight but its transaction journal is missing. It will not be duplicated automatically.');
+      return false;
+    }
+    const item = S.queue.find(x => x.status === 'pending');
+    if (!item) return false;
+    const input = getComposer();
+    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
+
+    S.queueProcessing = true;
+    try {
+      if (!(await verifyLease())) { kickQueue('other-tab-lease', CFG.queueBlockedRetryMs); return false; }
+      const diskTxn = loadTxn(S.route);
+      const diskHib = loadHibernation(S.route);
+      if (diskTxn || diskHib) {
+        if (diskTxn) S.txn = diskTxn;
+        if (diskHib) S.hib = diskHib;
+        S.queueHoldReason = diskTxn ? 'active-task-other-tab' : diskHib.phase;
+        return false;
+      }
+      S.queue = loadQueue(S.route);
+      const freshItem = S.queue.find(x => x.id === item.id && x.status === 'pending');
+      if (!freshItem) return false;
+      markQueueItemInflight(freshItem.id);
+      const ok = await dispatchPrompt(freshItem.text, 'queue', { newLogicalTask: true, queueItemId: freshItem.id });
+      if (!ok) {
+        // If dispatchPrompt already created the matching journal, that journal now
+        // owns reconciliation. Otherwise put the item back rather than losing it.
+        if (S.txn?.queueItemId !== freshItem.id) {
+          const cur = S.queue.find(x => x.id === freshItem.id);
+          if (cur) { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
+          if (norm(composerText(input)) === norm(freshItem.text)) clearComposer(input);
+          kickQueue('queue-dispatch-not-ready', CFG.queuePumpRetryMs);
+        }
+        return false;
+      }
+      S.queueHoldReason = '';
+      return true;
+    } finally {
+      S.queueProcessing = false;
+    }
+  }
+
+  // ---------- GitHub hibernation ------------------------------------------------------
+  function clearHibernation(reason = 'complete', options = {}) {
+    if (S.hib) log('github-clear', { reason, phase: S.hib.phase, cycle: S.hib.cycle || 0 });
+    S.hib = null;
+    store.del(hibKey(S.route));
+    if (DC.wakeTimer) clearTimeout(DC.wakeTimer);
+    DC.wakeTimer = null; DC.wakeDueAt = 0;
+    if (!options.suppressQueueKick) kickQueue('github-clear', 50);
+    paintUI(true);
+  }
+
+  function armHibernation(queueItemId = null) {
+    const previous = S.hib;
+    S.hib = {
+      route: S.route,
+      phase: 'sleeping',
+      wakeAt: now() + CFG.githubHibernateMs,
+      cycle: Number(previous?.cycle || 0) + 1,
+      queueItemId: queueItemId || previous?.queueItemId || null,
+      armedAt: now(),
+    };
+    saveHibernation();
+    scheduleWakeTimer();
+    paintUI(true);
+  }
+
+  function setWaitUser(queueItemId = null) {
+    S.hib = {
+      route: S.route,
+      phase: 'wait-user',
+      wakeAt: 0,
+      cycle: Number(S.hib?.cycle || 0),
+      queueItemId: queueItemId || S.hib?.queueItemId || null,
+      armedAt: now(),
+    };
+    saveHibernation();
+    if (DC.wakeTimer) clearTimeout(DC.wakeTimer);
+    DC.wakeTimer = null; DC.wakeDueAt = 0;
+    paintUI(true);
+  }
+
+  function scheduleWakeTimer(delayOverride = null) {
+    if (DC.wakeTimer) clearTimeout(DC.wakeTimer);
+    DC.wakeTimer = null; DC.wakeDueAt = 0;
+    if (!S.enabled || !S.hib || S.hib.phase !== 'sleeping' || S.hib.route !== S.route) return;
+    const delay = delayOverride == null ? Math.max(0, S.hib.wakeAt - now()) : Math.max(0, delayOverride);
+    DC.wakeDueAt = now() + delay;
+    DC.wakeTimer = setTimeout(() => {
+      DC.wakeTimer = null; DC.wakeDueAt = 0;
+      attemptGithubWake('timer').catch(e => log('github-wake-error', { message: String(e?.message || e) }));
+    }, Math.min(delay + 200, 2_147_000_000));
+  }
+
+  async function attemptGithubWake(reason = 'timer', force = false) {
+    if (!S.enabled || !S.hib || S.hib.phase !== 'sleeping') return false;
+    if (S.hib.route !== S.route) { scheduleWakeTimer(CFG.githubWrongRouteRetryMs); return false; }
+    if (!force && now() < S.hib.wakeAt) { scheduleWakeTimer(); return false; }
+    if (!navigator.onLine || isPaused() || S.blockedReason || S.actionInFlight || S.txn || S.generating || S.error) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
+    const input = getComposer();
+    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
+    if (!(await verifyLease())) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
+    const diskTxn = loadTxn(S.route);
+    const diskHib = loadHibernation(S.route);
+    if (diskTxn) { S.txn = diskTxn; scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
+    if (diskHib) S.hib = diskHib;
+    if (!S.hib || S.hib.phase !== 'sleeping') return false;
+    const qid = S.hib.queueItemId || null;
+    S.hib.phase = 'waking';
+    S.hib.wakeAt = 0;
+    saveHibernation();
+    const ok = await dispatchPrompt(PROTOCOL.WAKE, 'github-wake', { newLogicalTask: true, queueItemId: qid });
+    if (!ok && !S.txn) {
+      S.hib.phase = 'sleeping';
+      S.hib.wakeAt = now() + CFG.githubWakeBlockedRetryMs;
+      saveHibernation();
+      scheduleWakeTimer();
+    }
+    if (ok) log('github-wake-send', { reason, cycle: S.hib.cycle || 0 });
+    return ok;
+  }
+
+  // ---------- completion and recovery FSM --------------------------------------------
+  function assistantChangedForTxn(msgs, t = S.txn) {
+    return !!t && (
+      msgs.assistants.length > Number(t.baselineAssistantCount || 0) ||
+      signature(msgs.lastAssistantText) !== t.baselineAssistantSig
+    );
+  }
+
+  function resetVerification(reason = 'activity') {
+    if (S.verify) log('verify-cancel', { reason: S.verify.reason, because: reason });
+    S.verify = null;
+  }
+
+  function armVerification(msgs, reason) {
+    const t = S.txn;
+    if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
+    const sig = signature(msgs.lastAssistantText);
+    const key = `${sig}:${reason}`;
+    if (!S.verify || S.verify.key !== key) {
+      S.verify = { key, sig, reason, since: now() };
+      log('verify-arm', { reason });
+      paintUI(true);
+    }
+    return true;
+  }
+
+  async function maybeFinishVerification(msgs, err) {
+    const v = S.verify;
+    const t = S.txn;
+    if (!v || !t || S.generating || t.manualStopped) return false;
+    if (signature(msgs.lastAssistantText) !== v.sig) { resetVerification('assistant-changed'); return false; }
+    if (findContinueButton()) { resetVerification('native-continue'); return clickNativeContinue(); }
+    if (now() < Number(t.nextRecoveryAt || 0)) return false;
+    if (now() - logicalQuietSince() < CFG.incompleteVerifyMs) return false;
+    if (now() - v.since < CFG.incompleteVerifyMs) return false;
+    if (err?.kind === 'hard' || err?.kind === 'rate' || err?.kind === 'reload') return false;
+    resetVerification('confirmed-dead');
+    return sendLiteralContinue(v.reason);
+  }
+
+  async function completeLogicalTask(marker, msgs) {
+    const t = S.txn;
+    if (!t) return false;
+    if (!(await verifyLease())) return false;
+    const diskTxn = loadTxn(S.route);
+    if (!diskTxn || diskTxn.id !== t.id) { S.txn = diskTxn; return false; }
+    S.txn = diskTxn;
+    S.queue = loadQueue(S.route);
+    const diskHib = loadHibernation(S.route);
+    if (diskHib) S.hib = diskHib;
+    const qid = S.txn.queueItemId || S.hib?.queueItemId || null;
+    if (marker === 'hibernate') {
+      armHibernation(qid);
+      clearTxn('hibernate');
+      return true;
+    }
+    if (marker === 'wait-user') {
+      setWaitUser(qid);
+      clearTxn('wait-user');
+      return true;
+    }
+    if (marker === 'done') {
+      if (qid) completeQueueItem(qid, 'done-marker');
+      if (S.hib) clearHibernation('done-marker');
+      S.lastGenerationEndAt = now();
+      clearTxn('done-marker');
+      return true;
+    }
+    return false;
+  }
+
+  async function recoverUnconfirmedSend(msgs, err) {
+    const t = S.txn;
+    if (!t || t.userTurnConfirmed) return false;
+    const elapsed = now() - Number(t.subturnAt || t.createdAt || 0);
+    if (elapsed < CFG.sendConfirmMs) return false;
+
+    const lastUserHash = fnv1a(norm(msgs.lastUserText));
+    const lastUserChanged = signature(msgs.lastUserText) !== String(t.baselineUserSig || '');
+    if (lastUserHash === t.currentPromptHash || (msgs.users.length > Number(t.baselineUserCount || 0) && lastUserChanged)) {
+      confirmTxn(msgs); return false;
+    }
+
+    // If a request was observed, reconcile by one controlled reload before ever
+    // deciding it was unsent. No blind duplicate sends.
+    if ((t.sendAttempted || t.sendObserved) && !t.reconciledAt) {
+      return reloadForRecovery('ambiguous-send');
+    }
+    if ((t.sendAttempted || t.sendObserved) && t.reconciledAt && now() - t.reconciledAt < CFG.postReloadReconcileMs) return false;
+
+    if (Number(t.resendCount || 0) >= CFG.maxResendAttempts) {
+      pauseUntil(now() + 10 * 60_000, 'send-unconfirmed');
+      maybeNotify(`${APP}: send needs attention`, 'The last message could not be confirmed after reconciliation. It was not duplicated automatically.');
+      return false;
+    }
+
+    // At this point there is no user turn, no assistant progress, and either no
+    // observed send or a post-reload reconciliation. One resend is safe enough.
+    if (msgs.assistants.length > Number(t.baselineAssistantCount || 0)) return false;
+    const input = getComposer();
+    if (!input || hasComposerAttachments(input)) return false;
+    if (norm(composerText(input)) && norm(composerText(input)) !== norm(t.currentPrompt)) return false;
+    if (!setComposerText(input, t.currentPrompt)) return false;
+    t.resendCount = Number(t.resendCount || 0) + 1;
+    t.sendObserved = false;
+    t.subturnAt = now();
+    t.reconciledAt = 0;
+    saveTxn();
+    return dispatchPrompt(t.currentPrompt, `resend:${err?.id || 'unconfirmed'}`, { newLogicalTask: false });
+  }
+
+  async function reloadForRecovery(reason) {
+    const t = S.txn;
+    if (!t || S.actionInFlight || isPaused()) return false;
+    if (Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) return false;
+    if (t.lastReloadAt && now() - t.lastReloadAt < CFG.reloadCooldownMs) return false;
+    const expectedTxnId = t.id;
+    S.actionInFlight = true;
+    try {
+      if (!(await verifyLease())) return false;
+      const diskTxn = loadTxn(S.route);
+      if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
+      S.txn = diskTxn;
+      const live = S.txn;
+      if (Number(live.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) return false;
+      if (live.lastReloadAt && now() - live.lastReloadAt < CFG.reloadCooldownMs) return false;
+      live.reloadCount = Number(live.reloadCount || 0) + 1;
+      live.lastReloadAt = now();
+      live.reconciledAt = now();
+      saveTxn();
+      log('reload', { reason, count: live.reloadCount });
+      location.reload();
+      return true;
+    } finally {
+      // Normally navigation destroys this context. If reload is blocked, unlock.
+      setTimeout(() => { S.actionInFlight = false; }, 2_000);
+    }
+  }
+
+  async function reloadWithoutTxn(reason = 'conversation-load') {
+    if (S.actionInFlight || isPaused()) return false;
+    const key = `page-reloads:${S.route}`;
+    const cutoff = now() - 5 * 60_000;
+    const hist = (store.json(key, []) || []).map(Number).filter(x => x > cutoff);
+    if (hist.length >= 2) {
+      blockAutomation('page-reload-safety-cap', 'ChatGPT still cannot load this conversation after two recovery reloads. Queue is preserved.');
+      return false;
+    }
+    S.actionInFlight = true;
+    try {
+      if (!(await verifyLease())) return false;
+      hist.push(now());
+      store.setJson(key, hist);
+      log('page-reload', { reason, count: hist.length });
+      location.reload();
+      return true;
+    } finally {
+      setTimeout(() => { S.actionInFlight = false; }, 2_000);
+    }
+  }
+
+  async function handleError(err, msgs) {
+    const t = S.txn;
+    if (!err) return false;
+    if (err.kind === 'hard') {
+      blockAutomation(err.id, `${err.id} cannot be repaired safely by automatic retries. Queue is preserved.`);
+      return true;
+    }
+    if (err.kind === 'rate') {
+      const wait = rateWaitMs(err.sourceText);
+      pauseUntil(now() + wait, 'rate-limit');
+      if (t) { t.nextRecoveryAt = S.pausedUntil; saveTxn(); }
+      return true;
+    }
+    if (err.kind === 'reload') {
+      if (!t) return reloadWithoutTxn(err.id);
+      const ok = await reloadForRecovery(err.id);
+      if (!ok && Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
+        blockAutomation('reload-safety-cap', 'ChatGPT still cannot load this conversation after bounded recovery reloads. Queue and task state are preserved.');
+      }
+      return ok;
+    }
+    if (!t) return false;
+    if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
+    if (t.manualStopped) return false;
+    // Confirmed turns never Retry/Regenerate. We preserve whatever survived and
+    // resume the logical task with the completion contract's literal continue.
+    if (!S.generating) armVerification(msgs, `error:${err.id}`);
+    return false;
+  }
+
+  async function maybeRecoverStall(msgs, longThinking) {
+    const t = S.txn;
+    if (!t || !t.userTurnConfirmed || t.manualStopped || !S.generating) return false;
+    const hasOutput = assistantChangedForTxn(msgs, t);
+    const quietFor = now() - Math.max(S.lastAssistantProgressAt, S.lastControlChangeAt, Number(t.confirmedAt || t.subturnAt || 0));
+    let threshold = hasOutput ? CFG.genericPartialStallMs : CFG.genericNoOutputStallMs;
+    if (longThinking && now() - S.longThinkingSeenAt >= CFG.longThinkingMinVisibleMs) {
+      threshold = hasOutput ? CFG.longThinkingPartialStallMs : CFG.longThinkingNoOutputStallMs;
+    }
+    if (quietFor < threshold) return false;
+    const stop = findStopButton();
+    if (stop) return stopThenContinue(longThinking ? 'long-thinking-stall' : 'generation-stall');
+    if (quietFor >= CFG.noStopReloadStallMs) return reloadForRecovery('stuck-without-stop-control');
+    return false;
+  }
+
+  async function evaluate(reason = 'event') {
+    detectRouteChange();
+    ensureObservers();
+    refreshMessageCache();
+    const msgs = getMessages();
+    promoteSendIntentFromDom(msgs);
+
+    const prevGenerating = S.generating;
+    S.generating = isGenerating();
+    if (prevGenerating && !S.generating) S.lastGenerationEndAt = now();
+
+    const aSig = signature(msgs.lastAssistantText);
+    const uSig = signature(msgs.lastUserText);
+    if (aSig !== S.lastAssistantSig) { S.lastAssistantSig = aSig; S.lastAssistantProgressAt = now(); resetVerification('assistant-change'); }
+    if (uSig !== S.lastUserSig) S.lastUserSig = uSig;
+
+    confirmTxn(msgs);
+    const marker = latestMarker(msgs);
+    let err = currentError(msgs);
+    // A terminal protocol marker commits the prior turn. Do not let a stale
+    // transient toast from that already-committed turn pin the queue forever.
+    if (!S.txn && marker && ['continue', 'send', 'reload'].includes(err?.kind || '')) err = null;
+    S.error = err;
+    const longThinking = updateLongThinking();
+
+    if (!S.enabled) { paintUI(); return; }
+    if (!navigator.onLine) { paintUI(); return; }
+    if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
+    if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
+
+    if (S.txn) {
+      const t = S.txn;
+
+      // An exact final terminal marker is the only success signal. Wait until the
+      // UI is no longer generating so a marker cannot be followed by more output.
+      const markerBelongsToCurrentSubturn = t.userTurnConfirmed && assistantChangedForTxn(msgs, t);
+      if (marker && markerBelongsToCurrentSubturn && !S.generating && now() - S.lastAssistantProgressAt >= CFG.answerSettleMs) {
+        await completeLogicalTask(marker, msgs);
+        paintUI(true);
+        scheduleWatchdog();
+        return;
+      }
+
+      // Manual Stop is sacred. Do not immediately undo the user's action.
+      if (t.manualStopped) { paintUI(); scheduleWatchdog(); return; }
+
+      // Native continuation is strictly less destructive than creating a new turn.
+      if (!S.generating && findContinueButton() && !['hard', 'rate'].includes(err?.kind || '')) {
+        await clickNativeContinue();
+        paintUI(); scheduleWatchdog(); return;
+      }
+
+      if (err) {
+        await handleError(err, msgs);
+        if (isPaused() || err.kind === 'reload' || !t.userTurnConfirmed) { paintUI(); scheduleWatchdog(); return; }
+      }
+
+      if (!t.userTurnConfirmed) {
+        await recoverUnconfirmedSend(msgs, err);
+        paintUI(); scheduleWatchdog(); return;
+      }
+
+      if (S.generating) {
+        await maybeRecoverStall(msgs, longThinking);
+        paintUI(); scheduleWatchdog(); return;
+      }
+
+      // Idle + confirmed + no terminal marker = unfinished by contract. Five
+      // seconds of absolute quiet proves the UI did not merely blink between states.
+      if (!marker) {
+        armVerification(msgs, err ? `error:${err.id}` : 'missing-terminal-marker');
+        await maybeFinishVerification(msgs, err);
+        paintUI(); scheduleWatchdog(); return;
+      }
+    }
+
+    // No active journal. Account/security/rate states still own the scheduler.
+    if (!S.txn && err?.kind === 'hard') {
+      blockAutomation(err.id, `${err.id} needs human attention. Queue is preserved.`);
+      scheduleWatchdog();
+      return;
+    }
+    if (!S.txn && err?.kind === 'rate') {
+      const wait = rateWaitMs(err.sourceText);
+      pauseUntil(now() + wait, 'rate-limit');
+      scheduleWatchdog();
+      return;
+    }
+    if (!S.txn && err?.kind === 'reload') {
+      await reloadWithoutTxn(err.id);
+      scheduleWatchdog();
+      return;
+    }
+
+    // No active journal. Hibernation has priority over ordinary queued work.
+    if (S.hib?.phase === 'sleeping' && now() >= Number(S.hib.wakeAt || 0)) await attemptGithubWake('due');    if (!S.txn && !S.hib && S.queue.length) await processQueue();
+    paintUI();
+    scheduleWatchdog();
+  }
+
+  // ---------- route migration ---------------------------------------------------------
+  function migrateScope(oldScope, newScope) {
+    if (!oldScope || !newScope || oldScope === newScope) return;
+    if (oldScope.startsWith('p:') && newScope.startsWith('c:')) {
+      const oldTxn = store.json(txnKey(oldScope), null);
+      if (oldTxn) { oldTxn.route = newScope; store.setJson(txnKey(newScope), oldTxn); store.del(txnKey(oldScope)); }
+      const oldQueue = store.json(queueKey(oldScope), []);
+      if (Array.isArray(oldQueue) && oldQueue.length) {
+        const existing = store.json(queueKey(newScope), []);
+        const ids = new Set((existing || []).map(x => x.id));
+        const merged = [...(existing || [])];
+        for (const x of oldQueue) if (!ids.has(x.id)) merged.push(x);
+        store.setJson(queueKey(newScope), merged); store.del(queueKey(oldScope));
+      }
+      const oldHib = store.json(hibKey(oldScope), null);
+      if (oldHib) { oldHib.route = newScope; store.setJson(hibKey(newScope), oldHib); store.del(hibKey(oldScope)); }
+      const oldDraft = String(store.get(draftKey(oldScope), '') || '');
+      if (norm(oldDraft) && !store.get(draftKey(newScope), '')) store.set(draftKey(newScope), oldDraft);
+      store.del(draftKey(oldScope));
+    }
+  }
+
+  function detectRouteChange() {
+    if (location.href === S.href) return false;
+    const old = S.route;
+    S.href = location.href;
+    const next = routeKey();
+    migrateScope(old, next);
+    S.route = next;
+    // Auth / anti-abuse are account-level. Other blockers belong to the old
+    // conversation and must not poison a different project chat.
+    if (S.blockedReason && !['auth', 'anti-abuse'].includes(S.blockedReason)) {
+      S.blockedReason = '';
+      store.set('blockedReason', '');
+    }
+    S.txn = loadTxn(next);
+    S.queue = loadQueue(next);
+    S.hib = loadHibernation(next);
+    S.verify = null;
+    S.sendIntent = null;
+    DC.longThinkingNode = null;
+    DC.messagesDirty = true;
+    DC.composer = null; DC.form = null;
+    DC.rootNode = null;
+    DC.composerNode = null;
+    installRootObserver();
+    installComposerObserver();
+    refreshMessageCache(true);
+    restoreDraftIfSafe();
+    scheduleWakeTimer();
+    renderQueueList();
+    paintUI(true);
+    log('route', { from: old, to: next });
+    return true;
+  }
+
+  // ---------- minimal network observer ------------------------------------------------
+  function isConversationRequest(url, method = 'GET') {
+    const m = String(method || 'GET').toUpperCase();
+    if (m !== 'POST') return false;
+    const u = String(url || '');
+    return /(?:\/backend-api\/.*conversation|\/conversation|\/responses)(?:[/?#]|$)/i.test(u);
+  }
+
+  function installNetworkObserver() {
+    try {
+      if (!UW.__CGR1_FETCH_PATCHED__ && typeof UW.fetch === 'function') {
+        UW.__CGR1_FETCH_PATCHED__ = true;
+        const orig = UW.fetch.bind(UW);
+        UW.fetch = async function (input, init = {}) {
+          const url = typeof input === 'string' ? input : input?.url || '';
+          const method = init?.method || input?.method || 'GET';
+          const tracked = isConversationRequest(url, method);
+          if (tracked) {
+            S.lastNetworkAt = now();
+            S.lastNetworkFailureAt = 0;
+            S.lastHttpStatus = 0;
+            S.lastHttpStatusAt = 0;
+            if (validSendIntent()) promoteSendIntent('network');
+            if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
+          }
+          try {
+            const res = await orig(input, init);
+            if (tracked) {
+              S.lastNetworkAt = now();
+              S.lastNetworkFailureAt = 0;
+              S.lastHttpStatus = Number(res?.status || 0);
+              S.lastHttpStatusAt = now();
+              if (S.lastHttpStatus === 429) {
+                const retryMs = parseRetryAfterMs(res?.headers?.get?.('retry-after'));
+                if (retryMs) S.rateRetryAt = now() + retryMs;
+              }
+              scheduleEvaluate('fetch-end', 80);
+            }
+            return res;
+          } catch (e) {
+            if (tracked) {
+              S.lastNetworkAt = now();
+              S.lastNetworkFailureAt = now();
+              scheduleEvaluate('fetch-fail', 80);
+            }
+            throw e;
+          }
+        };
+      }
+    } catch (e) { log('fetch-hook-failed', { message: String(e?.message || e) }); }
+
+    try {
+      const X = UW.XMLHttpRequest;
+      if (X?.prototype && !X.prototype.__CGR1_PATCHED__) {
+        X.prototype.__CGR1_PATCHED__ = true;
+        const open = X.prototype.open;
+        const send = X.prototype.send;
+        X.prototype.open = function (method, url, ...rest) {
+          this.__cgr1Method = method; this.__cgr1Url = url;
+          return open.call(this, method, url, ...rest);
+        };
+        X.prototype.send = function (...args) {
+          const tracked = isConversationRequest(this.__cgr1Url, this.__cgr1Method);
+          if (tracked) {
+            S.lastNetworkAt = now();
+            S.lastNetworkFailureAt = 0;
+            S.lastHttpStatus = 0;
+            S.lastHttpStatusAt = 0;
+            if (validSendIntent()) promoteSendIntent('network');
+            if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
+            this.addEventListener('loadend', () => {
+              S.lastNetworkAt = now();
+              S.lastNetworkFailureAt = 0;
+              S.lastHttpStatus = Number(this.status || 0);
+              S.lastHttpStatusAt = now();
+              if (S.lastHttpStatus === 429) {
+                const retryMs = parseRetryAfterMs(this.getResponseHeader?.('Retry-After'));
+                if (retryMs) S.rateRetryAt = now() + retryMs;
+              }
+              scheduleEvaluate('xhr-end', 80);
+            }, { once: true });
+            this.addEventListener('error', () => { S.lastNetworkFailureAt = now(); scheduleEvaluate('xhr-fail', 80); }, { once: true });
+          }
+          return send.apply(this, args);
+        };
+      }
+    } catch (e) { log('xhr-hook-failed', { message: String(e?.message || e) }); }
+  }
+
+  // ---------- input hooks -------------------------------------------------------------
+  function isComposerTarget(target) {
+    const input = getComposer();
+    return !!input && (target === input || input.contains?.(target));
+  }
+
+  function isSendButtonTarget(target) {
+    const b = target?.closest?.('button');
+    if (!b) return false;
+    const known = findSafeSendButton();
+    if (known && (b === known || known.contains?.(target))) return true;
+    const l = exactButtonLabel(b);
+    return /send|submit/.test(l) && !/stop|retry|regenerat|attach|model|tool/.test(l);
+  }
+
+  function isStopButtonTarget(target) {
+    const b = target?.closest?.('button');
+    if (!b) return false;
+    const stop = findStopButton();
+    return b === stop || /stop generating|stop response/.test(exactButtonLabel(b));
+  }
+
+  function hasComposerPopup(input = getComposer()) {
+    if (!input) return false;
+    try {
+      if (input.getAttribute?.('aria-expanded') === 'true') return true;
+      const active = input.getAttribute?.('aria-activedescendant'); if (active && visible(document.getElementById(active))) return true;
+      const form = composerForm(input); if (form && Array.from(form.querySelectorAll('[role="listbox"],[role="menu"]')).some(visible)) return true;
+    } catch (_) {}
+    return false;
+  }
+
+  function shouldQueueEnter() {
+    return !!S.txn || S.generating || !!S.hib || S.queue.length > 0 || S.queuePaused || isPaused() || !!S.error || S.actionInFlight;
+  }
+
+  function takeHibernationQueueItemForHuman() {
+    if (!S.hib || !['sleeping', 'wait-user'].includes(S.hib.phase)) return null;
+    const qid = S.hib.queueItemId || null;
+    clearHibernation('human-resume', { suppressQueueKick: true });
+    return qid;
+  }
+
+  function installInputHooks() {
+    document.addEventListener('input', e => {
+      if (isComposerTarget(e.target)) {
+        const txt = promptText(composerText(e.target));
+        if (norm(txt)) setDraft(txt, S.route); else { clearDraft(S.route); kickQueue('composer-cleared', 80); }
+        ensureQueueButton();
+        renderQueueList();
+      }
+    }, true);
+
+    // A real click is the trustworthy boundary for native Stop/Send controls.
+    // Script-generated HTMLElement.click() events are untrusted and must not be
+    // mistaken for human intervention.
+    document.addEventListener('click', e => {
+      if (isStopButtonTarget(e.target)) {
+        if (e.isTrusted && !S.actionInFlight && S.txn) {
+          S.txn.manualStopped = true;
+          saveTxn();
+          resetVerification('manual-stop');
+          paintUI(true);
+        }
+        return;
+      }
+      if (!isSendButtonTarget(e.target)) return;
+      if (S.actionInFlight) {
+        // HTMLElement.click() from our own dispatcher is untrusted and must pass.
+        if (e.isTrusted) { e.preventDefault(); e.stopImmediatePropagation(); }
+        return;
+      }
+      if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
+      const input = getComposer();
+      const p = promptText(composerText(input));
+      if (!norm(p)) return;
+      setSendIntent(p, (S.generating || S.txn) ? 'human-steer-click' : 'human-click', {
+        subturn: !!S.txn,
+        resumeHib: !!S.hib,
+        clearBlocked: !!S.blockedReason,
+        queueItemId: S.hib?.queueItemId || null,
+      });
+    }, true);
+
+    document.addEventListener('keydown', e => {
+      if (e.isComposing || e.repeat || !isComposerTarget(e.target) || !S.enabled) return;
+      if (e.key === 'Escape' && S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); cancelQueueEdit(); return; }
+      if (e.key !== 'Enter' || e.shiftKey || e.altKey || e.metaKey) return;
+      if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
+      if (S.actionInFlight) { e.preventDefault(); e.stopImmediatePropagation(); return; }
+      if (e.ctrlKey) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        const input = getComposer(); const p = promptText(composerText(input)); if (!norm(p)) return;
+        const active = !!S.txn || S.generating;
+        const hadHib = !!S.hib;
+        const hadBlock = !!S.blockedReason;
+        const resumedQueueItemId = !active ? (S.hib?.queueItemId || null) : null;
+        dispatchPrompt(p, active ? 'ctrl-enter-steer' : 'ctrl-enter', { newLogicalTask: !active, queueItemId: resumedQueueItemId })
+          .then(ok => {
+            if (!ok) return;
+            if (hadHib && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
+            if (hadBlock && S.blockedReason) clearBlock('ctrl-enter-confirmed');
+          })
+          .catch(err => log('ctrl-enter-error', { message: String(err?.message || err) }));
+        return;
+      }
+      if (hasComposerPopup(e.target)) return;
+      const isHumanWaitReply = S.hib?.phase === 'wait-user' && !S.txn && !S.generating;
+      const isBlockedReply = !!S.blockedReason && !S.generating;
+      if (!isHumanWaitReply && !isBlockedReply && shouldQueueEnter()) {
+        e.preventDefault(); e.stopImmediatePropagation(); queueCurrentComposer(); return;
+      }
+      // Idle Enter remains native, but only records an ephemeral intent. If a
+      // slash/autocomplete UI or React swallows the keystroke, nothing durable is
+      // created and the intent simply expires.
+      const p = promptText(composerText(e.target));
+      if (!norm(p)) return;
+      setSendIntent(p, isBlockedReply ? 'blocked-human-reply' : isHumanWaitReply ? 'wait-user-reply' : 'native-enter', {
+        subturn: !!S.txn,
+        resumeHib: !!S.hib,
+        clearBlocked: isBlockedReply,
+        queueItemId: S.hib?.queueItemId || null,
+      });
+    }, true);
+
+    document.addEventListener('submit', e => {
+      const input = getComposer();
+      if (!input || !e.target?.contains?.(input)) return;
+      const p = promptText(composerText(input));
+      if (!norm(p)) return;
+      if (!validSendIntent()) {
+        setSendIntent(p, (S.generating || S.txn) ? 'native-submit-followup' : 'native-submit', {
+          subturn: !!S.txn, resumeHib: !!S.hib, clearBlocked: !!S.blockedReason,
+          queueItemId: S.hib?.queueItemId || null,
+        });
+      }
+      promoteSendIntent('submit');
+    }, true);
+  }
+
+  // ---------- UI ----------------------------------------------------------------------
+  function ensureQueueTray() {
+    const input = getComposer();
+    const form = composerForm(input);
+    const host = form?.parentElement;
+    if (!input || !form || !host) return null;
+    let tray = document.getElementById('cgr-queue-tray');
+    if (!tray) {
+      tray = document.createElement('section');
+      tray.id = 'cgr-queue-tray';
+      tray.setAttribute('aria-label', 'Queued follow-up messages');
+      tray.innerHTML = `<div class="cgr-queue-tray-head"><div class="cgr-queue-tray-title"><span>Queued</span><span id="cgr-queue-tray-count"></span></div><button type="button" id="cgr-queue-tray-pause" class="cgr-queue-tray-pause"></button></div><div id="cgr-queue-list" class="cgr-queue-list" role="list"></div>`;
+      tray.querySelector('#cgr-queue-tray-pause')?.addEventListener('click', () => setQueuePaused(!S.queuePaused, 'panel'));
+    }
+    if (tray.parentElement !== host || tray.nextElementSibling !== form) {
+      try { host.insertBefore(tray, form); } catch (_) { try { host.prepend(tray); } catch (_) {} }
+    }
+    DC.queueTray = tray;
+    tray.hidden = !queueCount();
+    return tray;
+  }
+
+  function animateQueueCardOut(row, done) {
+    if (!row?.animate) { done(); return; }
+    const h = row.getBoundingClientRect?.().height || 44;
+    const a = row.animate([{ opacity: 1, transform: 'translateY(0)', maxHeight: `${h}px` }, { opacity: 0, transform: 'translateY(-5px) scale(.985)', maxHeight: '0px' }], { duration: 150, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'forwards' });
+    a.addEventListener('finish', done, { once: true });
+    a.addEventListener('cancel', done, { once: true });
+  }
+
+  function renderQueueList() {
+    const tray = ensureQueueTray();
+    if (!tray) return;
+    const list = tray.querySelector('#cgr-queue-list');
+    const count = tray.querySelector('#cgr-queue-tray-count');
+    const pause = tray.querySelector('#cgr-queue-tray-pause');
+    if (count) count.textContent = queueCount() ? String(queueCount()) : '';
+    if (pause) pause.textContent = S.queuePaused ? 'Resume' : 'Pause';
+    tray.hidden = !queueCount();
+    if (!list || !queueCount()) { if (list) list.textContent = ''; return; }
+    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.status}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|action:${S.actionInFlight}|online:${navigator.onLine}`;
+    if (fp === DC.queueFingerprint && list.childNodes.length) return;
+    DC.queueFingerprint = fp;
+    list.textContent = '';
+    S.queue.forEach((item, index) => {
+      const row = document.createElement('div');
+      row.className = `cgr-queue-item ${item.status === 'inflight' ? 'is-inflight' : ''} ${S.queueEditingId === item.id ? 'is-editing' : ''}`;
+      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = item.status === 'pending' && S.queueEditingId !== item.id;
+
+      const grip = document.createElement('button');
+      grip.type = 'button'; grip.className = 'cgr-queue-grip'; grip.title = 'Drag to reorder · Arrow keys move'; grip.innerHTML = '<span></span><span></span><span></span><span></span><span></span><span></span>';
+      grip.addEventListener('keydown', e => { if (item.status !== 'pending' || !['ArrowUp', 'ArrowDown'].includes(e.key)) return; e.preventDefault(); moveQueueItem(item.id, queueIndexById(item.id) + (e.key === 'ArrowUp' ? -1 : 2)); });
+      row.appendChild(grip);
+
+      const body = document.createElement('div'); body.className = 'cgr-queue-body';
+      const text = document.createElement('div'); text.className = 'cgr-queue-text'; text.textContent = item.text; text.title = item.text; if (item.status === 'pending') text.addEventListener('dblclick', () => beginQueueEdit(item.id));
+      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = item.status === 'inflight' ? 'Active logical task' : S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : index === 0 ? 'Next follow-up' : `Follow-up ${index + 1}`;
+      body.append(text, meta); row.appendChild(body);
+
+      const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
+      if (item.status === 'pending' && S.queueEditingId !== item.id) {
+        const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.txn || S.generating ? 'Steer' : 'Send';
+        send.disabled = !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !navigator.onLine;
+        send.addEventListener('click', () => steerOrSendQueuedItem(item.id)); actions.appendChild(send);
+        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
+      }
+      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.title = item.status === 'inflight' ? 'Forget queue ownership; current task continues' : 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
+
+      row.addEventListener('dragstart', e => { if (item.status !== 'pending') { e.preventDefault(); return; } DC.queueDragId = item.id; row.classList.add('is-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) {} });
+      row.addEventListener('dragend', () => { DC.queueDragId = ''; row.classList.remove('is-dragging'); });
+      row.addEventListener('dragover', e => { if (!DC.queueDragId || DC.queueDragId === item.id || item.status !== 'pending') return; e.preventDefault(); });
+      row.addEventListener('drop', e => { if (!DC.queueDragId || DC.queueDragId === item.id) return; e.preventDefault(); const r = row.getBoundingClientRect(); moveQueueItem(DC.queueDragId, queueIndexById(item.id) + (e.clientY > r.top + r.height / 2 ? 1 : 0)); DC.queueDragId = ''; });
+      list.appendChild(row);
+    });
+  }
+
+  function ensureQueueButton() {
+    const input = getComposer();
+    if (!input) return;
+    let btn = document.getElementById('cgr-queue-button');
+    if (btn?.isConnected) {
+      const badge = btn.querySelector('b');
+      if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
+      btn.disabled = !norm(composerText(input)) || hasComposerAttachments(input);
+      return;
+    }
+    const send = findSafeSendButton(input);
+    const form = composerForm(input);
+    const parent = send?.parentElement || form;
+    if (!parent) return;
+    btn = document.createElement('button');
+    btn.id = 'cgr-queue-button'; btn.type = 'button'; btn.setAttribute('aria-label', 'Queue follow-up');
+    btn.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 5.5h9M4 10h9M4 14.5h6.5"/><path d="m14 12.5 2 2 2-2"/></svg><span>Queue</span><b></b>';
+    btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); if (S.queueEditingId) commitQueueEdit(); else queueCurrentComposer(); });
+    try { if (send && send.parentElement === parent) parent.insertBefore(btn, send); else parent.appendChild(btn); } catch (_) {}
+    const badge = btn.querySelector('b'); if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
+    btn.disabled = !norm(composerText(input)) || hasComposerAttachments(input);
+  }
+
+  function statusText() {
+    if (!S.enabled) return ['Off', 'muted'];
+    if (!navigator.onLine) return ['Offline', 'warn'];
+    if (S.blockedReason) return [`Waiting · ${S.blockedReason}`, 'error'];
+    if (isPaused()) return [`Paused · ${S.pausedReason}`, 'warn'];
+    if (S.hib?.phase === 'sleeping') return [`GitHub sleep ${Math.max(1, Math.ceil((S.hib.wakeAt - now()) / 60_000))}m`, 'warn'];
+    if (S.hib?.phase === 'waking') return ['Checking GitHub', 'active'];
+    if (S.hib?.phase === 'wait-user') return ['Waiting for you', 'warn'];
+    if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
+    if (S.actionInFlight) return ['Recovering', 'active'];
+    if (S.verify) return [`Verifying ${Math.max(0, Math.ceil((CFG.incompleteVerifyMs - (now() - S.verify.since)) / 1000))}s`, 'warn'];
+    if (S.error) return [S.error.id, S.error.kind === 'hard' ? 'error' : 'warn'];
+    if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
+    if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
+    if (S.queue.length) return [`Queue ${S.queue.length}`, 'active'];
+    if (!tailCommittedForQueue()) return ['Untracked unfinished turn', 'warn'];
+    return ['Healthy', 'ok'];
+  }
+
+  function ensureUI() {
+    if (!document.body || document.getElementById('cgr-root')) return;
+    const root = document.createElement('div'); root.id = 'cgr-root';
+    root.innerHTML = `<button id="cgr-pill" type="button"><span id="cgr-dot"></span><span id="cgr-status">Starting</span></button><div id="cgr-panel" hidden><div class="cgr-head"><strong>${APP}</strong><span>v${VERSION}</span></div><div class="cgr-row"><span>Automation</span><button id="cgr-toggle"></button></div><div class="cgr-row"><span>Queue</span><button id="cgr-queue-toggle"></button></div><div class="cgr-note" id="cgr-detail"></div><div class="cgr-actions"><button id="cgr-recover">Continue now</button><button id="cgr-wake">GitHub wake now</button><button id="cgr-clear-queue">Clear pending</button><button id="cgr-clear-state">Clear state</button></div></div>`;
+    document.body.appendChild(root);
+    root.querySelector('#cgr-pill').addEventListener('click', () => { const p = root.querySelector('#cgr-panel'); p.hidden = !p.hidden; paintUI(true); });
+    root.querySelector('#cgr-toggle').addEventListener('click', () => { S.enabled = !S.enabled; store.set('enabled', S.enabled); if (S.enabled) scheduleEvaluate('enabled', 0); paintUI(true); });
+    root.querySelector('#cgr-queue-toggle').addEventListener('click', () => setQueuePaused(!S.queuePaused));
+    root.querySelector('#cgr-recover').addEventListener('click', async () => { clearPause(); clearBlock('panel-continue'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); } const msgs = getMessages(true); S.generating = isGenerating(); if (!S.generating && S.txn?.userTurnConfirmed) await sendLiteralContinue('manual'); scheduleEvaluate('manual-recover', 100); });
+    root.querySelector('#cgr-wake').addEventListener('click', () => attemptGithubWake('manual', true));
+    root.querySelector('#cgr-clear-queue').addEventListener('click', clearPendingQueue);
+    root.querySelector('#cgr-clear-state').addEventListener('click', () => { clearPause(); clearBlock('manual-clear'); clearTxn('manual-clear'); clearHibernation('manual-clear'); paintUI(true); });
+  }
+
+  function paintUI(force = false) {
+    ensureUI(); ensureQueueButton(); renderQueueList();
+    const root = document.getElementById('cgr-root'); if (!root) return;
+    const [text, state] = statusText();
+    const fp = `${text}|${state}|${S.queuePaused}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}`;
+    if (!force && fp === DC.uiFingerprint) return;
+    DC.uiFingerprint = fp;
+    root.dataset.state = state;
+    root.querySelector('#cgr-status').textContent = text;
+    root.querySelector('#cgr-toggle').textContent = S.enabled ? 'On' : 'Off';
+    root.querySelector('#cgr-queue-toggle').textContent = S.queuePaused ? 'Resume' : 'Pause';
+    const parts = [];
+    if (S.txn) parts.push(`continues ${S.txn.continueCount || 0}/${CFG.maxContinuesPerLogicalTask}`, `reloads ${S.txn.reloadCount || 0}/${CFG.maxReloadsPerLogicalTask}`);
+    if (S.queueHoldReason) parts.push(`queue: ${S.queueHoldReason}`);
+    parts.push('completion: marker required');
+    root.querySelector('#cgr-detail').textContent = parts.join(' · ');
+  }
+
+  function addStyles() {
+    GM_addStyle(`
+      #cgr-root{position:fixed;right:14px;bottom:14px;z-index:2147483600;font:12px/1.35 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:CanvasText}
+      #cgr-pill{display:flex;align-items:center;gap:7px;border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:999px;padding:7px 10px;background:color-mix(in srgb,Canvas 92%,transparent);color:CanvasText;box-shadow:0 5px 20px rgba(0,0,0,.16);backdrop-filter:blur(12px);cursor:pointer}
+      #cgr-dot{width:8px;height:8px;border-radius:50%;background:#6b7280}#cgr-root[data-state="ok"] #cgr-dot{background:#22c55e}#cgr-root[data-state="active"] #cgr-dot{background:#3b82f6}#cgr-root[data-state="warn"] #cgr-dot{background:#f59e0b}#cgr-root[data-state="error"] #cgr-dot{background:#ef4444}
+      #cgr-panel{position:absolute;right:0;bottom:42px;width:285px;padding:12px;border:1px solid color-mix(in srgb,CanvasText 16%,transparent);border-radius:14px;background:color-mix(in srgb,Canvas 96%,transparent);box-shadow:0 14px 50px rgba(0,0,0,.25);backdrop-filter:blur(16px)}#cgr-panel[hidden]{display:none}.cgr-head,.cgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px}.cgr-head{margin-bottom:10px}.cgr-head span{opacity:.55;font-size:10px}.cgr-row{padding:7px 0;border-top:1px solid color-mix(in srgb,CanvasText 9%,transparent)}.cgr-row button,.cgr-actions button{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:8px;background:color-mix(in srgb,CanvasText 7%,transparent);color:CanvasText;padding:5px 8px;cursor:pointer}.cgr-note{margin-top:8px;padding:8px;border-radius:8px;background:color-mix(in srgb,CanvasText 5%,transparent);opacity:.75;font-size:11px}.cgr-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:9px}
+      #cgr-queue-tray{width:100%;box-sizing:border-box;margin:0 0 8px;padding:6px;border:1px solid color-mix(in srgb,CanvasText 12%,transparent);border-radius:18px;background:color-mix(in srgb,Canvas 86%,transparent);box-shadow:0 6px 22px rgba(0,0,0,.08);backdrop-filter:blur(18px);animation:cgrTrayIn .16s cubic-bezier(.2,.8,.2,1)}#cgr-queue-tray[hidden]{display:none!important}.cgr-queue-tray-head{height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 5px 3px 8px}.cgr-queue-tray-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;opacity:.72}.cgr-queue-tray-title #cgr-queue-tray-count{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:color-mix(in srgb,CanvasText 9%,transparent);font-size:9px}.cgr-queue-tray-pause{border:0;background:transparent;color:CanvasText;opacity:.56;font-size:10px;padding:5px 7px;border-radius:7px;cursor:pointer}.cgr-queue-list{display:flex;flex-direction:column;gap:5px;max-height:min(30dvh,280px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:1px}.cgr-queue-item{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:48px;padding:7px 8px 7px 5px;border:1px solid color-mix(in srgb,CanvasText 9%,transparent);border-radius:13px;background:color-mix(in srgb,CanvasText 4.5%,Canvas);transition:background .13s ease,border-color .13s ease,transform .13s ease,opacity .13s ease;animation:cgrQueueCardIn .17s cubic-bezier(.2,.8,.2,1)}.cgr-queue-item.is-inflight{border-color:color-mix(in srgb,CanvasText 20%,transparent)}.cgr-queue-item.is-dragging{opacity:.45}.cgr-queue-grip{width:18px;height:28px;border:0;background:transparent;padding:6px 4px;display:grid;grid-template-columns:repeat(2,3px);gap:3px;align-content:center;justify-content:center;opacity:.28;cursor:grab;color:CanvasText}.cgr-queue-grip span{width:3px;height:3px;border-radius:50%;background:currentColor}.cgr-queue-body{min-width:0}.cgr-queue-text{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cgr-queue-meta{margin-top:2px;font-size:9.5px;opacity:.46}.cgr-queue-actions-inline{display:flex;align-items:center;gap:3px}.cgr-queue-action,.cgr-queue-icon-action{border:0;color:CanvasText;background:transparent;cursor:pointer}.cgr-queue-action{height:28px;padding:0 9px;border-radius:9px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;opacity:.48}.cgr-queue-icon-action:hover{opacity:.9;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action svg{width:15px;height:15px;fill:currentColor;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.cgr-queue-remove svg{fill:none}
+      #cgr-queue-button{margin-inline:3px;border:0;border-radius:999px;background:transparent;color:CanvasText;min-height:32px;padding:0 8px;display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:560;cursor:pointer;white-space:nowrap;opacity:.62}#cgr-queue-button:hover:not(:disabled){background:color-mix(in srgb,CanvasText 8%,transparent);opacity:.92}#cgr-queue-button:disabled{opacity:.28}#cgr-queue-button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.5}#cgr-queue-button b{min-width:16px;height:16px;padding:0 4px;border-radius:999px;display:inline-grid;place-items:center;background:color-mix(in srgb,CanvasText 10%,transparent);font-size:9px}
+      @keyframes cgrTrayIn{from{opacity:0;transform:translateY(5px) scale(.995)}to{opacity:1;transform:none}}@keyframes cgrQueueCardIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(prefers-reduced-motion:reduce){#cgr-queue-tray,.cgr-queue-item{animation:none!important}.cgr-queue-item{transition:none!important}}
+    `);
+  }
+
+  // ---------- scheduling --------------------------------------------------------------
+  function scheduleEvaluate(reason = 'event', delay = 0) {
+    const due = now() + Math.max(0, delay);
+    if (DC.evaluateTimer && DC.evaluateDueAt <= due) return;
+    if (DC.evaluateTimer) clearTimeout(DC.evaluateTimer);
+    DC.evaluateDueAt = due;
+    DC.evaluateTimer = setTimeout(() => {
+      DC.evaluateTimer = null; DC.evaluateDueAt = 0;
+      evaluate(reason).catch(e => log('evaluate-error', { reason, message: String(e?.message || e) }));
+    }, Math.max(0, due - now()));
+  }
+
+  function scheduleWatchdog() {
+    if (DC.watchdogTimer) clearTimeout(DC.watchdogTimer);
+    let delay;
+    if (document.hidden) delay = CFG.hiddenWatchdogMs;
+    else if (S.blockedReason) delay = CFG.idleWatchdogMs;
+    else if (S.hib?.phase === 'sleeping') delay = CFG.idleWatchdogMs;
+    else if (S.queuePaused) delay = CFG.idleWatchdogMs;
+    else if (isPaused()) delay = Math.min(CFG.idleWatchdogMs, Math.max(1_000, S.pausedUntil - now()));
+    else delay = (!!S.txn || S.generating || !!S.verify || !!S.sendIntent || S.hib?.phase === 'waking') ? CFG.activeWatchdogMs : CFG.idleWatchdogMs;
+    DC.watchdogTimer = setTimeout(() => scheduleEvaluate('watchdog', 0), delay);
+  }
+
+  function ensureObservers() {
+    const currentRoot = document.querySelector('main') || document.body;
+    if (!DC.rootObserver || !DC.rootNode?.isConnected || DC.rootNode !== currentRoot) installRootObserver();
+    installComposerObserver();
+    rebindAssistantObserver();
+  }
+
+  function installRouteHooks() {
+    try {
+      if (!UW.__CGR1_HISTORY__) {
+        UW.__CGR1_HISTORY__ = true;
+        for (const name of ['pushState', 'replaceState']) {
+          const orig = UW.history[name];
+          UW.history[name] = function (...args) { const r = orig.apply(this, args); queueMicrotask(() => window.dispatchEvent(new Event('cgr1:route'))); return r; };
+        }
+      }
+    } catch (_) {}
+    window.addEventListener('popstate', () => scheduleEvaluate('popstate', 0));
+    window.addEventListener('cgr1:route', () => scheduleEvaluate('route', 0));
+  }
+
+  function installMenu() {
+    try {
+      GM_registerMenuCommand('Toggle ChatGPT Resilience', () => { S.enabled = !S.enabled; store.set('enabled', S.enabled); paintUI(true); if (S.enabled) scheduleEvaluate('menu-enable', 0); });
+      GM_registerMenuCommand('Continue unfinished task now', () => { clearPause(); clearBlock('menu'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); sendLiteralContinue('menu'); } });
+      GM_registerMenuCommand('Pause / resume queue', () => setQueuePaused(!S.queuePaused));
+      GM_registerMenuCommand('Clear pending queue', clearPendingQueue);
+      GM_registerMenuCommand('GitHub wake now', () => attemptGithubWake('menu', true));
+      GM_registerMenuCommand('Clear recovery state', () => { clearPause(); clearBlock('menu-clear'); clearTxn('menu-clear'); clearHibernation('menu-clear'); paintUI(true); });
+    } catch (_) {}
+  }
+
+  function selfTest() {
+    const cases = [
+      ['done marker', terminalMarker('hello\n[[CGR_DONE]]'), 'done'],
+      ['hibernate marker', terminalMarker('hello\n[[CGR_HIBERNATE_GITHUB_5M]]'), 'hibernate'],
+      ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
+      ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
+      ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
+      ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
+      ['rate pauses', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
+      ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
+      ['context blocks', classifyError('This conversation has reached its maximum length')?.kind, 'hard'],
+      ['wait parser', parseWaitMs('Try again in 45 seconds'), 45000],
+      ['classifier can recognize network phrase', classifyError('We should handle network error conditions carefully')?.id || null, 'network'],
+      ['normal prose tail guard', ASSISTANT_ERROR_TAIL_RE.test('We should handle network error conditions carefully.'), false],
+      ['product error tail guard', ASSISTANT_ERROR_TAIL_RE.test('There was an error generating a response. Try again'), true],
+      ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
+      ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
+      ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
+    ];
+    // The classifier alone intentionally matches generic prose; collectErrorText
+    // is the guard that prevents normal assistant prose from reaching it. Keep
+    // that behavior explicit in the test output instead of pretending otherwise.
+    return cases.map(([name, got, expected], i) => ({ i, name, got, expected, pass: got === expected }));
+  }
+
+  function boot() {
+    // `reconciledAt` is written immediately before a controlled reload. Reset it
+    // to this boot time so a slow navigation cannot consume the entire
+    // post-reload reconciliation window before ChatGPT has rendered history.
+    if (S.txn && !S.txn.userTurnConfirmed && S.txn.reconciledAt) {
+      S.txn.reconciledAt = now();
+      saveTxn();
+    }
+    addStyles();
+    ensureUI();
+    installInputHooks();
+    installRootObserver();
+    installComposerObserver();
+    refreshMessageCache(true);
+    restoreDraftIfSafe();
+    ensureQueueButton(); renderQueueList();
+    scheduleWakeTimer();
+    scheduleEvaluate('boot', 250);
+    installMenu();
+    window.addEventListener('online', () => scheduleEvaluate('online', 250));
+    window.addEventListener('offline', () => paintUI(true));
+    window.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleEvaluate('visible', 100); scheduleWatchdog(); });
+    window.addEventListener('focus', () => scheduleEvaluate('focus', 100));
+    window.addEventListener('beforeunload', releaseLease);
+  }
+
+  try {
+    UW.ChatGPTResilience = Object.freeze({
+      version: VERSION,
+      protocol: PROTOCOL,
+      selfTest,
+      continueNow: () => sendLiteralContinue('console'),
+      githubWakeNow: () => attemptGithubWake('console', true),
+      githubCancel: () => clearHibernation('console'),
+      queueNow: queueCurrentComposer,
+      pauseQueue: () => setQueuePaused(true),
+      resumeQueue: () => setQueuePaused(false),
+      state: () => ({
+        route: S.route,
+        enabled: S.enabled,
+        generating: S.generating,
+        sendIntent: validSendIntent() ? { source: S.sendIntent.source, ageMs: now() - S.sendIntent.at, subturn: S.sendIntent.subturn } : null,
+        error: S.error,
+        verify: S.verify ? { ...S.verify } : null,
+        pausedUntil: S.pausedUntil,
+        pausedReason: S.pausedReason,
+        blockedReason: S.blockedReason,
+        composer: { ...S.composerControl },
+        txn: S.txn ? { ...S.txn, rootPrompt: `[${S.txn.rootPrompt?.length || 0} chars]`, currentPrompt: `[${S.txn.currentPrompt?.length || 0} chars]` } : null,
+        queue: S.queue.map(x => ({ ...x, text: `[${x.text.length} chars]` })),
+        github: S.hib ? { ...S.hib } : null,
+        logs: S.logs.slice(-40),
+      }),
+    });
+  } catch (_) {}
+
+  installNetworkObserver();
+  installRouteHooks();
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
+  else if (document.body) boot();
+  else {
+    const timer = setInterval(() => { if (document.body) { clearInterval(timer); boot(); } }, 100);
+  }
+})();
