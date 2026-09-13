@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.18 — wiring / edge-case audit
+ChatGPT Resilience v1.3.19 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -15,6 +15,28 @@ Core contract
 - Errors, [[CGR_HIBERNATE_GITHUB_10M]], [[CGR_WAIT_USER]], recovery, generation,
   and ambiguous states never release queued work.
 - There is no manual queued Send/Steer bypass.
+
+Queue release readiness
+-----------------------
+A queued item may dispatch only when ONE canonical gate reports no block:
+- current assistant tail ends in [[CGR_DONE]]
+- no recognized error
+- no active/pending recovery or control fault
+- no hibernation state (sleeping, waking, or wait-user)
+- no active transaction
+- not generating
+- no verifier
+- not paused or blocked
+- no action in flight or send intent
+- browser is online
+
+Unresolved long-thinking is represented by recovery/pending-recovery state, so it
+must finish its Stop -> wait -> continue flow before the queue can release.
+If [[CGR_DONE]] is later committed, that protocol result is the proof that the
+recovered logical task has actually finished.
+
+The gate is checked twice: before queue staging and again after durable state +
+live DOM are refreshed, closing races with newly-started recovery/hibernation.
 
 Queue dispatch
 --------------
@@ -146,7 +168,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.18
+- Userscript version: 1.3.19
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
