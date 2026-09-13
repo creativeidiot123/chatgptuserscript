@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.0.8
+// @version      1.0.9
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.0.8
+   * ChatGPT Resilience 1.0.9
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -41,6 +41,7 @@
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
    *   - Send/Voice appearing after turn work without a terminal marker is an immediate incomplete-turn signal
+   *   - Retry/Try again/Regenerate controls are failure signals only; they are never clicked
    *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
@@ -55,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.0.8';
+  const VERSION = '1.0.9';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -132,6 +133,13 @@
       'button[aria-label="Start voice conversation"]',
       'button[aria-label="Start voice chat"]',
       'button[aria-label^="Start voice" i]',
+    ],
+    retry: [
+      'button[data-testid*="retry" i]',
+      'button[data-testid*="regenerate" i]',
+      'button[aria-label="Retry" i]',
+      'button[aria-label="Try again" i]',
+      'button[aria-label^="Regenerate" i]',
     ],
     user: [
       '[data-message-author-role="user"]',
@@ -763,6 +771,46 @@
     return null;
   }
 
+  const RETRY_CONTROL_RE = /^(?:retry|try again|regenerate|regenerate response)$/i;
+
+  function retryControlLabel(el) {
+    if (!el) return '';
+    const values = [
+      el.getAttribute?.('aria-label'),
+      el.textContent,
+      el.getAttribute?.('title'),
+      el.getAttribute?.('data-testid'),
+    ];
+    for (const value of values) {
+      const v = norm(value || '');
+      if (!v) continue;
+      if (RETRY_CONTROL_RE.test(v) || /^retry[-_ ]?button$/i.test(v) || /regenerate/i.test(v)) return v;
+    }
+    return '';
+  }
+
+  function findRetryButton() {
+    const roots = [];
+    const turn = DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || null;
+    if (turn) roots.push(turn);
+    const main = document.querySelector('main');
+    if (main && !roots.includes(main)) roots.push(main);
+
+    for (const root of roots) {
+      for (const sel of SELECTORS.retry) {
+        try {
+          const hit = Array.from(root.querySelectorAll(sel)).find(el => visible(el) && !disabled(el));
+          if (hit) return hit;
+        } catch (_) {}
+      }
+      try {
+        const hit = Array.from(root.querySelectorAll('button')).find(el => visible(el) && !disabled(el) && retryControlLabel(el));
+        if (hit) return hit;
+      } catch (_) {}
+    }
+    return null;
+  }
+
   function isContinueButton(btn) {
     if (!btn || !visible(btn) || disabled(btn)) return false;
     const labels = [
@@ -939,6 +987,13 @@
   }
 
   function currentError(msgs = getMessages()) {
+    const retry = findRetryButton();
+    if (retry) return {
+      id: 'retry-control',
+      kind: 'continue',
+      sourceText: retryControlLabel(retry) || 'Retry control visible',
+    };
+
     const dom = classifyError(collectErrorText(msgs));
     if (dom) return dom;
     const age = now() - Number(S.lastHttpStatusAt || 0);
@@ -1197,6 +1252,34 @@
       nextRecoveryAt: 0,
       manualStopped: false,
     };
+  }
+
+  function adoptUntrackedTurn(msgs, source = 'adopt-untracked') {
+    if (S.txn || !msgs?.lastUserText || !msgs?.lastAssistant) return null;
+    if (latestMarker(msgs)) return null;
+
+    const p = promptText(msgs.lastUserText);
+    if (!norm(p)) return null;
+
+    const t = newTxn(p, source, inflightQueueItem()?.id || null);
+    t.baselineUserCount = Math.max(0, msgs.users.length - 1);
+    t.baselineUserSig = '';
+    t.baselineAssistantCount = Math.max(0, msgs.assistants.length - 1);
+    t.baselineAssistantSig = '';
+    t.userTurnConfirmed = true;
+    t.confirmedAt = now();
+    t.sendAttempted = true;
+    t.sendObserved = true;
+    t.generationObserved = false;
+    t.assistantObserved = true;
+    t.currentPrompt = p;
+    t.currentPromptHash = fnv1a(norm(p));
+    t.nextRecoveryAt = 0;
+    S.txn = t;
+    saveTxn();
+    S.verify = null;
+    log('txn-adopt', { source, queueItem: !!t.queueItemId });
+    return t;
   }
 
   function armNewTxn(prompt, source, queueItemId = null) {
@@ -1723,7 +1806,7 @@
   }
 
   function queueBlocked() {
-    return S.queuePaused || !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error || !!findContinueButton();
+    return S.queuePaused || !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error || !!findRetryButton() || !!findContinueButton();
   }
 
   function kickQueue(reason = 'event', delay = 0) {
@@ -1913,7 +1996,7 @@
     const t = S.txn;
     if (!v || !t || S.generating || t.manualStopped) return false;
     if (signature(msgs.lastAssistantText) !== v.sig) { resetVerification('assistant-changed'); return false; }
-    if (findContinueButton()) { resetVerification('native-continue'); return clickNativeContinue(); }
+    if (!findRetryButton() && findContinueButton()) { resetVerification('native-continue'); return clickNativeContinue(); }
     if (now() < Number(t.nextRecoveryAt || 0)) return false;
     if (now() - logicalQuietSince() < CFG.incompleteVerifyMs) return false;
     if (now() - v.since < CFG.incompleteVerifyMs) return false;
@@ -2111,6 +2194,18 @@
     if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
     if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
 
+    // A failed UI can outlive the journal after reload/navigation/script install.
+    // Recoverable Retry/error states may adopt only the current visible tail.
+    if (!S.txn && err && !['hard', 'rate', 'reload'].includes(err.kind || '')) {
+      const adopted = adoptUntrackedTurn(msgs, `error-adopt:${err.id}`);
+      if (adopted) {
+        await handleError(err, msgs);
+        paintUI(true);
+        scheduleWatchdog();
+        return;
+      }
+    }
+
     if (S.txn) {
       const t = S.txn;
 
@@ -2160,7 +2255,7 @@
 
       // Native continuation is a fallback only when the composer has not already
       // given us the stronger Send/Voice ended-without-marker signal.
-      if (!S.generating && findContinueButton()) {
+      if (!S.generating && !findRetryButton() && findContinueButton()) {
         await clickNativeContinue();
         paintUI(); scheduleWatchdog(); return;
       }
@@ -2614,6 +2709,7 @@
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
     if (S.verify) return [`Verifying ${Math.max(0, Math.ceil((CFG.incompleteVerifyMs - (now() - S.verify.since)) / 1000))}s`, 'warn'];
+    if (findRetryButton()) return ['Retry detected', 'warn'];
     if (S.error) return [S.error.id, S.error.kind === 'hard' ? 'error' : 'warn'];
     if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
     if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
@@ -2740,6 +2836,9 @@
       ['classifier can recognize network phrase', classifyError('We should handle network error conditions carefully')?.id || null, 'network'],
       ['normal prose tail guard', ASSISTANT_ERROR_TAIL_RE.test('We should handle network error conditions carefully.'), false],
       ['product error tail guard', ASSISTANT_ERROR_TAIL_RE.test('There was an error generating a response. Try again'), true],
+      ['retry label exact', RETRY_CONTROL_RE.test('Retry'), true],
+      ['try again label exact', RETRY_CONTROL_RE.test('Try again'), true],
+      ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
       ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
@@ -2802,6 +2901,7 @@
         verify: S.verify ? { ...S.verify } : null,
         recovery: S.recovery ? { ...S.recovery } : null,
         controlFault: S.controlFault,
+        retryVisible: !!findRetryButton(),
         pausedUntil: S.pausedUntil,
         pausedReason: S.pausedReason,
         blockedReason: S.blockedReason,
