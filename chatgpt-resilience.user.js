@@ -854,10 +854,13 @@
   }
 
   function generationDecision(next, wasGenerating, lastEvidenceAt, at = now()) {
-    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
-    if (strongBusy) return true;
+    // Explicit idle composer controls beat stale streaming attributes.
     if (next.kind === 'voice') return false;
     if (next.kind === 'send' && !next.hasDraft) return false;
+
+    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
+    if (strongBusy) return true;
+
     if (next.kind === 'send' && next.hasDraft && wasGenerating) {
       return at - Number(lastEvidenceAt || 0) <= CFG.draftBusyGraceMs;
     }
@@ -871,12 +874,14 @@
     if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = t;
     S.composerControl = next;
 
-    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
+    const decision = generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
+    const explicitIdle = next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft);
+    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence);
     if (strongBusy) S.lastGenerationEvidenceAt = t;
 
     // Typing can replace Stop with Send while the response is still running.
     // generationDecision gives that ambiguous state a bounded grace period.
-    return generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
+    return decision;
   }
 
   function unfinishedControlSignal(t, marker, control = S.composerControl) {
@@ -2508,6 +2513,7 @@
     S.queueEditingOriginalText = '';
     S.queueHoldReason = '';
     S.generating = false;
+    S.lastGenerationEvidenceAt = 0;
     S.error = null;
     S.verify = null;
     S.sendIntent = null;
@@ -2617,6 +2623,8 @@
     S.pendingRecoveryReason = '';
     S.composerMissingSince = 0;
     S.controlFault = '';
+    S.generating = false;
+    S.lastGenerationEvidenceAt = 0;
     clearTransientNetworkError();
     S.suppressTransportErrorsUntil = 0;
     S.lastAssistantSig = '';
@@ -3168,6 +3176,8 @@
       ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false, 9_900, 10_000), false],
       ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true, 9_900, 10_000), false],
       ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false, 0, 10_000), true],
+      ['voice beats stale busy evidence', generationDecision({ kind:'voice', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
+      ['empty Send beats stale busy evidence', generationDecision({ kind:'send', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
