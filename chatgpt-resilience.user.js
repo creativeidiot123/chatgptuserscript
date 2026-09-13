@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.5
+// @version      1.3.6
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.5
+   * ChatGPT Resilience 1.3.6
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.5';
+  const VERSION = '1.3.6';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -517,8 +517,6 @@
       hash: String(x.hash || fnv1a(norm(x.text))),
       createdAt: Number(x.createdAt || now()),
       editedAt: Number(x.editedAt || 0),
-      status: x.status === 'inflight' ? 'inflight' : 'pending',
-      sentAt: Number(x.sentAt || 0),
     }));
   }
 
@@ -1198,7 +1196,7 @@
     S.sendIntent = {
       route: S.route, prompt: p, hash: fnv1a(norm(p)), source, at: now(),
       subturn: !!options.subturn, resumeHib: !!options.resumeHib,
-      clearBlocked: !!options.clearBlocked, queueItemId: options.queueItemId || null,
+      clearBlocked: !!options.clearBlocked,
       baselineUserCount: msgs.users.length, baselineUserSig: signature(msgs.lastUserText),
       baselineAssistantCount: msgs.assistants.length, baselineAssistantSig: signature(msgs.lastAssistantText),
     };
@@ -1216,12 +1214,9 @@
   function promoteSendIntent(evidence = 'unknown') {
     const i = validSendIntent();
     if (!i) return null;
-    let qid = i.queueItemId || null;
-    if (i.resumeHib && S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase)) qid = qid || S.hib.queueItemId || null;
-
     let t = null;
     if (i.subturn && S.txn) t = beginSubturn(i.prompt, i.source);
-    else if (!S.txn) t = armNewTxn(i.prompt, i.source, qid);
+    else if (!S.txn) t = armNewTxn(i.prompt, i.source);
     else t = beginSubturn(i.prompt, i.source);
     if (!t) return null;
 
@@ -1237,7 +1232,7 @@
     saveTxn();
 
     if (i.resumeHib && S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase)) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
-    reconcileQueueOwnership('send-intent-promote');
+    reconcileQueueClaim('send-intent-promote');
     if (i.clearBlocked && S.blockedReason) clearBlock(`human-send:${evidence}`);
     S.sendIntent = null;
     log('send-intent-promote', { evidence, source: i.source, subturn: i.subturn });
@@ -1294,7 +1289,7 @@
     const p = promptText(msgs.lastUserText);
     if (!norm(p)) return null;
 
-    const t = newTxn(p, source, inflightQueueItem()?.id || null);
+    const t = newTxn(p, source);
     t.baselineUserCount = Math.max(0, msgs.users.length - 1);
     t.baselineUserSig = '';
     t.baselineAssistantCount = Math.max(0, msgs.assistants.length - 1);
@@ -1400,43 +1395,36 @@
     return terminalMarker(msgs.lastAssistantText, turn);
   }
 
-  function firstPendingQueueItem(queue = S.queue) {
-    return Array.isArray(queue) ? (queue.find(x => x?.status === 'pending') || null) : null;
+  function firstQueueItem(queue = S.queue) {
+    return Array.isArray(queue) && queue.length ? queue[0] : null;
   }
 
-  function queueOwnerId() {
-    return S.txn?.queueItemId || S.hib?.queueItemId || null;
-  }
+  // Queue items are future work only. queueItemId exists briefly so a crash
+  // between journaling the transaction and removing the queued item cannot
+  // duplicate work. Old hibernation pointers are consumed here for migration.
+  function reconcileQueueClaim(reason = 'reconcile') {
+    const ids = [...new Set([S.txn?.queueItemId, S.hib?.queueItemId].filter(Boolean))];
+    if (!ids.length) return false;
 
-  function markQueueItemInflight(id) {
-    const item = S.queue.find(x => x.id === id);
-    if (!item) return false;
-    let changed = false;
-    if (item.status !== 'inflight') { item.status = 'inflight'; changed = true; }
-    if (!item.sentAt) { item.sentAt = now(); changed = true; }
-    if (changed) saveQueue();
-    return true;
-  }
+    let removed = false;
+    for (const id of ids) {
+      const i = S.queue.findIndex(x => x.id === id);
+      if (i < 0) continue;
+      S.queue.splice(i, 1);
+      removed = true;
+      log('queue-claim', { id, reason });
+    }
+    if (removed) saveQueue();
 
-  function reconcileQueueOwnership(reason = 'reconcile') {
-    const qid = queueOwnerId();
-    if (!qid) return false;
-    const item = S.queue.find(x => x.id === qid);
-    if (!item || item.status === 'inflight') return false;
-    item.status = 'inflight';
-    item.sentAt ||= now();
-    saveQueue();
-    log('queue-owner-reconciled', { id: qid, reason });
-    return true;
-  }
-
-  function completeQueueItem(id, reason = 'done') {
-    if (!id) return;
-    const i = S.queue.findIndex(x => x.id === id);
-    if (i < 0) return;
-    S.queue.splice(i, 1);
-    saveQueue();
-    log('queue-complete', { id, reason, depth: S.queue.length });
+    if (S.txn?.queueItemId) {
+      S.txn.queueItemId = null;
+      saveTxn();
+    }
+    if (S.hib?.queueItemId) {
+      delete S.hib.queueItemId;
+      saveHibernation();
+    }
+    return removed;
   }
 
   function clearPause() {
@@ -1534,7 +1522,7 @@
       let queueClaim = null;
       if (options.claimQueueItem) {
         S.queue = loadQueue(dispatchRoute);
-        queueClaim = S.queue.find(x => x.id === options.queueItemId && x.status === 'pending') || null;
+        queueClaim = S.queue.find(x => x.id === options.queueItemId) || null;
         if (!queueClaim) return false;
         if (options.expectedQueueHash && queueClaim.hash !== options.expectedQueueHash) return false;
         if (norm(queueClaim.text) !== norm(p)) return false;
@@ -1547,13 +1535,9 @@
       if (!t) return false;
       if (options.queueItemId) { t.queueItemId = options.queueItemId; saveTxn(); }
 
-      // Journal first, queue ownership second. A crash can now leave at worst a
-      // journal owning a still-pending item, which reconcileQueueOwnership heals.
-      if (options.claimQueueItem && !markQueueItemInflight(options.queueItemId)) {
-        S.txn = null;
-        store.del(txnKey(dispatchRoute));
-        return false;
-      }
+      // Journal first, then consume the queued future message. queueItemId is a
+      // transient crash-recovery pointer and is cleared by reconciliation.
+      if (options.claimQueueItem) reconcileQueueClaim('dispatch-claim');
 
       if (S.route !== dispatchRoute) return false;
       t.sendObserved = false;
@@ -1563,7 +1547,7 @@
       action.run();
       t.sendAttempted = true;
       saveTxn();
-      log('dispatch', { source, method: action.kind, queueItem: !!t.queueItemId });
+      log('dispatch', { source, method: action.kind, queueItem: !!options.queueItemId });
       scheduleEvaluate('dispatch', 120);
       return true;
     } catch (e) {
@@ -1718,8 +1702,6 @@
       hash: fnv1a(norm(p)),
       createdAt: now(),
       editedAt: 0,
-      status: 'pending',
-      sentAt: 0,
     };
     S.queue.push(item);
     saveQueue();
@@ -1732,14 +1714,10 @@
     if (!verifyTabContext()) return false;
     const i = queueIndexById(id);
     if (i < 0) return false;
-    const [item] = S.queue.splice(i, 1);
+    S.queue.splice(i, 1);
     saveQueue();
-    if (item.status === 'inflight') {
-      if (S.txn?.queueItemId === id) { S.txn.queueItemId = null; saveTxn(); }
-      if (S.hib?.queueItemId === id) { S.hib.queueItemId = null; saveHibernation(); }
-    }
     if (S.queueEditingId === id) cancelQueueEdit('removed');
-    log('queue-remove', { id, reason, status: item.status });
+    log('queue-remove', { id, reason });
     renderQueueList();
     return true;
   }
@@ -1747,7 +1725,7 @@
   function clearPendingQueue() {
     if (!verifyTabContext()) return false;
     if (S.queueEditingId) cancelQueueEdit();
-    S.queue = S.queue.filter(x => x.status === 'inflight');
+    S.queue = [];
     saveQueue();
     S.queueHoldReason = '';
     renderQueueList();
@@ -1802,12 +1780,10 @@
   function moveQueueItem(id, targetIndex) {
     if (!verifyTabContext()) return false;
     const from = queueIndexById(id);
-    if (from < 0 || S.queue[from].status !== 'pending') return false;
+    if (from < 0) return false;
     const before = captureQueueRects();
     const [item] = S.queue.splice(from, 1);
-    const pendingStart = S.queue.findIndex(x => x.status === 'pending');
-    const min = pendingStart < 0 ? S.queue.length : pendingStart;
-    const to = Math.max(min, Math.min(S.queue.length, targetIndex > from ? targetIndex - 1 : targetIndex));
+    const to = Math.max(0, Math.min(S.queue.length, targetIndex > from ? targetIndex - 1 : targetIndex));
     S.queue.splice(to, 0, item);
     saveQueue();
     renderQueueList();
@@ -1817,7 +1793,7 @@
 
   function beginQueueEdit(id) {
     if (!verifyTabContext()) return false;
-    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    const item = S.queue.find(x => x.id === id);
     const input = getComposer();
     if (!item || !input || norm(composerText(input))) return false;
     S.queueEditingId = id;
@@ -1839,7 +1815,7 @@
   function commitQueueEdit() {
     if (!verifyTabContext()) return false;
     const id = S.queueEditingId;
-    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    const item = S.queue.find(x => x.id === id);
     const input = getComposer();
     if (!item || !input) return false;
     const p = promptText(composerText(input));
@@ -1863,55 +1839,36 @@
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
     if (!verifyTabContext(actionRoute)) return false;
 
-    // Tab context first, then trust durable state. Never steer/send from a stale tab.
-    const diskTxn = loadTxn(actionRoute);
-    const diskHib = loadHibernation(actionRoute);
-    S.txn = diskTxn;
-    S.hib = diskHib;
+    S.txn = loadTxn(actionRoute);
+    S.hib = loadHibernation(actionRoute);
     S.queue = loadQueue(actionRoute);
-    reconcileQueueOwnership('manual-action');
+    reconcileQueueClaim('manual-action');
 
     const freshError = currentError(getMessages(true));
     if (freshError) { S.error = freshError; return false; }
     if (S.route !== actionRoute || S.hib) return false;
-    const item = S.queue.find(x => x.id === id && x.status === 'pending');
+    const item = S.queue.find(x => x.id === id);
     if (!item) { renderQueueList(); return false; }
 
     cancelRecovery('queue-action');
     S.generating = isGenerating();
+    if (S.generating && !S.txn) return false;
 
-    if (S.txn || S.generating) {
-      // A Steer is a real subturn. Once the journal owns this exact steer, the
-      // future queue copy must disappear even if the native click later throws.
-      if (!S.txn) return false; // orphan generation: never inject unjournaled work
-      const ok = await dispatchPrompt(item.text, 'queue-steer', { newLogicalTask: false });
-      const journalOwnsSteer = S.txn?.source === 'queue-steer' && S.txn?.currentPromptHash === item.hash;
-      if (ok || journalOwnsSteer) {
-        S.queueHoldReason = '';
-        removeQueueItem(id, 'steered-into-active-task');
-        log('queue-steer', { id, journalOwned: journalOwnsSteer });
-      }
-      return ok || journalOwnsSteer;
-    }
-
-    // This is an explicit human Send. Unlike the automatic queue pump, it may
-    // intentionally move past an idle uncommitted tail.
-    // dispatchPrompt claims queue ownership only after its transaction journal
-    // exists, eliminating inflight-without-journal crash windows.
-    const ok = await dispatchPrompt(item.text, 'queue-send-now', {
-      newLogicalTask: true,
+    const source = S.generating ? 'queue-steer' : 'queue-send';
+    const ok = await dispatchPrompt(item.text, source, {
+      newLogicalTask: !S.txn,
       queueItemId: id,
       claimQueueItem: true,
       expectedQueueHash: item.hash,
     });
-    if (!ok && S.txn?.queueItemId !== id) {
-      S.queue = loadQueue(S.route);
-      const cur = S.queue.find(x => x.id === id);
-      if (cur?.status === 'inflight') { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
-      if (norm(composerText(input)) === norm(item.text)) clearComposer(input);
-    }
-    if (ok || S.txn?.queueItemId === id) S.queueHoldReason = '';
-    return ok || S.txn?.queueItemId === id;
+
+    const accepted = ok || (
+      !S.queue.some(x => x.id === id) &&
+      S.txn?.currentPromptHash === item.hash &&
+      S.txn?.source === source
+    );
+    if (accepted) S.queueHoldReason = '';
+    return accepted;
   }
 
   function tailCommittedForQueue() {
@@ -1969,7 +1926,7 @@
       S.txn = diskTxn;
       S.hib = diskHib;
       S.queue = loadQueue(pumpRoute);
-      reconcileQueueOwnership('queue-pump');
+      reconcileQueueClaim('queue-pump');
 
       if (S.route !== pumpRoute) return false;
       const freshError = currentError(getMessages(true));
@@ -1980,14 +1937,7 @@
         return false;
       }
 
-      const inflight = inflightQueueItem();
-      if (inflight) {
-        S.queueHoldReason = 'inflight-without-journal';
-        maybeNotify(`${APP}: queue held`, 'A queued item is marked in-flight but its transaction journal is missing. It will not be duplicated automatically.');
-        return false;
-      }
-
-      const freshItem = firstPendingQueueItem(S.queue);
+      const freshItem = firstQueueItem(S.queue);
       if (!freshItem) {
         S.queueHoldReason = '';
         renderQueueList();
@@ -2003,7 +1953,12 @@
         expectedQueueHash: freshItem.hash,
       });
 
-      if (!ok && S.txn?.queueItemId !== freshItem.id) {
+      const accepted = ok || (
+        !S.queue.some(x => x.id === freshItem.id) &&
+        S.txn?.currentPromptHash === freshItem.hash &&
+        S.txn?.source === 'queue'
+      );
+      if (!accepted) {
         S.queue = loadQueue(S.route);
         if (norm(composerText(input)) === norm(freshItem.text)) clearComposer(input);
         kickQueue('queue-dispatch-not-ready', CFG.queuePumpRetryMs);
@@ -2011,7 +1966,7 @@
       }
 
       S.queueHoldReason = '';
-      return ok || S.txn?.queueItemId === freshItem.id;
+      return true;
     } finally {
       S.queueProcessing = false;
       renderQueueList();
@@ -2030,14 +1985,13 @@
     paintUI(true);
   }
 
-  function armHibernation(queueItemId = null) {
+  function armHibernation() {
     const previous = S.hib;
     S.hib = {
       route: S.route,
       phase: 'sleeping',
       wakeAt: now() + CFG.githubHibernateMs,
       cycle: Number(previous?.cycle || 0) + 1,
-      queueItemId: queueItemId || previous?.queueItemId || null,
       armedAt: now(),
     };
     saveHibernation();
@@ -2045,13 +1999,12 @@
     paintUI(true);
   }
 
-  function setWaitUser(queueItemId = null) {
+  function setWaitUser() {
     S.hib = {
       route: S.route,
       phase: 'wait-user',
       wakeAt: 0,
       cycle: Number(S.hib?.cycle || 0),
-      queueItemId: queueItemId || S.hib?.queueItemId || null,
       armedAt: now(),
     };
     saveHibernation();
@@ -2086,11 +2039,10 @@
     if (diskTxn) { S.txn = diskTxn; scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
     if (diskHib) S.hib = diskHib;
     if (!S.hib || S.hib.phase !== 'sleeping') return false;
-    const qid = S.hib.queueItemId || null;
     S.hib.phase = 'waking';
     S.hib.wakeAt = 0;
     saveHibernation();
-    const ok = await dispatchPrompt(PROTOCOL.WAKE, 'github-wake', { newLogicalTask: true, queueItemId: qid });
+    const ok = await dispatchPrompt(PROTOCOL.WAKE, 'github-wake', { newLogicalTask: true });
     if (!ok && !S.txn) {
       S.hib.phase = 'sleeping';
       S.hib.wakeAt = now() + CFG.githubWakeBlockedRetryMs;
@@ -2148,39 +2100,22 @@
     return stopThenContinue(v.reason);
   }
 
-  function orphanMarkerQueueItemId(msgs) {
-    const item = inflightQueueItem();
-    if (!item || !msgs?.lastUserText) return null;
-    return fnv1a(norm(msgs.lastUserText)) === item.hash ? item.id : null;
-  }
-
-  function reconcileOrphanTerminalMarker(marker, msgs) {
+  function reconcileOrphanTerminalMarker(marker) {
     if (S.txn || !marker) return false;
-    const qid = orphanMarkerQueueItemId(msgs);
-
     if (marker === 'hibernate') {
       if (!S.hib) {
-        armHibernation(qid);
-        log('orphan-marker-reconcile', { marker, queueItem: !!qid });
+        armHibernation();
+        log('orphan-marker-reconcile', { marker });
       }
       return true;
     }
-
     if (marker === 'wait-user') {
       if (!S.hib || S.hib.phase !== 'wait-user') {
-        setWaitUser(qid);
-        log('orphan-marker-reconcile', { marker, queueItem: !!qid });
+        setWaitUser();
+        log('orphan-marker-reconcile', { marker });
       }
       return true;
     }
-
-    if (marker === 'done' && qid) {
-      completeQueueItem(qid, 'orphan-done-marker');
-      S.lastGenerationEndAt = now();
-      log('orphan-marker-reconcile', { marker, queueItem: true });
-      return true;
-    }
-
     return false;
   }
 
@@ -2194,7 +2129,7 @@
     S.queue = loadQueue(S.route);
     const diskHib = loadHibernation(S.route);
     if (diskHib) S.hib = diskHib;
-    const qid = S.txn.queueItemId || S.hib?.queueItemId || null;
+    reconcileQueueClaim('terminal-marker');
 
     // A terminal protocol marker commits the subturn. Stale verifier/error/
     // transport state from the just-finished generation must not veto the next
@@ -2208,17 +2143,16 @@
     S.suppressTransportErrorsUntil = 0;
 
     if (marker === 'hibernate') {
-      armHibernation(qid);
+      armHibernation();
       clearTxn('hibernate');
       return true;
     }
     if (marker === 'wait-user') {
-      setWaitUser(qid);
+      setWaitUser();
       clearTxn('wait-user');
       return true;
     }
     if (marker === 'done') {
-      if (qid) completeQueueItem(qid, 'done-marker');
       if (S.hib) clearHibernation('done-marker');
       S.lastGenerationEndAt = now();
       clearTxn('done-marker');
@@ -2392,7 +2326,7 @@
     // Rendered protocol is durable evidence too. If the journal disappeared
     // across reload/update, reconstruct sleep/wait ownership before any queue
     // item can advance.
-    if (!S.txn && marker && reconcileOrphanTerminalMarker(marker, msgs)) {
+    if (!S.txn && marker && reconcileOrphanTerminalMarker(marker)) {
       paintUI(true);
       scheduleWatchdog();
       return;
@@ -2603,7 +2537,7 @@
     installRootObserver();
     installComposerObserver();
     rebindAssistantObserver();
-    reconcileQueueOwnership('runtime-activate');
+    reconcileQueueClaim('runtime-activate');
     restoreDraftIfSafe();
     ensureQueueButton();
     renderQueueList();
@@ -2686,7 +2620,7 @@
     S.txn = loadTxn(next);
     S.queue = loadQueue(next);
     S.hib = loadHibernation(next);
-    reconcileQueueOwnership('route-change');
+    reconcileQueueClaim('route-change');
     S.verify = null;
     S.sendIntent = null;
     S.recovery = null;
@@ -2894,7 +2828,6 @@
         subturn: !!S.txn,
         resumeHib: !!S.hib,
         clearBlocked: !!S.blockedReason,
-        queueItemId: S.hib?.queueItemId || null,
       });
     }, true);
 
@@ -2912,8 +2845,7 @@
         const active = !!S.txn || S.generating;
         const hadHib = !!S.hib;
         const hadBlock = !!S.blockedReason;
-        const resumedQueueItemId = !active ? (S.hib?.queueItemId || null) : null;
-        dispatchPrompt(p, active ? 'ctrl-enter-steer' : 'ctrl-enter', { newLogicalTask: !active, queueItemId: resumedQueueItemId })
+        dispatchPrompt(p, active ? 'ctrl-enter-steer' : 'ctrl-enter', { newLogicalTask: !active })
           .then(ok => {
             if (!ok) return;
             if (hadHib && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
@@ -2937,7 +2869,6 @@
         subturn: !!S.txn,
         resumeHib: !!S.hib,
         clearBlocked: isBlockedReply,
-        queueItemId: S.hib?.queueItemId || null,
       });
     }, true);
 
@@ -2998,38 +2929,38 @@
     if (pause) pause.textContent = S.queuePaused ? 'Resume' : 'Pause';
     tray.hidden = !queueCount();
     if (!list || !queueCount()) { if (list) list.textContent = ''; return; }
-    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.status}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|action:${S.actionInFlight}|online:${navigator.onLine}`;
+    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|action:${S.actionInFlight}|online:${navigator.onLine}`;
     if (fp === DC.queueFingerprint && list.childNodes.length) return;
     DC.queueFingerprint = fp;
     list.textContent = '';
-    const nextPendingId = firstPendingQueueItem(S.queue)?.id || '';
+    const nextQueueId = firstQueueItem(S.queue)?.id || '';
     S.queue.forEach((item, index) => {
       const row = document.createElement('div');
-      row.className = `cgr-queue-item ${item.status === 'inflight' ? 'is-inflight' : ''} ${S.queueEditingId === item.id ? 'is-editing' : ''}`;
-      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = item.status === 'pending' && S.queueEditingId !== item.id;
+      row.className = `cgr-queue-item ${S.queueEditingId === item.id ? 'is-editing' : ''}`;
+      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = S.queueEditingId !== item.id;
 
       const grip = document.createElement('button');
       grip.type = 'button'; grip.className = 'cgr-queue-grip'; grip.title = 'Drag to reorder · Arrow keys move'; grip.innerHTML = '<span></span><span></span><span></span><span></span><span></span><span></span>';
-      grip.addEventListener('keydown', e => { if (item.status !== 'pending' || !['ArrowUp', 'ArrowDown'].includes(e.key)) return; e.preventDefault(); moveQueueItem(item.id, queueIndexById(item.id) + (e.key === 'ArrowUp' ? -1 : 2)); });
+      grip.addEventListener('keydown', e => { if (!['ArrowUp', 'ArrowDown'].includes(e.key)) return; e.preventDefault(); moveQueueItem(item.id, queueIndexById(item.id) + (e.key === 'ArrowUp' ? -1 : 2)); });
       row.appendChild(grip);
 
       const body = document.createElement('div'); body.className = 'cgr-queue-body';
-      const text = document.createElement('div'); text.className = 'cgr-queue-text'; text.textContent = item.text; text.title = item.text; if (item.status === 'pending') text.addEventListener('dblclick', () => beginQueueEdit(item.id));
-      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = item.status === 'inflight' ? 'Active logical task' : S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : item.id === nextPendingId ? 'Next follow-up' : `Follow-up ${index + 1}`;
+      const text = document.createElement('div'); text.className = 'cgr-queue-text'; text.textContent = item.text; text.title = item.text; text.addEventListener('dblclick', () => beginQueueEdit(item.id));
+      const meta = document.createElement('div'); meta.className = 'cgr-queue-meta'; meta.textContent = S.queueEditingId === item.id ? 'Editing in composer · Enter saves · Esc cancels' : item.id === nextQueueId ? 'Next follow-up' : `Follow-up ${index + 1}`;
       body.append(text, meta); row.appendChild(body);
 
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
-      if (item.status === 'pending' && S.queueEditingId !== item.id) {
+      if (S.queueEditingId !== item.id) {
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
         send.disabled = !!S.hib || isPaused() || !!S.blockedReason || !!S.error || S.actionInFlight || !navigator.onLine;
         send.addEventListener('click', () => steerOrSendQueuedItem(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
-      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.title = item.status === 'inflight' ? 'Forget queue ownership; current task continues' : 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
+      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
 
-      row.addEventListener('dragstart', e => { if (item.status !== 'pending') { e.preventDefault(); return; } DC.queueDragId = item.id; row.classList.add('is-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) {} });
+      row.addEventListener('dragstart', e => { DC.queueDragId = item.id; row.classList.add('is-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) {} });
       row.addEventListener('dragend', () => { DC.queueDragId = ''; row.classList.remove('is-dragging'); });
-      row.addEventListener('dragover', e => { if (!DC.queueDragId || DC.queueDragId === item.id || item.status !== 'pending') return; e.preventDefault(); });
+      row.addEventListener('dragover', e => { if (!DC.queueDragId || DC.queueDragId === item.id) return; e.preventDefault(); });
       row.addEventListener('drop', e => { if (!DC.queueDragId || DC.queueDragId === item.id) return; e.preventDefault(); const r = row.getBoundingClientRect(); moveQueueItem(DC.queueDragId, queueIndexById(item.id) + (e.clientY > r.top + r.height / 2 ? 1 : 0)); DC.queueDragId = ''; });
       list.appendChild(row);
     });
@@ -3130,7 +3061,7 @@
       #cgr-pill{display:flex;align-items:center;gap:7px;border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:999px;padding:7px 10px;background:color-mix(in srgb,Canvas 92%,transparent);color:CanvasText;box-shadow:0 5px 20px rgba(0,0,0,.16);backdrop-filter:blur(12px);cursor:pointer}
       #cgr-dot{width:8px;height:8px;border-radius:50%;background:#6b7280}#cgr-root[data-state="ok"] #cgr-dot{background:#22c55e}#cgr-root[data-state="active"] #cgr-dot{background:#3b82f6}#cgr-root[data-state="warn"] #cgr-dot{background:#f59e0b}#cgr-root[data-state="error"] #cgr-dot{background:#ef4444}
       #cgr-panel{position:absolute;right:0;bottom:42px;width:285px;padding:12px;border:1px solid color-mix(in srgb,CanvasText 16%,transparent);border-radius:14px;background:color-mix(in srgb,Canvas 96%,transparent);box-shadow:0 14px 50px rgba(0,0,0,.25);backdrop-filter:blur(16px)}#cgr-panel[hidden]{display:none}.cgr-head,.cgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px}.cgr-head{margin-bottom:10px}.cgr-head span{opacity:.55;font-size:10px}.cgr-row{padding:7px 0;border-top:1px solid color-mix(in srgb,CanvasText 9%,transparent)}.cgr-row button,.cgr-actions button{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:8px;background:color-mix(in srgb,CanvasText 7%,transparent);color:CanvasText;padding:5px 8px;cursor:pointer}.cgr-note{margin-top:8px;padding:8px;border-radius:8px;background:color-mix(in srgb,CanvasText 5%,transparent);opacity:.75;font-size:11px}.cgr-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:9px}
-      #cgr-queue-tray{width:100%;box-sizing:border-box;margin:0 0 8px;padding:6px;border:1px solid color-mix(in srgb,CanvasText 12%,transparent);border-radius:18px;background:color-mix(in srgb,Canvas 86%,transparent);box-shadow:0 6px 22px rgba(0,0,0,.08);backdrop-filter:blur(18px);animation:cgrTrayIn .16s cubic-bezier(.2,.8,.2,1)}#cgr-queue-tray[hidden]{display:none!important}.cgr-queue-tray-head{height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 5px 3px 8px}.cgr-queue-tray-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;opacity:.72}.cgr-queue-tray-title #cgr-queue-tray-count{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:color-mix(in srgb,CanvasText 9%,transparent);font-size:9px}.cgr-queue-tray-pause{border:0;background:transparent;color:CanvasText;opacity:.56;font-size:10px;padding:5px 7px;border-radius:7px;cursor:pointer}.cgr-queue-list{display:flex;flex-direction:column;gap:5px;max-height:min(30dvh,280px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:1px}.cgr-queue-item{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:48px;padding:7px 8px 7px 5px;border:1px solid color-mix(in srgb,CanvasText 9%,transparent);border-radius:13px;background:color-mix(in srgb,CanvasText 4.5%,Canvas);transition:background .13s ease,border-color .13s ease,transform .13s ease,opacity .13s ease;animation:cgrQueueCardIn .17s cubic-bezier(.2,.8,.2,1)}.cgr-queue-item.is-inflight{border-color:color-mix(in srgb,CanvasText 20%,transparent)}.cgr-queue-item.is-dragging{opacity:.45}.cgr-queue-grip{width:18px;height:28px;border:0;background:transparent;padding:6px 4px;display:grid;grid-template-columns:repeat(2,3px);gap:3px;align-content:center;justify-content:center;opacity:.28;cursor:grab;color:CanvasText}.cgr-queue-grip span{width:3px;height:3px;border-radius:50%;background:currentColor}.cgr-queue-body{min-width:0}.cgr-queue-text{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cgr-queue-meta{margin-top:2px;font-size:9.5px;opacity:.46}.cgr-queue-actions-inline{display:flex;align-items:center;gap:3px}.cgr-queue-action,.cgr-queue-icon-action{border:0;color:CanvasText;background:transparent;cursor:pointer}.cgr-queue-action{height:28px;padding:0 9px;border-radius:9px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;opacity:.48}.cgr-queue-icon-action:hover{opacity:.9;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action svg{width:15px;height:15px;fill:currentColor;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.cgr-queue-remove svg{fill:none}
+      #cgr-queue-tray{width:100%;box-sizing:border-box;margin:0 0 8px;padding:6px;border:1px solid color-mix(in srgb,CanvasText 12%,transparent);border-radius:18px;background:color-mix(in srgb,Canvas 86%,transparent);box-shadow:0 6px 22px rgba(0,0,0,.08);backdrop-filter:blur(18px);animation:cgrTrayIn .16s cubic-bezier(.2,.8,.2,1)}#cgr-queue-tray[hidden]{display:none!important}.cgr-queue-tray-head{height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 5px 3px 8px}.cgr-queue-tray-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;opacity:.72}.cgr-queue-tray-title #cgr-queue-tray-count{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:color-mix(in srgb,CanvasText 9%,transparent);font-size:9px}.cgr-queue-tray-pause{border:0;background:transparent;color:CanvasText;opacity:.56;font-size:10px;padding:5px 7px;border-radius:7px;cursor:pointer}.cgr-queue-list{display:flex;flex-direction:column;gap:5px;max-height:min(30dvh,280px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:1px}.cgr-queue-item{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:48px;padding:7px 8px 7px 5px;border:1px solid color-mix(in srgb,CanvasText 9%,transparent);border-radius:13px;background:color-mix(in srgb,CanvasText 4.5%,Canvas);transition:background .13s ease,border-color .13s ease,transform .13s ease,opacity .13s ease;animation:cgrQueueCardIn .17s cubic-bezier(.2,.8,.2,1)}.cgr-queue-item.is-dragging{opacity:.45}.cgr-queue-grip{width:18px;height:28px;border:0;background:transparent;padding:6px 4px;display:grid;grid-template-columns:repeat(2,3px);gap:3px;align-content:center;justify-content:center;opacity:.28;cursor:grab;color:CanvasText}.cgr-queue-grip span{width:3px;height:3px;border-radius:50%;background:currentColor}.cgr-queue-body{min-width:0}.cgr-queue-text{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cgr-queue-meta{margin-top:2px;font-size:9.5px;opacity:.46}.cgr-queue-actions-inline{display:flex;align-items:center;gap:3px}.cgr-queue-action,.cgr-queue-icon-action{border:0;color:CanvasText;background:transparent;cursor:pointer}.cgr-queue-action{height:28px;padding:0 9px;border-radius:9px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;opacity:.48}.cgr-queue-icon-action:hover{opacity:.9;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action svg{width:15px;height:15px;fill:currentColor;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.cgr-queue-remove svg{fill:none}
       #cgr-queue-button{margin-inline:3px;border:0;border-radius:999px;background:transparent;color:CanvasText;min-height:32px;padding:0 8px;display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:560;cursor:pointer;white-space:nowrap;opacity:.62}#cgr-queue-button:hover:not(:disabled){background:color-mix(in srgb,CanvasText 8%,transparent);opacity:.92}#cgr-queue-button:disabled{opacity:.28}#cgr-queue-button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.5}#cgr-queue-button b{min-width:16px;height:16px;padding:0 4px;border-radius:999px;display:inline-grid;place-items:center;background:color-mix(in srgb,CanvasText 10%,transparent);font-size:9px}
       @keyframes cgrTrayIn{from{opacity:0;transform:translateY(5px) scale(.995)}to{opacity:1;transform:none}}@keyframes cgrQueueCardIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(prefers-reduced-motion:reduce){#cgr-queue-tray,.cgr-queue-item{animation:none!important}.cgr-queue-item{transition:none!important}}
     `);
@@ -3226,9 +3157,8 @@
       ['retry label exact', RETRY_CONTROL_RE.test('Retry'), true],
       ['try again label exact', RETRY_CONTROL_RE.test('Try again'), true],
       ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
-      ['queue head is first pending', firstPendingQueueItem([{id:'a',status:'inflight'},{id:'b',status:'pending'},{id:'c',status:'pending'}])?.id, 'b'],
-      ['queue head ignores later pending', firstPendingQueueItem([{id:'a',status:'pending'},{id:'b',status:'pending'}])?.id, 'a'],
-      ['queue owner prefers txn', (() => { const oldT=S.txn, oldH=S.hib; S.txn={queueItemId:'txn-q'}; S.hib={queueItemId:'hib-q'}; const got=queueOwnerId(); S.txn=oldT; S.hib=oldH; return got; })(), 'txn-q'],
+      ['queue head is first future message', firstQueueItem([{id:'a'},{id:'b'}])?.id, 'a'],
+      ['empty queue has no head', firstQueueItem([]), null],
       ['Enter sends while idle', queueEnterDecision({ generating:false }), false],
       ['Enter ignores existing queue while idle', queueEnterDecision({ generating:false, queueLength:1 }), false],
       ['Enter queues while generation active', queueEnterDecision({ generating:true }), true],
