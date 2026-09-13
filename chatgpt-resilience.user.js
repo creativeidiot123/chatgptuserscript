@@ -1795,6 +1795,10 @@
     await sleep(120);
     if (!verifyTabContext() || !S.queue.some(x => x.id === item.id)) return false;
 
+    // Preserve FIFO. A just-typed message may auto-send only if it is the
+    // current queue head; otherwise older follow-ups keep their place.
+    if (firstQueueItem(S.queue)?.id !== item.id) return false;
+
     for (let i = 0; i < 4; i++) {
       const control = getComposerControlState();
       const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
