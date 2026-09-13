@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.13
+// @version      1.3.14
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.13
+   * ChatGPT Resilience 1.3.14
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.13';
+  const VERSION = '1.3.14';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1626,9 +1626,20 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
     if (latestMarker(getMessages())) return false;
 
-    if (!getComposer()) {
+    const recoveryInput = getComposer();
+    if (!recoveryInput) {
       S.pendingRecoveryReason = reason;
       S.controlFault = 'composer-missing';
+      paintUI(true);
+      return false;
+    }
+
+    // Human draft owns the composer. Never start Stop -> wait -> continue while
+    // the user is typing or an attachment is staged. Queue/send/cancel the draft
+    // first; the input hook will re-evaluate recovery once the composer is empty.
+    if (norm(composerText(recoveryInput)) || hasComposerAttachments(recoveryInput)) {
+      S.pendingRecoveryReason = reason;
+      log('recovery-deferred-human-draft', { reason });
       paintUI(true);
       return false;
     }
@@ -2859,7 +2870,7 @@
         else {
           if (!validSendIntent()) clearDraft(S.route);
           kickQueue('composer-cleared', 80);
-          if (S.txn || S.controlFault) scheduleEvaluate('composer-cleared-recovery', 50);
+          if (S.txn || S.controlFault || S.pendingRecoveryReason) scheduleEvaluate('composer-cleared-recovery', 50);
         }
         ensureQueueButton();
         renderQueueList();
@@ -3087,6 +3098,7 @@
     if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
     if (S.txn?.holdReason) return [`Waiting · ${S.txn.holdReason}`, 'warn'];
     if (S.controlFault === 'composer-missing') return ['Waiting for composer', 'warn'];
+    if (S.pendingRecoveryReason && norm(composerText(getComposer()))) return ['Recovery pending · draft', 'warn'];
     if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
