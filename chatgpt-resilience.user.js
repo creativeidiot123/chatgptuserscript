@@ -882,7 +882,7 @@
     const decision = strongBusy ? true : generationDecision(next, S.generating);
 
     // Typing can replace Stop with Send while the response is still running.
-    // generationDecision gives that ambiguous state a bounded grace period.
+    // Keep that active state until the draft is cleared and real controls return.
     return decision;
   }
 
@@ -1787,13 +1787,6 @@
     return true;
   }
 
-  function queueHumanSendFromComposer() {
-    // Busy-state human sends are intercepted into the queue and stay there.
-    // We deliberately do not auto-send after clearing the draft: React can
-    // transiently expose an idle control while the live answer is remounting.
-    return queueCurrentComposer();
-  }
-
   function captureQueueRects() {
     const m = new Map();
     document.querySelectorAll?.('#cgr-queue-list [data-queue-id]').forEach(el => m.set(el.dataset.queueId, el.getBoundingClientRect()));
@@ -1904,7 +1897,7 @@
     if (!item) { renderQueueList(); return false; }
 
     cancelRecovery('queue-action');
-    S.generating = shouldQueueHumanSend();
+    S.generating = humanSendMustQueue();
     if (S.generating && !S.txn) return false;
 
     const hadBlock = !!S.blockedReason;
@@ -2833,13 +2826,9 @@
     return false;
   }
 
-  function queueEnterDecision({ generating = false } = {}) {
-    return !!generating;
-  }
-
-  function shouldQueueHumanSend() {
-    // Never let an input event demote a state the evaluator already classified
-    // as generating. That exact split-brain bug can interrupt the live answer.
+  function humanSendMustQueue() {
+    // The evaluator owns clearing S.generating. Human input may respect it or
+    // promote it from fresh busy evidence, but it never demotes it.
     if (S.generating) return true;
 
     // Input handlers may only promote idle -> generating from fresh independent
@@ -2863,18 +2852,13 @@
   }
 
   function interceptBusyHumanSend(input = getComposer()) {
-    if (!shouldQueueHumanSend()) return false;
+    if (!humanSendMustQueue()) return false;
     if (hasComposerAttachments(input)) {
       maybeNotify(`${APP}: wait for current response`, 'This message has attachments, so it cannot be queued safely. It was not sent.');
       return true;
     }
-    queueHumanSendFromComposer();
+    queueCurrentComposer();
     return true;
-  }
-
-  function shouldQueueEnter() {
-    // Normal Enter uses the exact same fail-safe decision as native Send.
-    return queueEnterDecision({ generating: shouldQueueHumanSend() });
   }
 
   function installInputHooks() {
@@ -2924,16 +2908,21 @@
       if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
       const input = getComposer();
       const p = promptText(composerText(input));
-      if (!norm(p)) return;
+      const hasAttachments = hasComposerAttachments(input);
+      if (!norm(p) && !hasAttachments) return;
 
-      // Native Send and Enter obey the same queue rule. Attachments stay native
-      // because this queue intentionally stores reconstructable text only.
+      // Native Send and Enter obey the same queue rule. A busy message with
+      // attachments is blocked rather than sent because attachments cannot be
+      // reconstructed safely in the queue.
       if (e.isTrusted && interceptBusyHumanSend(input)) {
         e.preventDefault();
         e.stopImmediatePropagation();
         return;
       }
 
+      // Attachment-only idle sends stay native; there is no reconstructable
+      // text to journal as a transaction prompt.
+      if (!norm(p)) return;
       if (e.isTrusted) cancelRecovery('human-send');
       setSendIntent(p, 'human-click', {
         subturn: !!S.txn,
@@ -2969,10 +2958,9 @@
       if (hasComposerPopup(e.target)) return;
       const isHumanWaitReply = S.hib?.phase === 'wait-user' && !S.txn && !S.generating;
       const isBlockedReply = !!S.blockedReason && !S.generating;
-      if (!isHumanWaitReply && !isBlockedReply && shouldQueueEnter()) {
+      if (!isHumanWaitReply && !isBlockedReply && interceptBusyHumanSend(e.target)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        interceptBusyHumanSend(e.target);
         return;
       }
       // Idle Enter remains native, but only records an ephemeral intent. If a
@@ -2992,7 +2980,8 @@
       const input = getComposer();
       if (!input || !e.target?.contains?.(input)) return;
       const p = promptText(composerText(input));
-      if (!norm(p)) return;
+      const hasAttachments = hasComposerAttachments(input);
+      if (!norm(p) && !hasAttachments) return;
 
       // Form submit is a third native send path. Guard it with the same rule so
       // keyboard, button, and submit events cannot disagree about generation.
@@ -3002,6 +2991,7 @@
         return;
       }
 
+      if (!norm(p)) return;
       if (!validSendIntent()) {
         setSendIntent(p, (S.generating || S.txn) ? 'native-submit-followup' : 'native-submit', {
           subturn: !!S.txn, resumeHib: !!S.hib, clearBlocked: !!S.blockedReason,
@@ -3072,7 +3062,8 @@
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (S.queueEditingId !== item.id) {
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
-        send.disabled = S.hib?.phase === 'waking' || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
+        send.disabled = S.hib?.phase === 'waking' || isPaused() || !!S.error || S.actionInFlight ||
+          (S.generating && !S.txn) || !navigator.onLine;
         send.addEventListener('click', () => dispatchQueuedItemNow(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.disabled = S.actionInFlight; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
@@ -3121,7 +3112,7 @@
     if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
     if (S.txn?.holdReason) return [`Waiting · ${S.txn.holdReason}`, 'warn'];
     if (S.controlFault === 'composer-missing') return ['Waiting for composer', 'warn'];
-    if (S.pendingRecoveryReason && norm(composerText(getComposer()))) return ['Recovery pending · draft', 'warn'];
+    if (S.pendingRecoveryReason && (norm(composerText(getComposer())) || hasComposerAttachments(getComposer()))) return ['Recovery pending · draft', 'warn'];
     if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
@@ -3275,12 +3266,6 @@
       ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
       ['queue head is first future message', firstQueueItem([{id:'a'},{id:'b'}])?.id, 'a'],
       ['empty queue has no head', firstQueueItem([]), null],
-      ['Enter sends while idle', queueEnterDecision({ generating:false }), false],
-      ['Enter ignores existing queue while idle', queueEnterDecision({ generating:false, queueLength:1 }), false],
-      ['Enter queues while generation active', queueEnterDecision({ generating:true }), true],
-      ['input guard never demotes cached generation', queueEnterDecision({ generating:true }), true],
-      ['Enter ignores unfinished idle tail', queueEnterDecision({ generating:false, tailDone:false }), false],
-      ['Enter ignores idle transaction journal', queueEnterDecision({ generating:false, txn:true }), false],
       ['draft Send preserves active generation until draft clears', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true), true],
       ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false), false],
       ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true), false],
