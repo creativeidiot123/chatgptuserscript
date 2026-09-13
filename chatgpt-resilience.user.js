@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.2.3
+// @version      1.2.4
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.2.3
+   * ChatGPT Resilience 1.2.4
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.2.3';
+  const VERSION = '1.2.4';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1621,6 +1621,7 @@
 
   async function dispatchPrompt(prompt, source, options = {}) {
     if (!S.enabled || S.actionInFlight || isPaused()) return false;
+    const dispatchRoute = S.route;
     const input = getComposer();
     const p = promptText(prompt);
     if (!input || !norm(p) || hasComposerAttachments(input)) return false;
@@ -1632,11 +1633,12 @@
     S.actionInFlight = true;
     try {
       const action = await waitForSendAction(input, p);
-      if (!action) return false;
+      if (!action || S.route !== dispatchRoute) return false;
       if (!(await verifyLease())) return false;
+      if (S.route !== dispatchRoute) return false;
       if (!input.isConnected || norm(composerText(input)) !== norm(p)) return false;
 
-      const diskTxn = loadTxn(S.route);
+      const diskTxn = loadTxn(dispatchRoute);
       if (options.newLogicalTask) {
         if (diskTxn) { S.txn = diskTxn; return false; }
       } else if (S.txn) {
@@ -1649,7 +1651,7 @@
 
       let queueClaim = null;
       if (options.claimQueueItem) {
-        S.queue = loadQueue(S.route);
+        S.queue = loadQueue(dispatchRoute);
         queueClaim = S.queue.find(x => x.id === options.queueItemId && x.status === 'pending') || null;
         if (!queueClaim) return false;
         if (options.expectedQueueHash && queueClaim.hash !== options.expectedQueueHash) return false;
@@ -1667,13 +1669,15 @@
       // journal owning a still-pending item, which reconcileQueueOwnership heals.
       if (options.claimQueueItem && !markQueueItemInflight(options.queueItemId)) {
         S.txn = null;
-        store.del(txnKey(S.route));
+        store.del(txnKey(dispatchRoute));
         return false;
       }
 
+      if (S.route !== dispatchRoute) return false;
       t.sendObserved = false;
       t.dispatchAt = now();
       saveTxn();
+      if (S.route !== dispatchRoute) return false;
       action.run();
       t.sendAttempted = true;
       saveTxn();
@@ -1959,20 +1963,23 @@
 
   async function steerOrSendQueuedItem(id) {
     cancelRecovery('queue-action');
+    const actionRoute = S.route;
     if (S.actionInFlight || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
-    if (!(await verifyLease())) return false;
+    if (!(await verifyLease()) || S.route !== actionRoute) return false;
 
     // Lease first, then trust durable state. Never steer/send from a stale tab.
-    const diskTxn = loadTxn(S.route);
-    const diskHib = loadHibernation(S.route);
+    const diskTxn = loadTxn(actionRoute);
+    const diskHib = loadHibernation(actionRoute);
     S.txn = diskTxn;
     S.hib = diskHib;
-    S.queue = loadQueue(S.route);
+    S.queue = loadQueue(actionRoute);
     reconcileQueueOwnership('manual-action');
 
-    if (S.hib) return false;
+    const freshError = currentError(getMessages(true));
+    if (freshError) { S.error = freshError; return false; }
+    if (S.route !== actionRoute || S.hib) return false;
     const item = S.queue.find(x => x.id === id && x.status === 'pending');
     if (!item) { renderQueueList(); return false; }
 
@@ -1985,6 +1992,7 @@
       const ok = await dispatchPrompt(item.text, 'queue-steer', { newLogicalTask: false });
       const journalOwnsSteer = S.txn?.source === 'queue-steer' && S.txn?.currentPromptHash === item.hash;
       if (ok || journalOwnsSteer) {
+        S.queueHoldReason = '';
         removeQueueItem(id, 'steered-into-active-task');
         log('queue-steer', { id, journalOwned: journalOwnsSteer });
       }
@@ -2011,6 +2019,7 @@
       if (cur?.status === 'inflight') { cur.status = 'pending'; cur.sentAt = 0; saveQueue(); }
       if (norm(composerText(input)) === norm(item.text)) clearComposer(input);
     }
+    if (ok || S.txn?.queueItemId === id) S.queueHoldReason = '';
     return ok || S.txn?.queueItemId === id;
   }
 
@@ -2039,6 +2048,7 @@
 
   async function processQueue() {
     if (S.queueProcessing || !S.enabled || !S.queue.length) return false;
+    const pumpRoute = S.route;
     if (queueBlocked()) {
       S.queueHoldReason = S.queuePaused ? 'paused' : S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
       return false;
@@ -2057,18 +2067,22 @@
 
     S.queueProcessing = true;
     try {
-      if (!(await verifyLease())) {
-        kickQueue('other-tab-lease', CFG.queueBlockedRetryMs);
+      if (!(await verifyLease()) || S.route !== pumpRoute) {
+        if (S.route === pumpRoute) kickQueue('other-tab-lease', CFG.queueBlockedRetryMs);
         return false;
       }
 
       // Durable state after the lease is the only source of dispatch truth.
-      const diskTxn = loadTxn(S.route);
-      const diskHib = loadHibernation(S.route);
+      const diskTxn = loadTxn(pumpRoute);
+      const diskHib = loadHibernation(pumpRoute);
       S.txn = diskTxn;
       S.hib = diskHib;
-      S.queue = loadQueue(S.route);
+      S.queue = loadQueue(pumpRoute);
       reconcileQueueOwnership('queue-pump');
+
+      if (S.route !== pumpRoute) return false;
+      const freshError = currentError(getMessages(true));
+      if (freshError) { S.error = freshError; S.queueHoldReason = `error:${freshError.id}`; return false; }
 
       if (S.txn || S.hib) {
         S.queueHoldReason = S.txn ? 'active-task-other-tab' : S.hib.phase;
@@ -2174,9 +2188,10 @@
     if (!navigator.onLine || isPaused() || S.blockedReason || S.actionInFlight || S.txn || S.generating || S.error) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
-    if (!(await verifyLease())) { scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
-    const diskTxn = loadTxn(S.route);
-    const diskHib = loadHibernation(S.route);
+    const wakeRoute = S.route;
+    if (!(await verifyLease()) || S.route !== wakeRoute) { if (S.route === wakeRoute) scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
+    const diskTxn = loadTxn(wakeRoute);
+    const diskHib = loadHibernation(wakeRoute);
     if (diskTxn) { S.txn = diskTxn; scheduleWakeTimer(CFG.githubWakeBlockedRetryMs); return false; }
     if (diskHib) S.hib = diskHib;
     if (!S.hib || S.hib.phase !== 'sleeping') return false;
@@ -2642,6 +2657,19 @@
     if (next === old) return false;
 
     flushDraftSave();
+
+    // Invalidate queue work that belonged to the previous chat. In-flight async
+    // functions are route-bound and will fail closed when they resume.
+    if (DC.queuePumpTimer) clearTimeout(DC.queuePumpTimer);
+    DC.queuePumpTimer = null;
+    DC.queuePumpDueAt = 0;
+    S.queueProcessing = false;
+    S.queueEditingId = '';
+    S.queueEditingOriginalText = '';
+    S.queueHoldReason = '';
+    DC.queueDragId = '';
+    DC.queueFingerprint = '';
+
     migrateScope(old, next, oldHref, nextHref);
     S.route = next;
     // Auth / anti-abuse are account-level. Other blockers belong to the old
@@ -3181,6 +3209,7 @@
       ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
       ['queue head is first pending', firstPendingQueueItem([{id:'a',status:'inflight'},{id:'b',status:'pending'},{id:'c',status:'pending'}])?.id, 'b'],
       ['queue head ignores later pending', firstPendingQueueItem([{id:'a',status:'pending'},{id:'b',status:'pending'}])?.id, 'a'],
+      ['queue owner prefers txn', (() => { const oldT=S.txn, oldH=S.hib; S.txn={queueItemId:'txn-q'}; S.hib={queueItemId:'hib-q'}; const got=queueOwnerId(); S.txn=oldT; S.hib=oldH; return got; })(), 'txn-q'],
       ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
