@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.11
+// @version      1.3.12
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.11
+   * ChatGPT Resilience 1.3.12
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.11';
+  const VERSION = '1.3.12';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1604,10 +1604,17 @@
     return true;
   }
 
+  function postStopControlSettled(control = getComposerControlState()) {
+    const c = control || {};
+    if (c.kind === 'send' || c.kind === 'voice') return true;
+    if (c.kind === 'idle' && !c.busyEvidence) return true;
+    return false;
+  }
+
   async function waitForGenerationStop() {
     const deadline = now() + CFG.stopSettleTimeoutMs;
     while (now() < deadline) {
-      if (!isGenerating()) return true;
+      if (postStopControlSettled()) return true;
       await sleep(250);
     }
     return false;
@@ -1652,16 +1659,19 @@
           log('auto-stop', { reason });
         } finally { S.actionInFlight = false; }
 
-        await waitForGenerationStop();
+        const stopped = await waitForGenerationStop();
+        if (!stopped) return false;
+        // The long-thinking banner may remain mounted after Stop. Do not feed
+        // that stale banner back into normal generation detection here.
+        S.generating = false;
+        S.lastGenerationEvidenceAt = 0;
+        S.lastGenerationEndAt = now();
       } else if (isGenerating()) {
         // A genuinely busy turn without an accessible Stop control is ambiguous,
         // commonly because a human draft is exposing Send. Never destroy the draft.
         scheduleEvaluate(`await-stop:${reason}`, 1_000);
         return false;
       }
-
-      S.generating = isGenerating();
-      if (S.generating) return false;
 
       if (S.recovery !== recovery) return false;
       recovery.phase = 'grace';
@@ -1680,12 +1690,15 @@
       }
       const after = getMessages(true);
       if (latestMarker(after)) return false;
-      if (isGenerating()) return false;
       if (signature(after.lastAssistantText) !== beforeSig) {
         S.lastAssistantProgressAt = now();
         scheduleEvaluate(`recovery-progress:${reason}`, 500);
         return false;
       }
+      // After our own Stop, only live composer/streaming controls can prove the
+      // generation restarted. A lingering long-thinking banner cannot.
+      if (!postStopControlSettled()) return false;
+      S.generating = false;
       return sendLiteralContinue(reason);
     } finally {
       if (S.recovery === recovery) S.recovery = null;
@@ -2328,6 +2341,14 @@
     if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
     if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
 
+    // The exact long-thinking product banner is strong current-turn evidence.
+    // If recovery lost its journal, adopt the visible user/assistant tail now
+    // instead of waiting for the generic five-minute orphan fallback.
+    if (longThinking && !marker && !S.hib && !S.txn && msgs.lastUserText &&
+        assistantIsCurrentTail(msgs) && !['auth', 'anti-abuse', 'policy'].includes(err?.id || '')) {
+      adoptUntrackedTurn(msgs, 'long-thinking-adopt');
+    }
+
     // Rendered protocol is durable evidence too. If the journal disappeared
     // across reload/update, reconstruct sleep/wait ownership before any queue
     // item can advance.
@@ -2351,6 +2372,26 @@
 
     if (S.txn) {
       const t = S.txn;
+
+      if (longThinking && !t.userTurnConfirmed && msgs.lastUserText && assistantIsCurrentTail(msgs)) {
+        confirmTxn(msgs);
+        if (!t.userTurnConfirmed && (t.sendAttempted || t.sendObserved || S.generating)) {
+          const visiblePrompt = promptText(msgs.lastUserText);
+          if (norm(visiblePrompt)) {
+            t.currentPrompt = visiblePrompt;
+            t.currentPromptHash = fnv1a(norm(visiblePrompt));
+            t.userTurnConfirmed = true;
+            t.confirmedAt = now();
+            t.sendAttempted = true;
+            t.sendObserved = true;
+            t.assistantObserved = !!msgs.lastAssistant;
+            t.generationObserved = true;
+            clearDraft(S.route);
+            saveTxn();
+            log('txn-long-thinking-reconcile', { source: t.source });
+          }
+        }
+      }
 
       // The protocol marker is authoritative. Once its rendered tail is stable
       // for the short settle window, stale Stop/busy UI cannot veto completion.
@@ -3182,6 +3223,10 @@
       ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false, 0, 10_000), true],
       ['voice beats stale busy evidence', generationDecision({ kind:'voice', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
       ['empty Send beats stale busy evidence', generationDecision({ kind:'send', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
+      ['post-stop Send is settled even with stale busy attr', postStopControlSettled({ kind:'send', hasDraft:true, busyEvidence:true }), true],
+      ['post-stop Voice is settled even with stale busy attr', postStopControlSettled({ kind:'voice', hasDraft:false, busyEvidence:true }), true],
+      ['post-stop Stop is not settled', postStopControlSettled({ kind:'stop', hasDraft:false, busyEvidence:false }), false],
+      ['post-stop spinner is not settled', postStopControlSettled({ kind:'spinner', hasDraft:false, busyEvidence:false }), false],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
