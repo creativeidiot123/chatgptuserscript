@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.2.1
+// @version      1.2.2
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.2.1
+   * ChatGPT Resilience 1.2.2
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.2.1';
+  const VERSION = '1.2.2';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -328,7 +328,7 @@
 
   const MAX_LENGTH_UI_RE = /(?:you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
 
-  function terminalMarker(text, root = null) {
+  function markerFromProtocolText(text) {
     const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
     if (!clean) return null;
     const tokens = [
@@ -336,28 +336,33 @@
       [PROTOCOL.HIBERNATE, 'hibernate'],
       [PROTOCOL.WAIT_USER, 'wait-user'],
     ];
-
-    if (!root) {
-      // Diagnostics/tests have no rendered DOM. Accept the exact final line, or
-      // a terminal marker followed only by ChatGPT's known maximum-length UI.
-      for (const [token, marker] of tokens) {
-        const i = clean.lastIndexOf(token);
-        if (i < 0) continue;
-        const before = clean.slice(0, i);
-        const suffix = clean.slice(i + token.length).trim();
-        if (suffix === '' || MAX_LENGTH_UI_RE.test(suffix)) {
-          const prev = before.slice(-1);
-          if (!prev || /\s/.test(prev)) return marker;
-        }
-      }
-      return null;
+    for (const [token, marker] of tokens) {
+      const i = clean.lastIndexOf(token);
+      if (i < 0) continue;
+      const suffix = clean.slice(i + token.length).trim();
+      // ChatGPT may append the maximum-length UI after the assistant response.
+      // The protocol token itself is intentionally unique, so flattened DOM text
+      // such as "...finished.[[CGR_DONE]]" is still authoritative.
+      if (!suffix || MAX_LENGTH_UI_RE.test(suffix)) return marker;
     }
+    return null;
+  }
 
-    // Rendered ChatGPT can append a maximum-length card after the assistant's
-    // actual final paragraph. Search for an exact visible marker node near the
-    // tail instead of requiring the entire flattened response text to end there.
+  function terminalMarker(text, root = null) {
+    const rawMarker = markerFromProtocolText(text);
+    if (!root) return rawMarker;
+
+    const tokens = [
+      [PROTOCOL.DONE, 'done'],
+      [PROTOCOL.HIBERNATE, 'hibernate'],
+      [PROTOCOL.WAIT_USER, 'wait-user'],
+    ];
+
+    // Prefer rendered evidence. Search exact element text first, then exact text
+    // nodes because React/Markdown can wrap the marker in a parent whose
+    // textContent also includes adjacent content.
     try {
-      const nodes = Array.from(root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6')).slice(-120).reverse();
+      const nodes = Array.from(root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6')).slice(-160).reverse();
       for (const [token, marker] of tokens) {
         const exact = nodes.find(el => {
           if (!visible(el)) return false;
@@ -365,21 +370,30 @@
           const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
           return value === token;
         });
-        if (!exact) continue;
+        if (exact && rawMarker === marker) return marker;
+      }
 
-        // If flattened text contains content after the token, allow only the
-        // known max-length banner. Any real assistant prose after the marker
-        // still invalidates it.
-        const i = clean.lastIndexOf(token);
-        if (i >= 0) {
-          const suffix = clean.slice(i + token.length).trim();
-          if (suffix && !MAX_LENGTH_UI_RE.test(suffix)) continue;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const tailTextNodes = [];
+      let node;
+      while ((node = walker.nextNode())) {
+        tailTextNodes.push(node);
+        if (tailTextNodes.length > 240) tailTextNodes.shift();
+      }
+      for (let i = tailTextNodes.length - 1; i >= 0; i--) {
+        const tn = tailTextNodes[i];
+        const parent = tn.parentElement;
+        if (!parent || !visible(parent) || parent.closest?.('pre,code,blockquote')) continue;
+        const value = String(tn.nodeValue || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+        for (const [token, marker] of tokens) {
+          if (value === token && rawMarker === marker) return marker;
         }
-        return marker;
       }
     } catch (_) {}
 
-    return null;
+    // Final fallback for flattened/virtualized ChatGPT DOM. In this dedicated
+    // project browser the exact protocol token is the completion contract.
+    return rawMarker;
   }
 
   function classifyError(text) {
@@ -1495,7 +1509,12 @@
   }
 
   function latestMarker(msgs = getMessages()) {
-    return terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+    if (!msgs.lastAssistant) return null;
+    const direct = terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+    if (direct) return direct;
+    const turn = msgs.lastAssistant.closest?.('[data-testid^="conversation-turn"],article');
+    if (!turn) return null;
+    return terminalMarker(msgs.lastAssistantText, turn);
   }
 
   function markQueueItemInflight(id) {
@@ -1936,7 +1955,7 @@
     const msgs = getMessages();
     if (!msgs.lastUser && !msgs.lastAssistant) return true;
     if (!assistantIsCurrentTail(msgs)) return false;
-    return !!terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+    return !!latestMarker(msgs);
   }
 
   function queueBlocked() {
@@ -2093,11 +2112,9 @@
   }
 
   // ---------- completion and recovery FSM --------------------------------------------
-  function assistantChangedForTxn(msgs, t = S.txn) {
-    return !!t && (
-      msgs.assistants.length > Number(t.baselineAssistantCount || 0) ||
-      signature(msgs.lastAssistantText) !== t.baselineAssistantSig
-    );
+  function markerBelongsToTxn(msgs, t = S.txn) {
+    if (!t || !t.userTurnConfirmed || !assistantIsCurrentTail(msgs) || !msgs.lastUserText) return false;
+    return fnv1a(norm(msgs.lastUserText)) === t.currentPromptHash;
   }
 
   function resetVerification(reason = 'activity') {
@@ -2152,6 +2169,18 @@
     const diskHib = loadHibernation(S.route);
     if (diskHib) S.hib = diskHib;
     const qid = S.txn.queueItemId || S.hib?.queueItemId || null;
+
+    // A terminal protocol marker commits the subturn. Stale verifier/error/
+    // transport state from the just-finished generation must not veto the next
+    // queue step or GitHub wake.
+    resetVerification('terminal-marker');
+    S.recovery = null;
+    S.pendingRecoveryReason = '';
+    S.controlFault = '';
+    S.error = null;
+    clearTransientNetworkError();
+    S.suppressTransportErrorsUntil = 0;
+
     if (marker === 'hibernate') {
       armHibernation(qid);
       clearTxn('hibernate');
@@ -2350,7 +2379,7 @@
 
       // The protocol marker is authoritative. Once its rendered tail is stable
       // for the short settle window, stale Stop/busy UI cannot veto completion.
-      const markerBelongsToCurrentSubturn = t.userTurnConfirmed && assistantChangedForTxn(msgs, t);
+      const markerBelongsToCurrentSubturn = markerBelongsToTxn(msgs, t);
       if (marker && markerBelongsToCurrentSubturn && now() - S.lastAssistantProgressAt >= CFG.answerSettleMs) {
         await completeLogicalTask(marker, msgs);
         paintUI(true);
@@ -2921,9 +2950,13 @@
     if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
-    if (S.verify) return [`Verifying ${Math.max(0, Math.ceil((CFG.incompleteVerifyMs - (now() - S.verify.since)) / 1000))}s`, 'warn'];
     if (S.error?.id === 'retry-control') return ['Retry detected', 'warn'];
     if (S.error) return [S.error.id, S.error.kind === 'hard' ? 'error' : 'warn'];
+    if (S.verify) {
+      const verifyRemain = CFG.incompleteVerifyMs - (now() - S.verify.since);
+      const quietRemain = CFG.incompleteVerifyMs - (now() - logicalQuietSince());
+      return [`Verifying ${Math.max(1, Math.ceil(Math.max(verifyRemain, quietRemain) / 1000))}s`, 'warn'];
+    }
     if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
     if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
     if (S.queue.length) return [`Queue ${S.queue.length}`, 'active'];
@@ -3040,6 +3073,8 @@
       ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
       ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_5M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
+      ['flattened hibernate marker', terminalMarker('work complete.[[CGR_HIBERNATE_GITHUB_5M]]'), 'hibernate'],
+      ['flattened done marker', terminalMarker('all done.[[CGR_DONE]]'), 'done'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
