@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.17
+// @version      1.3.18
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.17
+   * ChatGPT Resilience 1.3.18
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.17';
+  const VERSION = '1.3.18';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1996,6 +1996,7 @@
   }
 
   function setWaitUser() {
+    const entering = S.hib?.phase !== 'wait-user';
     S.hib = {
       route: S.route,
       phase: 'wait-user',
@@ -2006,6 +2007,7 @@
     saveHibernation();
     if (DC.wakeTimer) clearTimeout(DC.wakeTimer);
     DC.wakeTimer = null; DC.wakeDueAt = 0;
+    if (entering) maybeNotify(`${APP}: waiting for you`, 'The current task needs your input.');
     paintUI(true);
   }
 
@@ -2152,6 +2154,7 @@
       if (S.hib) clearHibernation('done-marker');
       S.lastGenerationEndAt = now();
       clearTxn('done-marker');
+      maybeNotify(`${APP}: task done`, 'The current task reached [[CGR_DONE]].');
       return true;
     }
     return false;
