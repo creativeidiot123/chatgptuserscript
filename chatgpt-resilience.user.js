@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.0.5
+// @version      1.0.6
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.0.5
+   * ChatGPT Resilience 1.0.6
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -42,7 +42,8 @@
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
    *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
-   *   - Auth, anti-abuse, context-limit, policy and unsafe upload states fail closed.
+   *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
+   *   - ChatGPT's maximum-conversation-length banner is ignored UI chrome.
    *
    * Performance policy:
    *   - no response-stream cloning
@@ -53,7 +54,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.0.5';
+  const VERSION = '1.0.6';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -142,11 +143,10 @@
   const CONTINUE_LABELS = new Set(['continue generating', 'continue response']);
 
 
-  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something went wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|conversation (?:has )?(?:reached )?(?:its )?maximum length|conversation is too long|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|something went wrong(?:\.|!|$| while generating| if this issue persists)|error in (?:the )?message stream|thinking failed|stopped thinking|reasoning stopped|a network error occurred|error occurred while connecting to the websocket|conversation not found|unable to load conversation|failed to load conversation|(?:request|message[- ]delivery|response)?\s*timed? out|too many requests|usage limit|unusual activity|suspicious activity|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
   const ERROR_RULES = [
     { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare|automated traffic|security check|you have been blocked/i },
     { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
-    { id: 'context-limit', kind: 'hard', re: /conversation (?:has )?(?:reached )?(?:its )?maximum length|maximum length for (?:this )?conversation|conversation is too long|start a new (?:chat|conversation)/i },
     { id: 'policy', kind: 'hard', re: /content policy|may violate|can(?:not|'t|’t) assist with that|can(?:not|'t|’t) help with that request/i },
     { id: 'artifact-expired', kind: 'hard', re: /download failed|file not found|generated file (?:has )?expired|file (?:has )?expired/i },
     { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
@@ -303,6 +303,8 @@
     return '';
   }
 
+  const MAX_LENGTH_UI_RE = /(?:you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
+
   function terminalMarker(text, root = null) {
     const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
     if (!clean) return null;
@@ -312,32 +314,49 @@
       [PROTOCOL.WAIT_USER, 'wait-user'],
     ];
 
-    // With no DOM root (tests / diagnostics), enforce the written protocol:
-    // the marker must be the exact final non-empty line.
     if (!root) {
-      const line = clean.split(/\r?\n/).at(-1).trim();
-      return tokens.find(([token]) => line === token)?.[1] || null;
+      // Diagnostics/tests have no rendered DOM. Accept the exact final line, or
+      // a terminal marker followed only by ChatGPT's known maximum-length UI.
+      for (const [token, marker] of tokens) {
+        const i = clean.lastIndexOf(token);
+        if (i < 0) continue;
+        const before = clean.slice(0, i);
+        const suffix = clean.slice(i + token.length).trim();
+        if (suffix === '' || MAX_LENGTH_UI_RE.test(suffix)) {
+          const prev = before.slice(-1);
+          if (!prev || /\s/.test(prev)) return marker;
+        }
+      }
+      return null;
     }
 
-    // ChatGPT's rendered block DOM often flattens adjacent <p> elements in
-    // textContent with *no newline*. So checking the last text line alone can
-    // miss a perfectly valid final marker. First require the response's raw text
-    // to end in the token, then independently prove there is a visible element
-    // whose entire content is exactly that token and which is not quoted/code.
-    const hit = tokens.find(([token]) => clean.endsWith(token));
-    if (!hit) return null;
-    const [token, marker] = hit;
+    // Rendered ChatGPT can append a maximum-length card after the assistant's
+    // actual final paragraph. Search for an exact visible marker node near the
+    // tail instead of requiring the entire flattened response text to end there.
     try {
-      const nodes = Array.from(root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6')).slice(-80).reverse();
-      const exact = nodes.find(el => {
-        if (!visible(el)) return false;
-        if (el.closest?.('pre,code,blockquote')) return false;
-        const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-        return value === token;
-      });
-      if (!exact) return null;
-      return marker;
-    } catch (_) { return null; }
+      const nodes = Array.from(root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6')).slice(-120).reverse();
+      for (const [token, marker] of tokens) {
+        const exact = nodes.find(el => {
+          if (!visible(el)) return false;
+          if (el.closest?.('pre,code,blockquote')) return false;
+          const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+          return value === token;
+        });
+        if (!exact) continue;
+
+        // If flattened text contains content after the token, allow only the
+        // known max-length banner. Any real assistant prose after the marker
+        // still invalidates it.
+        const i = clean.lastIndexOf(token);
+        if (i >= 0) {
+          const suffix = clean.slice(i + token.length).trim();
+          if (suffix && !MAX_LENGTH_UI_RE.test(suffix)) continue;
+        }
+        return marker;
+      }
+    } catch (_) {}
+
+    return null;
   }
 
   function classifyError(text) {
@@ -816,7 +835,9 @@
     for (const el of qAll(SELECTORS.alerts).filter(visible).slice(-6)) {
       if (el.closest?.('[data-message-author-role="user"]')) continue;
       const t = norm(el.textContent || '');
-      if (t && t.length < 4000) chunks.push(t);
+      if (!t || t.length >= 4000) continue;
+      if (MAX_LENGTH_UI_RE.test(t)) continue;
+      chunks.push(t);
     }
     return chunks.join('\n').slice(-10_000);
   }
@@ -1892,7 +1913,7 @@
 
     // These are not recoverable generation glitches. Do not automate through
     // authentication, anti-abuse, policy, or hard conversation-context gates.
-    if (['auth', 'anti-abuse', 'policy', 'context-limit'].includes(err.id)) {
+    if (['auth', 'anti-abuse', 'policy'].includes(err.id)) {
       blockAutomation(err.id, `${err.id} needs human attention. Queue and task state are preserved.`);
       return true;
     }
@@ -2537,11 +2558,12 @@
       ['hibernate marker', terminalMarker('hello\n[[CGR_HIBERNATE_GITHUB_5M]]'), 'hibernate'],
       ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
+      ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_5M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
       ['rate pauses', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
       ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
-      ['context blocks', classifyError('This conversation has reached its maximum length')?.kind, 'hard'],
+      ['maximum length ignored', classifyError('This conversation has reached its maximum length')?.kind || null, null],
       ['wait parser', parseWaitMs('Try again in 45 seconds'), 45000],
       ['classifier can recognize network phrase', classifyError('We should handle network error conditions carefully')?.id || null, 'network'],
       ['normal prose tail guard', ASSISTANT_ERROR_TAIL_RE.test('We should handle network error conditions carefully.'), false],
