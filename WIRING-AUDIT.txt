@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.11 — wiring / edge-case audit
+ChatGPT Resilience v1.3.12 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -95,6 +95,19 @@ PASS  repeated Enter cannot fall through to native ChatGPT
 PASS  queue mutations honor actionInFlight
 PASS  JavaScript syntax parses successfully
 
+Long-thinking recovery
+----------------------
+- The exact ChatGPT "thinking a bit more" banner is immediate recovery evidence.
+- If the transaction journal is missing, the current visible user/assistant tail
+  is adopted immediately instead of waiting for the generic five-minute orphan
+  timeout.
+- If the journal exists but its user-turn confirmation was lost, the visible
+  current turn is reconciled before recovery.
+- Recovery remains: click Stop -> wait until the composer shows a settled
+  Send/Voice/idle state -> wait 10 seconds -> send literal "continue".
+- The long-thinking banner may remain mounted after Stop, so post-Stop settling
+  intentionally ignores that banner and trusts the actual composer controls.
+
 Known intentional behavior
 --------------------------
 - Automatic queue progression does NOT run past hibernate/wait-user or an
@@ -105,7 +118,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.11
+- Userscript version: 1.3.12
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
