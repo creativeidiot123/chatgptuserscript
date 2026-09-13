@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.6
+// @version      1.3.7
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.6
+   * ChatGPT Resilience 1.3.7
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.6';
+  const VERSION = '1.3.7';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1678,7 +1678,6 @@
 
   // ---------- queue -------------------------------------------------------------------
   function queueCount() { return S.queue.length; }
-  function inflightQueueItem() { return S.queue.find(x => x.status === 'inflight') || null; }
   function queueIndexById(id) { return S.queue.findIndex(x => x.id === id); }
 
   function setQueuePaused(value, reason = 'user') {
@@ -1831,10 +1830,24 @@
     return true;
   }
 
-  async function steerOrSendQueuedItem(id) {
+  async function dispatchQueuedItem(item, source, newLogicalTask) {
+    const ok = await dispatchPrompt(item.text, source, {
+      newLogicalTask,
+      queueItemId: item.id,
+      claimQueueItem: true,
+      expectedQueueHash: item.hash,
+    });
+    return ok || (
+      !S.queue.some(x => x.id === item.id) &&
+      S.txn?.currentPromptHash === item.hash &&
+      S.txn?.source === source
+    );
+  }
+
+  async function dispatchQueuedItemNow(id) {
     if (!verifyTabContext()) return false;
     const actionRoute = S.route;
-    if (S.actionInFlight || isPaused() || S.blockedReason || S.error || !navigator.onLine) return false;
+    if (S.actionInFlight || isPaused() || S.error || !navigator.onLine) return false;
     const input = getComposer();
     if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
     if (!verifyTabContext(actionRoute)) return false;
@@ -1846,7 +1859,9 @@
 
     const freshError = currentError(getMessages(true));
     if (freshError) { S.error = freshError; return false; }
-    if (S.route !== actionRoute || S.hib) return false;
+
+    const resumeWait = S.hib?.phase === 'wait-user';
+    if (S.route !== actionRoute || (S.hib && !resumeWait)) return false;
     const item = S.queue.find(x => x.id === id);
     if (!item) { renderQueueList(); return false; }
 
@@ -1854,21 +1869,15 @@
     S.generating = isGenerating();
     if (S.generating && !S.txn) return false;
 
+    const hadBlock = !!S.blockedReason;
     const source = S.generating ? 'queue-steer' : 'queue-send';
-    const ok = await dispatchPrompt(item.text, source, {
-      newLogicalTask: !S.txn,
-      queueItemId: id,
-      claimQueueItem: true,
-      expectedQueueHash: item.hash,
-    });
+    const accepted = await dispatchQueuedItem(item, source, !S.txn);
+    if (!accepted) return false;
 
-    const accepted = ok || (
-      !S.queue.some(x => x.id === id) &&
-      S.txn?.currentPromptHash === item.hash &&
-      S.txn?.source === source
-    );
-    if (accepted) S.queueHoldReason = '';
-    return accepted;
+    if (resumeWait && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
+    if (hadBlock && S.blockedReason) clearBlock('queue-send-confirmed');
+    S.queueHoldReason = '';
+    return true;
   }
 
   function tailCommittedForQueue() {
@@ -1946,18 +1955,7 @@
 
       // Re-select the freshly persisted head after async staging so edit/reorder
       // operations in this tab cannot race dispatch.
-      const ok = await dispatchPrompt(freshItem.text, 'queue', {
-        newLogicalTask: true,
-        queueItemId: freshItem.id,
-        claimQueueItem: true,
-        expectedQueueHash: freshItem.hash,
-      });
-
-      const accepted = ok || (
-        !S.queue.some(x => x.id === freshItem.id) &&
-        S.txn?.currentPromptHash === freshItem.hash &&
-        S.txn?.source === 'queue'
-      );
+      const accepted = await dispatchQueuedItem(freshItem, 'queue', true);
       if (!accepted) {
         S.queue = loadQueue(S.route);
         if (norm(composerText(input)) === norm(freshItem.text)) clearComposer(input);
@@ -2881,7 +2879,6 @@
       if (!validSendIntent()) {
         setSendIntent(p, (S.generating || S.txn) ? 'native-submit-followup' : 'native-submit', {
           subturn: !!S.txn, resumeHib: !!S.hib, clearBlocked: !!S.blockedReason,
-          queueItemId: S.hib?.queueItemId || null,
         });
       }
       promoteSendIntent('submit');
@@ -2952,8 +2949,8 @@
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (S.queueEditingId !== item.id) {
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
-        send.disabled = !!S.hib || isPaused() || !!S.blockedReason || !!S.error || S.actionInFlight || !navigator.onLine;
-        send.addEventListener('click', () => steerOrSendQueuedItem(item.id)); actions.appendChild(send);
+        send.disabled = (S.hib && S.hib.phase !== 'wait-user') || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
+        send.addEventListener('click', () => dispatchQueuedItemNow(item.id)); actions.appendChild(send);
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
       const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
