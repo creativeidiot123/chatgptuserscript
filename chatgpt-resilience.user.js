@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.3
+// @version      1.3.4
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,14 +21,14 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.3
+   * ChatGPT Resilience 1.3.4
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
    *
    * Terminal markers:
    *   [[CGR_DONE]]                 normal successful completion
-   *   [[CGR_HIBERNATE_GITHUB_5M]] suspend the logical task and wake in 5 minutes
+   *   [[CGR_HIBERNATE_GITHUB_10M]] suspend the logical task and wake in 10 minutes
    *   [[CGR_WAIT_USER]]            suspend the logical task for human input
    *
    * Recovery policy:
@@ -55,13 +55,13 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.3';
+  const VERSION = '1.3.4';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const PROTOCOL = Object.freeze({
     DONE: '[[CGR_DONE]]',
-    HIBERNATE: '[[CGR_HIBERNATE_GITHUB_5M]]',
+    HIBERNATE: '[[CGR_HIBERNATE_GITHUB_10M]]',
     WAKE: '[[CGR_WAKE_GITHUB]]',
     WAIT_USER: '[[CGR_WAIT_USER]]',
     CONTINUE: 'continue',
@@ -94,7 +94,7 @@
     maxReloadsPerLogicalTask: 2,
     reloadCooldownMs: 30_000,
     rateFallbackMs: 60_000,
-    githubHibernateMs: 5 * 60_000,
+    githubHibernateMs: 10 * 60_000,
     githubWakeBlockedRetryMs: 15_000,
     githubWrongRouteRetryMs: 60_000,
     logLimit: 160,
@@ -3216,11 +3216,11 @@
   function selfTest() {
     const cases = [
       ['done marker', terminalMarker('hello\n[[CGR_DONE]]'), 'done'],
-      ['hibernate marker', terminalMarker('hello\n[[CGR_HIBERNATE_GITHUB_5M]]'), 'hibernate'],
+      ['hibernate marker', terminalMarker('hello\n[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
       ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
-      ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_5M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
-      ['flattened hibernate marker', terminalMarker('work complete.[[CGR_HIBERNATE_GITHUB_5M]]'), 'hibernate'],
+      ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_10M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
+      ['flattened hibernate marker', terminalMarker('work complete.[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
       ['flattened done marker', terminalMarker('all done.[[CGR_DONE]]'), 'done'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
@@ -3247,7 +3247,7 @@
       ['Enter queues when existing queue has work', queueEnterDecision({ tailDone:true, queueLength:1 }), true],
       ['Enter queues while generation active', queueEnterDecision({ tailDone:false, generating:true }), true],
       ['Enter queues when tail is unfinished', queueEnterDecision({ tailDone:false }), true],
-      ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_5M]]') === 'done', false],
+      ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
       ['normal new-chat runtime off', isProjectUrl('https://chatgpt.com/'), false],
