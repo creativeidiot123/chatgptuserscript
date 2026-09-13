@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.15
+// @version      1.3.16
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.15
+   * ChatGPT Resilience 1.3.16
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.15';
+  const VERSION = '1.3.16';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1784,74 +1784,14 @@
       return false;
     }
     kickQueue('queued', 40);
-    return item;
-  }
-
-  async function resolveQueuedHumanSendAfterDraftClear(item) {
-    if (!item?.id) return false;
-
-    // Give React a moment to replace the draft-induced Send control with the
-    // actual post-draft control. If any real busy signal appears, leave queued.
-    await sleep(120);
-    if (!verifyTabContext() || !S.queue.some(x => x.id === item.id)) return false;
-
-    // Preserve FIFO. A just-typed message may auto-send only if it is the
-    // current queue head; otherwise older follow-ups keep their place.
-    if (firstQueueItem(S.queue)?.id !== item.id) return false;
-
-    for (let i = 0; i < 4; i++) {
-      const control = getComposerControlState();
-      const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
-      const busy = control.kind === 'stop' || control.kind === 'spinner' || control.kind === 'streaming' ||
-        control.busyEvidence || longThinkingBusy;
-
-      if (busy) {
-        S.composerControl = control;
-        S.generating = true;
-        S.lastGenerationEvidenceAt = now();
-        return false;
-      }
-
-      const idle = control.kind === 'voice' ||
-        (control.kind === 'send' && !control.hasDraft) ||
-        (control.kind === 'idle' && !control.busyEvidence);
-
-      if (idle) {
-        // Require idle to survive one more frame-sized check so a transient
-        // composer swap cannot immediately interrupt an answer.
-        await sleep(100);
-        const confirm = getComposerControlState();
-        const confirmBusy = confirm.kind === 'stop' || confirm.kind === 'spinner' || confirm.kind === 'streaming' ||
-          confirm.busyEvidence || (!!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode));
-        const confirmIdle = confirm.kind === 'voice' ||
-          (confirm.kind === 'send' && !confirm.hasDraft) ||
-          (confirm.kind === 'idle' && !confirm.busyEvidence);
-
-        if (confirmBusy) {
-          S.composerControl = confirm;
-          S.generating = true;
-          S.lastGenerationEvidenceAt = now();
-          return false;
-        }
-        if (confirmIdle) {
-          S.composerControl = confirm;
-          S.generating = false;
-          return dispatchQueuedItemNow(item.id);
-        }
-      }
-
-      await sleep(100);
-    }
-
-    // Ambiguous is safe: keep it queued. Never risk interrupting generation.
-    return false;
+    return true;
   }
 
   function queueHumanSendFromComposer() {
-    const item = queueCurrentComposer();
-    if (!item) return false;
-    resolveQueuedHumanSendAfterDraftClear(item).catch(err => log('queue-human-resolve-error', { message: String(err?.message || err) }));
-    return true;
+    // Busy-state human sends are intercepted into the queue and stay there.
+    // We deliberately do not auto-send after clearing the draft: React can
+    // transiently expose an idle control while the live answer is remounting.
+    return queueCurrentComposer();
   }
 
   function captureQueueRects() {
@@ -1964,7 +1904,7 @@
     if (!item) { renderQueueList(); return false; }
 
     cancelRecovery('queue-action');
-    S.generating = isGenerating();
+    S.generating = shouldQueueHumanSend();
     if (S.generating && !S.txn) return false;
 
     const hadBlock = !!S.blockedReason;
@@ -2905,6 +2845,11 @@
     // Input handlers may only promote idle -> generating from fresh independent
     // evidence. The evaluator remains the sole owner of clearing S.generating.
     const next = getComposerControlState();
+
+    // If the evaluator already considers the turn idle, a real idle composer
+    // control should remain usable immediately.
+    if (next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft)) return false;
+
     const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
     const recentAssistantProgress = !!S.txn && now() - Number(S.lastAssistantProgressAt || 0) <= CFG.answerSettleMs;
     const busy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
@@ -2914,6 +2859,16 @@
     S.composerControl = next;
     S.generating = true;
     S.lastGenerationEvidenceAt = now();
+    return true;
+  }
+
+  function interceptBusyHumanSend(input = getComposer()) {
+    if (!shouldQueueHumanSend()) return false;
+    if (hasComposerAttachments(input)) {
+      maybeNotify(`${APP}: wait for current response`, 'This message has attachments, so it cannot be queued safely. It was not sent.');
+      return true;
+    }
+    queueHumanSendFromComposer();
     return true;
   }
 
@@ -2973,10 +2928,9 @@
 
       // Native Send and Enter obey the same queue rule. Attachments stay native
       // because this queue intentionally stores reconstructable text only.
-      if (e.isTrusted && shouldQueueHumanSend() && !hasComposerAttachments(input)) {
+      if (e.isTrusted && interceptBusyHumanSend(input)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        queueHumanSendFromComposer();
         return;
       }
 
@@ -3016,7 +2970,10 @@
       const isHumanWaitReply = S.hib?.phase === 'wait-user' && !S.txn && !S.generating;
       const isBlockedReply = !!S.blockedReason && !S.generating;
       if (!isHumanWaitReply && !isBlockedReply && shouldQueueEnter()) {
-        e.preventDefault(); e.stopImmediatePropagation(); queueHumanSendFromComposer(); return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        interceptBusyHumanSend(e.target);
+        return;
       }
       // Idle Enter remains native, but only records an ephemeral intent. If a
       // slash/autocomplete UI or React swallows the keystroke, nothing durable is
@@ -3039,10 +2996,9 @@
 
       // Form submit is a third native send path. Guard it with the same rule so
       // keyboard, button, and submit events cannot disagree about generation.
-      if (e.isTrusted && !S.actionInFlight && shouldQueueHumanSend() && !hasComposerAttachments(input)) {
+      if (e.isTrusted && !S.actionInFlight && interceptBusyHumanSend(input)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        queueHumanSendFromComposer();
         return;
       }
 
