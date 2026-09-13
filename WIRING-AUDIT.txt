@@ -2,7 +2,7 @@ ChatGPT Resilience v1.0.2 — wiring audit
 
 This build is a wiring/stability patch over v1.0.1. The completion protocol remains authoritative:
   [[CGR_DONE]]
-  [[CGR_HIBERNATE_GITHUB_5M]]
+  [[CGR_HIBERNATE_GITHUB_10M]]
   [[CGR_WAIT_USER]]
   continue
 
