@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.7
+// @version      1.3.8
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.7
+   * ChatGPT Resilience 1.3.8
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.7';
+  const VERSION = '1.3.8';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -2821,8 +2821,18 @@
       const input = getComposer();
       const p = promptText(composerText(input));
       if (!norm(p)) return;
+
+      // Native Send and Enter obey the same queue rule. Attachments stay native
+      // because this queue intentionally stores reconstructable text only.
+      if (e.isTrusted && isGenerating() && !hasComposerAttachments(input)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        queueCurrentComposer();
+        return;
+      }
+
       if (e.isTrusted) cancelRecovery('human-send');
-      setSendIntent(p, (S.generating || S.txn) ? 'human-steer-click' : 'human-click', {
+      setSendIntent(p, 'human-click', {
         subturn: !!S.txn,
         resumeHib: !!S.hib,
         clearBlocked: !!S.blockedReason,
