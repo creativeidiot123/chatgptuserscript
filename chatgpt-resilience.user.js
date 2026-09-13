@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.10
+// @version      1.3.12
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.10
+   * ChatGPT Resilience 1.3.12
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.10';
+  const VERSION = '1.3.12';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -81,6 +81,7 @@
     composerMissingGraceMs: 12_000,
     controlMismatchGraceMs: 350,
     noStartControlGraceMs: 2_500,
+    draftBusyGraceMs: 5_000,
     sendConfirmMs: 18_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
@@ -568,6 +569,7 @@
     composerMissingSince: 0,
     rateRetryAt: 0,
     lastGenerationEndAt: 0,
+    lastGenerationEvidenceAt: 0,
     lastAssistantSig: '',
     lastUserSig: '',
     longThinkingSeenAt: 0,
@@ -851,28 +853,37 @@
     return { kind: 'idle', label: '', hasDraft, busyEvidence };
   }
 
+  function generationDecision(next, wasGenerating, lastEvidenceAt, at = now()) {
+    // Explicit idle composer controls beat stale streaming attributes.
+    if (next.kind === 'voice') return false;
+    if (next.kind === 'send' && !next.hasDraft) return false;
+
+    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
+    if (strongBusy) return true;
+
+    if (next.kind === 'send' && next.hasDraft && wasGenerating) {
+      return at - Number(lastEvidenceAt || 0) <= CFG.draftBusyGraceMs;
+    }
+    return false;
+  }
+
   function isGenerating() {
     const next = getComposerControlState();
     const prev = S.composerControl || {};
-    if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = now();
+    const t = now();
+    const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
+    const recentAssistantProgress = !!S.txn && t - Number(S.lastAssistantProgressAt || 0) <= CFG.answerSettleMs;
+    if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = t;
     S.composerControl = next;
 
-    if (next.kind === 'stop') return true;
+    const explicitIdle = next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft);
+    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence || longThinkingBusy || recentAssistantProgress);
+    if (strongBusy) S.lastGenerationEvidenceAt = t;
+    const decision = strongBusy ? true : generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
 
-    // Voice is an idle affordance. A stale busy attribute does not get to
-    // overrule it; that contradiction is handled as a recovery signal.
-    if (next.kind === 'voice') return false;
-
-    // A human draft is never evidence that generation ended. ChatGPT normally
-    // exposes Send for the draft while the current response is still running.
-    // Keep the prior busy state latched until independent evidence can clear it.
-    if (next.kind === 'send') {
-      if (!next.hasDraft) return false;
-      return !!(next.busyEvidence || S.generating);
-    }
-
-    if (next.kind === 'spinner' || next.kind === 'streaming') return true;
-    return false;
+    // Typing can replace Stop with Send while the response is still running.
+    // generationDecision gives that ambiguous state a bounded grace period.
+    return decision;
   }
 
   function unfinishedControlSignal(t, marker, control = S.composerControl) {
@@ -1055,6 +1066,7 @@
     DC.assistantObserver = new MutationObserver(() => {
       if (!S.projectActive || !isProjectUrl()) return;
       S.lastAssistantProgressAt = now();
+      if (S.generating) S.lastGenerationEvidenceAt = now();
       scheduleEvaluate('assistant-progress', CFG.tailDebounceMs);
     });
     try {
@@ -1502,6 +1514,8 @@
     // GitHub wake, or a second programmatic send from racing the staged prompt
     // while React is still enabling the native Send control.
     S.actionInFlight = true;
+    renderQueueList();
+    ensureQueueButton();
     try {
       const action = await waitForSendAction(input, p);
       if (!action || S.route !== dispatchRoute) return false;
@@ -1556,6 +1570,8 @@
       return false;
     } finally {
       S.actionInFlight = false;
+      renderQueueList();
+      ensureQueueButton();
     }
   }
 
@@ -1588,10 +1604,17 @@
     return true;
   }
 
+  function postStopControlSettled(control = getComposerControlState()) {
+    const c = control || {};
+    if (c.kind === 'send' || c.kind === 'voice') return true;
+    if (c.kind === 'idle' && !c.busyEvidence) return true;
+    return false;
+  }
+
   async function waitForGenerationStop() {
     const deadline = now() + CFG.stopSettleTimeoutMs;
     while (now() < deadline) {
-      if (!isGenerating()) return true;
+      if (postStopControlSettled()) return true;
       await sleep(250);
     }
     return false;
@@ -1636,16 +1659,19 @@
           log('auto-stop', { reason });
         } finally { S.actionInFlight = false; }
 
-        await waitForGenerationStop();
+        const stopped = await waitForGenerationStop();
+        if (!stopped) return false;
+        // The long-thinking banner may remain mounted after Stop. Do not feed
+        // that stale banner back into normal generation detection here.
+        S.generating = false;
+        S.lastGenerationEvidenceAt = 0;
+        S.lastGenerationEndAt = now();
       } else if (isGenerating()) {
         // A genuinely busy turn without an accessible Stop control is ambiguous,
         // commonly because a human draft is exposing Send. Never destroy the draft.
         scheduleEvaluate(`await-stop:${reason}`, 1_000);
         return false;
       }
-
-      S.generating = isGenerating();
-      if (S.generating) return false;
 
       if (S.recovery !== recovery) return false;
       recovery.phase = 'grace';
@@ -1664,12 +1690,15 @@
       }
       const after = getMessages(true);
       if (latestMarker(after)) return false;
-      if (isGenerating()) return false;
       if (signature(after.lastAssistantText) !== beforeSig) {
         S.lastAssistantProgressAt = now();
         scheduleEvaluate(`recovery-progress:${reason}`, 500);
         return false;
       }
+      // After our own Stop, only live composer/streaming controls can prove the
+      // generation restarted. A lingering long-thinking banner cannot.
+      if (!postStopControlSettled()) return false;
+      S.generating = false;
       return sendLiteralContinue(reason);
     } finally {
       if (S.recovery === recovery) S.recovery = null;
@@ -1700,7 +1729,7 @@
   }
 
   function removeQueueItem(id, reason = 'removed') {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const i = queueIndexById(id);
     if (i < 0) return false;
     S.queue.splice(i, 1);
@@ -1712,7 +1741,7 @@
   }
 
   function clearPendingQueue() {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     if (S.queueEditingId) cancelQueueEdit();
     S.queue = [];
     saveQueue();
@@ -1729,7 +1758,7 @@
   }
 
   function queueCurrentComposer() {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const input = getComposer();
     const p = promptText(composerText(input));
     if (!input || !norm(p)) return false;
@@ -1767,7 +1796,7 @@
   }
 
   function moveQueueItem(id, targetIndex) {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const from = queueIndexById(id);
     if (from < 0) return false;
     const before = captureQueueRects();
@@ -1781,10 +1810,11 @@
   }
 
   function beginQueueEdit(id) {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const item = S.queue.find(x => x.id === id);
     const input = getComposer();
     if (!item || !input || norm(composerText(input))) return false;
+    clearDraft(S.route);
     S.queueEditingId = id;
     S.queueEditingOriginalText = item.text;
     setComposerText(input, item.text);
@@ -1795,14 +1825,14 @@
   function cancelQueueEdit() {
     if (!S.queueEditingId) return;
     const input = getComposer();
-    if (input && norm(composerText(input)) === norm(S.queueEditingOriginalText)) clearComposer(input);
+    if (input) clearComposer(input);
     S.queueEditingId = '';
     S.queueEditingOriginalText = '';
     renderQueueList();
   }
 
   function commitQueueEdit() {
-    if (!verifyTabContext()) return false;
+    if (!verifyTabContext() || S.actionInFlight) return false;
     const id = S.queueEditingId;
     const item = S.queue.find(x => x.id === id);
     const input = getComposer();
@@ -1850,8 +1880,8 @@
     const freshError = currentError(getMessages(true));
     if (freshError) { S.error = freshError; return false; }
 
-    const resumeWait = S.hib?.phase === 'wait-user';
-    if (S.route !== actionRoute || (S.hib && !resumeWait)) return false;
+    const resumeHib = !!S.hib && ['sleeping', 'wait-user'].includes(S.hib.phase);
+    if (S.route !== actionRoute || (S.hib && !resumeHib)) return false;
     const item = S.queue.find(x => x.id === id);
     if (!item) { renderQueueList(); return false; }
 
@@ -1864,7 +1894,7 @@
     const accepted = await dispatchQueuedItem(item, source, !S.txn);
     if (!accepted) return false;
 
-    if (resumeWait && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
+    if (resumeHib && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
     if (hadBlock && S.blockedReason) clearBlock('queue-send-confirmed');
     S.queueHoldReason = '';
     return true;
@@ -2311,6 +2341,14 @@
     if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
     if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
 
+    // The exact long-thinking product banner is strong current-turn evidence.
+    // If recovery lost its journal, adopt the visible user/assistant tail now
+    // instead of waiting for the generic five-minute orphan fallback.
+    if (longThinking && !marker && !S.hib && !S.txn && msgs.lastUserText &&
+        assistantIsCurrentTail(msgs) && !['auth', 'anti-abuse', 'policy'].includes(err?.id || '')) {
+      adoptUntrackedTurn(msgs, 'long-thinking-adopt');
+    }
+
     // Rendered protocol is durable evidence too. If the journal disappeared
     // across reload/update, reconstruct sleep/wait ownership before any queue
     // item can advance.
@@ -2334,6 +2372,26 @@
 
     if (S.txn) {
       const t = S.txn;
+
+      if (longThinking && !t.userTurnConfirmed && msgs.lastUserText && assistantIsCurrentTail(msgs)) {
+        confirmTxn(msgs);
+        if (!t.userTurnConfirmed && (t.sendAttempted || t.sendObserved || S.generating)) {
+          const visiblePrompt = promptText(msgs.lastUserText);
+          if (norm(visiblePrompt)) {
+            t.currentPrompt = visiblePrompt;
+            t.currentPromptHash = fnv1a(norm(visiblePrompt));
+            t.userTurnConfirmed = true;
+            t.confirmedAt = now();
+            t.sendAttempted = true;
+            t.sendObserved = true;
+            t.assistantObserved = !!msgs.lastAssistant;
+            t.generationObserved = true;
+            clearDraft(S.route);
+            saveTxn();
+            log('txn-long-thinking-reconcile', { source: t.source });
+          }
+        }
+      }
 
       // The protocol marker is authoritative. Once its rendered tail is stable
       // for the short settle window, stale Stop/busy UI cannot veto completion.
@@ -2501,6 +2559,7 @@
     S.queueEditingOriginalText = '';
     S.queueHoldReason = '';
     S.generating = false;
+    S.lastGenerationEvidenceAt = 0;
     S.error = null;
     S.verify = null;
     S.sendIntent = null;
@@ -2610,6 +2669,8 @@
     S.pendingRecoveryReason = '';
     S.composerMissingSince = 0;
     S.controlFault = '';
+    S.generating = false;
+    S.lastGenerationEvidenceAt = 0;
     clearTransientNetworkError();
     S.suppressTransportErrorsUntil = 0;
     S.lastAssistantSig = '';
@@ -2768,6 +2829,12 @@
     document.addEventListener('input', e => {
       if (!S.projectActive || !isProjectUrl()) return;
       if (isComposerTarget(e.target)) {
+        if (S.queueEditingId) {
+          cancelPendingDraft(S.route);
+          ensureQueueButton();
+          renderQueueList();
+          return;
+        }
         const txt = promptText(composerText(e.target));
         if (norm(txt)) scheduleDraftSave(txt, S.route);
         else {
@@ -2826,7 +2893,8 @@
 
     document.addEventListener('keydown', e => {
       if (!S.projectActive || !isProjectUrl()) return;
-      if (e.isComposing || e.repeat || !isComposerTarget(e.target) || !S.enabled) return;
+      if (e.isComposing || !isComposerTarget(e.target) || !S.enabled) return;
+      if (e.repeat && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.stopImmediatePropagation(); return; }
       if (e.key === 'Escape' && S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); cancelQueueEdit(); return; }
       if (e.key !== 'Enter' || e.shiftKey || e.altKey || e.metaKey) return;
       if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
@@ -2926,10 +2994,10 @@
     S.queue.forEach((item, index) => {
       const row = document.createElement('div');
       row.className = `cgr-queue-item ${S.queueEditingId === item.id ? 'is-editing' : ''}`;
-      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = S.queueEditingId !== item.id;
+      row.dataset.queueId = item.id; row.setAttribute('role', 'listitem'); row.draggable = !S.actionInFlight && S.queueEditingId !== item.id;
 
       const grip = document.createElement('button');
-      grip.type = 'button'; grip.className = 'cgr-queue-grip'; grip.title = 'Drag to reorder · Arrow keys move'; grip.innerHTML = '<span></span><span></span><span></span><span></span><span></span><span></span>';
+      grip.type = 'button'; grip.className = 'cgr-queue-grip'; grip.disabled = S.actionInFlight; grip.title = 'Drag to reorder · Arrow keys move'; grip.innerHTML = '<span></span><span></span><span></span><span></span><span></span><span></span>';
       grip.addEventListener('keydown', e => { if (!['ArrowUp', 'ArrowDown'].includes(e.key)) return; e.preventDefault(); moveQueueItem(item.id, queueIndexById(item.id) + (e.key === 'ArrowUp' ? -1 : 2)); });
       row.appendChild(grip);
 
@@ -2941,11 +3009,11 @@
       const actions = document.createElement('div'); actions.className = 'cgr-queue-actions-inline';
       if (S.queueEditingId !== item.id) {
         const send = document.createElement('button'); send.type = 'button'; send.className = 'cgr-queue-action'; send.textContent = S.generating ? 'Steer' : 'Send';
-        send.disabled = (S.hib && S.hib.phase !== 'wait-user') || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
+        send.disabled = S.hib?.phase === 'waking' || isPaused() || !!S.error || S.actionInFlight || !navigator.onLine;
         send.addEventListener('click', () => dispatchQueuedItemNow(item.id)); actions.appendChild(send);
-        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
+        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'cgr-queue-icon-action'; edit.disabled = S.actionInFlight; edit.title = 'Edit queued message'; edit.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 13.8V16h2.2l7.1-7.1-2.2-2.2L4 13.8Zm10.9-6.5a.8.8 0 0 0 0-1.1l-1.1-1.1a.8.8 0 0 0-1.1 0l-.9.9L14 8.2l.9-.9Z"/></svg>'; edit.addEventListener('click', () => beginQueueEdit(item.id)); actions.appendChild(edit);
       }
-      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
+      const del = document.createElement('button'); del.type = 'button'; del.className = 'cgr-queue-icon-action cgr-queue-remove'; del.disabled = S.actionInFlight; del.title = 'Delete queued message'; del.innerHTML = '<svg viewBox="0 0 20 20"><path d="m6.1 6.1 7.8 7.8m0-7.8-7.8 7.8"/></svg>'; del.addEventListener('click', () => animateQueueCardOut(row, () => removeQueueItem(item.id, 'ui-remove'))); actions.appendChild(del); row.appendChild(actions);
 
       row.addEventListener('dragstart', e => { DC.queueDragId = item.id; row.classList.add('is-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) {} });
       row.addEventListener('dragend', () => { DC.queueDragId = ''; row.classList.remove('is-dragging'); });
@@ -2963,7 +3031,7 @@
     if (btn?.isConnected) {
       const badge = btn.querySelector('b');
       if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
-      btn.disabled = !norm(composerText(input)) || hasComposerAttachments(input);
+      btn.disabled = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
       return;
     }
     const send = findSafeSendButton(input);
@@ -2976,7 +3044,7 @@
     btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); if (S.queueEditingId) commitQueueEdit(); else queueCurrentComposer(); });
     try { if (send && send.parentElement === parent) parent.insertBefore(btn, send); else parent.appendChild(btn); } catch (_) {}
     const badge = btn.querySelector('b'); if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
-    btn.disabled = !norm(composerText(input)) || hasComposerAttachments(input);
+    btn.disabled = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
   }
 
   function statusText() {
@@ -3148,6 +3216,17 @@
       ['Enter queues while generation active', queueEnterDecision({ generating:true }), true],
       ['Enter ignores unfinished idle tail', queueEnterDecision({ generating:false, tailDone:false }), false],
       ['Enter ignores idle transaction journal', queueEnterDecision({ generating:false, txn:true }), false],
+      ['draft Send keeps recent active generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 8_000, 10_000), true],
+      ['draft Send cannot self-latch forever', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true, 1_000, 10_000), false],
+      ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false, 9_900, 10_000), false],
+      ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true, 9_900, 10_000), false],
+      ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false, 0, 10_000), true],
+      ['voice beats stale busy evidence', generationDecision({ kind:'voice', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
+      ['empty Send beats stale busy evidence', generationDecision({ kind:'send', hasDraft:false, busyEvidence:true }, true, 9_900, 10_000), false],
+      ['post-stop Send is settled even with stale busy attr', postStopControlSettled({ kind:'send', hasDraft:true, busyEvidence:true }), true],
+      ['post-stop Voice is settled even with stale busy attr', postStopControlSettled({ kind:'voice', hasDraft:false, busyEvidence:true }), true],
+      ['post-stop Stop is not settled', postStopControlSettled({ kind:'stop', hasDraft:false, busyEvidence:false }), false],
+      ['post-stop spinner is not settled', postStopControlSettled({ kind:'spinner', hasDraft:false, busyEvidence:false }), false],
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_10M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
