@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.8
+// @version      1.3.9
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.8
+   * ChatGPT Resilience 1.3.9
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.8';
+  const VERSION = '1.3.9';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -544,7 +544,6 @@
     href: location.href,
     txn: null,
     queue: [],
-    queuePaused: store.get('queueUserPaused', false) === true,
     queueProcessing: false,
     queueHoldReason: '',
     queueEditingId: '',
@@ -582,6 +581,7 @@
   S.txn = loadTxn(S.route);
   S.queue = loadQueue(S.route);
   S.hib = loadHibernation(S.route);
+  store.del('queueUserPaused'); // legacy setting: queueing is always enabled
 
   const DC = {
     composer: null,
@@ -1680,17 +1680,6 @@
   function queueCount() { return S.queue.length; }
   function queueIndexById(id) { return S.queue.findIndex(x => x.id === id); }
 
-  function setQueuePaused(value, reason = 'user') {
-    if (!verifyTabContext()) return false;
-    S.queuePaused = !!value;
-    store.set('queueUserPaused', S.queuePaused);
-    S.queueHoldReason = S.queuePaused ? reason : '';
-    renderQueueList();
-    paintUI(true);
-    if (!S.queuePaused) kickQueue('resume', 30);
-    return true;
-  }
-
   function enqueuePrompt(text) {
     if (!verifyTabContext()) return null;
     const p = promptText(text);
@@ -1888,7 +1877,7 @@
   }
 
   function queueBlocked() {
-    return S.queuePaused || !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error;
+    return !!S.hib || isPaused() || !!S.blockedReason || S.actionInFlight || !!S.sendIntent || !!S.txn || S.generating || !!S.error;
   }
 
   function kickQueue(reason = 'event', delay = 0) {
@@ -1907,7 +1896,7 @@
     if (!verifyTabContext() || S.queueProcessing || !S.enabled || !S.queue.length) return false;
     const pumpRoute = S.route;
     if (queueBlocked()) {
-      S.queueHoldReason = S.queuePaused ? 'paused' : S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
+      S.queueHoldReason = S.hib ? S.hib.phase : isPaused() ? S.pausedReason : S.blockedReason || (S.txn ? 'active-task' : S.generating ? 'generating' : S.error ? `error:${S.error.id}` : 'busy');
       return false;
     }
     if (!tailCommittedForQueue()) {
@@ -2906,8 +2895,7 @@
       tray = document.createElement('section');
       tray.id = 'cgr-queue-tray';
       tray.setAttribute('aria-label', 'Queued follow-up messages');
-      tray.innerHTML = `<div class="cgr-queue-tray-head"><div class="cgr-queue-tray-title"><span>Queued</span><span id="cgr-queue-tray-count"></span></div><button type="button" id="cgr-queue-tray-pause" class="cgr-queue-tray-pause"></button></div><div id="cgr-queue-list" class="cgr-queue-list" role="list"></div>`;
-      tray.querySelector('#cgr-queue-tray-pause')?.addEventListener('click', () => setQueuePaused(!S.queuePaused, 'panel'));
+      tray.innerHTML = `<div class="cgr-queue-tray-head"><div class="cgr-queue-tray-title"><span>Queued</span><span id="cgr-queue-tray-count"></span></div></div><div id="cgr-queue-list" class="cgr-queue-list" role="list"></div>`;
     }
     if (tray.parentElement !== host || tray.nextElementSibling !== form) {
       try { host.insertBefore(tray, form); } catch (_) { try { host.prepend(tray); } catch (_) {} }
@@ -2931,12 +2919,10 @@
     if (!tray) return;
     const list = tray.querySelector('#cgr-queue-list');
     const count = tray.querySelector('#cgr-queue-tray-count');
-    const pause = tray.querySelector('#cgr-queue-tray-pause');
     if (count) count.textContent = queueCount() ? String(queueCount()) : '';
-    if (pause) pause.textContent = S.queuePaused ? 'Resume' : 'Pause';
     tray.hidden = !queueCount();
     if (!list || !queueCount()) { if (list) list.textContent = ''; return; }
-    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|pause:${S.queuePaused}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|action:${S.actionInFlight}|online:${navigator.onLine}`;
+    const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|action:${S.actionInFlight}|online:${navigator.onLine}`;
     if (fp === DC.queueFingerprint && list.childNodes.length) return;
     DC.queueFingerprint = fp;
     list.textContent = '';
@@ -3030,11 +3016,10 @@
     if (!S.projectActive || !isProjectUrl()) { removeRuntimeUi(); return; }
     if (!document.body || document.getElementById('cgr-root')) return;
     const root = document.createElement('div'); root.id = 'cgr-root';
-    root.innerHTML = `<button id="cgr-pill" type="button"><span id="cgr-dot"></span><span id="cgr-status">Starting</span></button><div id="cgr-panel" hidden><div class="cgr-head"><strong>${APP}</strong><span>v${VERSION}</span></div><div class="cgr-row"><span>Automation</span><button id="cgr-toggle"></button></div><div class="cgr-row"><span>Queue</span><button id="cgr-queue-toggle"></button></div><div class="cgr-note" id="cgr-detail"></div><div class="cgr-actions"><button id="cgr-recover">Continue now</button><button id="cgr-wake">GitHub wake now</button><button id="cgr-clear-queue">Clear pending</button><button id="cgr-clear-state">Clear state</button></div></div>`;
+    root.innerHTML = `<button id="cgr-pill" type="button"><span id="cgr-dot"></span><span id="cgr-status">Starting</span></button><div id="cgr-panel" hidden><div class="cgr-head"><strong>${APP}</strong><span>v${VERSION}</span></div><div class="cgr-row"><span>Automation</span><button id="cgr-toggle"></button></div><div class="cgr-note" id="cgr-detail"></div><div class="cgr-actions"><button id="cgr-recover">Continue now</button><button id="cgr-wake">GitHub wake now</button><button id="cgr-clear-queue">Clear pending</button><button id="cgr-clear-state">Clear state</button></div></div>`;
     document.body.appendChild(root);
     root.querySelector('#cgr-pill').addEventListener('click', () => { const p = root.querySelector('#cgr-panel'); p.hidden = !p.hidden; paintUI(true); });
     root.querySelector('#cgr-toggle').addEventListener('click', () => { S.enabled = !S.enabled; store.set('enabled', S.enabled); if (S.enabled) scheduleEvaluate('enabled', 0); paintUI(true); });
-    root.querySelector('#cgr-queue-toggle').addEventListener('click', () => setQueuePaused(!S.queuePaused));
     root.querySelector('#cgr-recover').addEventListener('click', async () => { clearPause(); clearBlock('panel-continue'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); } const msgs = getMessages(true); S.generating = isGenerating(); if (!S.generating && S.txn?.userTurnConfirmed) await sendLiteralContinue('manual'); scheduleEvaluate('manual-recover', 100); });
     root.querySelector('#cgr-wake').addEventListener('click', () => attemptGithubWake('manual', true));
     root.querySelector('#cgr-clear-queue').addEventListener('click', clearPendingQueue);
@@ -3046,13 +3031,12 @@
     ensureUI(); ensureQueueButton(); renderQueueList();
     const root = document.getElementById('cgr-root'); if (!root) return;
     const [text, state] = statusText();
-    const fp = `${text}|${state}|${S.queuePaused}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}|${S.composerControl?.kind || ''}|${S.composerControl?.busyEvidence ? 1 : 0}|${S.recovery?.phase || ''}|${S.controlFault || ''}|${S.pendingRecoveryReason || ''}`;
+    const fp = `${text}|${state}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}|${S.composerControl?.kind || ''}|${S.composerControl?.busyEvidence ? 1 : 0}|${S.recovery?.phase || ''}|${S.controlFault || ''}|${S.pendingRecoveryReason || ''}`;
     if (!force && fp === DC.uiFingerprint) return;
     DC.uiFingerprint = fp;
     root.dataset.state = state;
     root.querySelector('#cgr-status').textContent = text;
     root.querySelector('#cgr-toggle').textContent = S.enabled ? 'On' : 'Off';
-    root.querySelector('#cgr-queue-toggle').textContent = S.queuePaused ? 'Resume' : 'Pause';
     const parts = [];
     if (S.txn) parts.push(`continues ${S.txn.continueCount || 0}/${CFG.maxContinuesPerLogicalTask}`, `reloads ${S.txn.reloadCount || 0}/${CFG.maxReloadsPerLogicalTask}`);
     if (S.queueHoldReason) parts.push(`queue: ${S.queueHoldReason}`);
@@ -3068,7 +3052,7 @@
       #cgr-pill{display:flex;align-items:center;gap:7px;border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:999px;padding:7px 10px;background:color-mix(in srgb,Canvas 92%,transparent);color:CanvasText;box-shadow:0 5px 20px rgba(0,0,0,.16);backdrop-filter:blur(12px);cursor:pointer}
       #cgr-dot{width:8px;height:8px;border-radius:50%;background:#6b7280}#cgr-root[data-state="ok"] #cgr-dot{background:#22c55e}#cgr-root[data-state="active"] #cgr-dot{background:#3b82f6}#cgr-root[data-state="warn"] #cgr-dot{background:#f59e0b}#cgr-root[data-state="error"] #cgr-dot{background:#ef4444}
       #cgr-panel{position:absolute;right:0;bottom:42px;width:285px;padding:12px;border:1px solid color-mix(in srgb,CanvasText 16%,transparent);border-radius:14px;background:color-mix(in srgb,Canvas 96%,transparent);box-shadow:0 14px 50px rgba(0,0,0,.25);backdrop-filter:blur(16px)}#cgr-panel[hidden]{display:none}.cgr-head,.cgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px}.cgr-head{margin-bottom:10px}.cgr-head span{opacity:.55;font-size:10px}.cgr-row{padding:7px 0;border-top:1px solid color-mix(in srgb,CanvasText 9%,transparent)}.cgr-row button,.cgr-actions button{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:8px;background:color-mix(in srgb,CanvasText 7%,transparent);color:CanvasText;padding:5px 8px;cursor:pointer}.cgr-note{margin-top:8px;padding:8px;border-radius:8px;background:color-mix(in srgb,CanvasText 5%,transparent);opacity:.75;font-size:11px}.cgr-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:9px}
-      #cgr-queue-tray{width:100%;box-sizing:border-box;margin:0 0 8px;padding:6px;border:1px solid color-mix(in srgb,CanvasText 12%,transparent);border-radius:18px;background:color-mix(in srgb,Canvas 86%,transparent);box-shadow:0 6px 22px rgba(0,0,0,.08);backdrop-filter:blur(18px);animation:cgrTrayIn .16s cubic-bezier(.2,.8,.2,1)}#cgr-queue-tray[hidden]{display:none!important}.cgr-queue-tray-head{height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 5px 3px 8px}.cgr-queue-tray-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;opacity:.72}.cgr-queue-tray-title #cgr-queue-tray-count{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:color-mix(in srgb,CanvasText 9%,transparent);font-size:9px}.cgr-queue-tray-pause{border:0;background:transparent;color:CanvasText;opacity:.56;font-size:10px;padding:5px 7px;border-radius:7px;cursor:pointer}.cgr-queue-list{display:flex;flex-direction:column;gap:5px;max-height:min(30dvh,280px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:1px}.cgr-queue-item{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:48px;padding:7px 8px 7px 5px;border:1px solid color-mix(in srgb,CanvasText 9%,transparent);border-radius:13px;background:color-mix(in srgb,CanvasText 4.5%,Canvas);transition:background .13s ease,border-color .13s ease,transform .13s ease,opacity .13s ease;animation:cgrQueueCardIn .17s cubic-bezier(.2,.8,.2,1)}.cgr-queue-item.is-dragging{opacity:.45}.cgr-queue-grip{width:18px;height:28px;border:0;background:transparent;padding:6px 4px;display:grid;grid-template-columns:repeat(2,3px);gap:3px;align-content:center;justify-content:center;opacity:.28;cursor:grab;color:CanvasText}.cgr-queue-grip span{width:3px;height:3px;border-radius:50%;background:currentColor}.cgr-queue-body{min-width:0}.cgr-queue-text{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cgr-queue-meta{margin-top:2px;font-size:9.5px;opacity:.46}.cgr-queue-actions-inline{display:flex;align-items:center;gap:3px}.cgr-queue-action,.cgr-queue-icon-action{border:0;color:CanvasText;background:transparent;cursor:pointer}.cgr-queue-action{height:28px;padding:0 9px;border-radius:9px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;opacity:.48}.cgr-queue-icon-action:hover{opacity:.9;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action svg{width:15px;height:15px;fill:currentColor;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.cgr-queue-remove svg{fill:none}
+      #cgr-queue-tray{width:100%;box-sizing:border-box;margin:0 0 8px;padding:6px;border:1px solid color-mix(in srgb,CanvasText 12%,transparent);border-radius:18px;background:color-mix(in srgb,Canvas 86%,transparent);box-shadow:0 6px 22px rgba(0,0,0,.08);backdrop-filter:blur(18px);animation:cgrTrayIn .16s cubic-bezier(.2,.8,.2,1)}#cgr-queue-tray[hidden]{display:none!important}.cgr-queue-tray-head{height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 5px 3px 8px}.cgr-queue-tray-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;opacity:.72}.cgr-queue-tray-title #cgr-queue-tray-count{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:color-mix(in srgb,CanvasText 9%,transparent);font-size:9px}.cgr-queue-list{display:flex;flex-direction:column;gap:5px;max-height:min(30dvh,280px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:1px}.cgr-queue-item{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:48px;padding:7px 8px 7px 5px;border:1px solid color-mix(in srgb,CanvasText 9%,transparent);border-radius:13px;background:color-mix(in srgb,CanvasText 4.5%,Canvas);transition:background .13s ease,border-color .13s ease,transform .13s ease,opacity .13s ease;animation:cgrQueueCardIn .17s cubic-bezier(.2,.8,.2,1)}.cgr-queue-item.is-dragging{opacity:.45}.cgr-queue-grip{width:18px;height:28px;border:0;background:transparent;padding:6px 4px;display:grid;grid-template-columns:repeat(2,3px);gap:3px;align-content:center;justify-content:center;opacity:.28;cursor:grab;color:CanvasText}.cgr-queue-grip span{width:3px;height:3px;border-radius:50%;background:currentColor}.cgr-queue-body{min-width:0}.cgr-queue-text{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cgr-queue-meta{margin-top:2px;font-size:9.5px;opacity:.46}.cgr-queue-actions-inline{display:flex;align-items:center;gap:3px}.cgr-queue-action,.cgr-queue-icon-action{border:0;color:CanvasText;background:transparent;cursor:pointer}.cgr-queue-action{height:28px;padding:0 9px;border-radius:9px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;opacity:.48}.cgr-queue-icon-action:hover{opacity:.9;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action svg{width:15px;height:15px;fill:currentColor;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.cgr-queue-remove svg{fill:none}
       #cgr-queue-button{margin-inline:3px;border:0;border-radius:999px;background:transparent;color:CanvasText;min-height:32px;padding:0 8px;display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:560;cursor:pointer;white-space:nowrap;opacity:.62}#cgr-queue-button:hover:not(:disabled){background:color-mix(in srgb,CanvasText 8%,transparent);opacity:.92}#cgr-queue-button:disabled{opacity:.28}#cgr-queue-button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.5}#cgr-queue-button b{min-width:16px;height:16px;padding:0 4px;border-radius:999px;display:inline-grid;place-items:center;background:color-mix(in srgb,CanvasText 10%,transparent);font-size:9px}
       @keyframes cgrTrayIn{from{opacity:0;transform:translateY(5px) scale(.995)}to{opacity:1;transform:none}}@keyframes cgrQueueCardIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(prefers-reduced-motion:reduce){#cgr-queue-tray,.cgr-queue-item{animation:none!important}.cgr-queue-item{transition:none!important}}
     `);
@@ -3094,7 +3078,6 @@
     if (document.hidden) delay = CFG.hiddenWatchdogMs;
     else if (S.blockedReason) delay = CFG.idleWatchdogMs;
     else if (S.hib?.phase === 'sleeping') delay = CFG.idleWatchdogMs;
-    else if (S.queuePaused) delay = CFG.idleWatchdogMs;
     else if (isPaused()) delay = Math.min(CFG.idleWatchdogMs, Math.max(1_000, S.pausedUntil - now()));
     else delay = (!!S.txn || S.generating || !!S.verify || !!S.sendIntent || S.hib?.phase === 'waking') ? CFG.activeWatchdogMs : CFG.idleWatchdogMs;
     DC.watchdogTimer = setTimeout(() => scheduleEvaluate('watchdog', 0), delay);
@@ -3130,7 +3113,6 @@
     try {
       GM_registerMenuCommand('Toggle ChatGPT Resilience', inProject(() => { S.enabled = !S.enabled; store.set('enabled', S.enabled); paintUI(true); if (S.enabled) scheduleEvaluate('menu-enable', 0); }));
       GM_registerMenuCommand('Continue unfinished task now', inProject(() => { clearPause(); clearBlock('menu'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); sendLiteralContinue('menu'); } }));
-      GM_registerMenuCommand('Pause / resume queue', inProject(() => setQueuePaused(!S.queuePaused)));
       GM_registerMenuCommand('Clear pending queue', inProject(clearPendingQueue));
       GM_registerMenuCommand('GitHub wake now', inProject(() => attemptGithubWake('menu', true)));
       GM_registerMenuCommand('Clear recovery state', inProject(() => { clearPause(); clearBlock('menu-clear'); clearTxn('menu-clear'); clearHibernation('menu-clear'); paintUI(true); }));
@@ -3232,8 +3214,6 @@
       githubWakeNow: () => verifyTabContext() ? attemptGithubWake('console', true) : false,
       githubCancel: () => verifyTabContext() ? clearHibernation('console') : false,
       queueNow: () => verifyTabContext() ? queueCurrentComposer() : false,
-      pauseQueue: () => verifyTabContext() ? setQueuePaused(true) : false,
-      resumeQueue: () => verifyTabContext() ? setQueuePaused(false) : false,
       state: () => ({
         projectActive: S.projectActive && isProjectUrl(),
         storage: 'tab-session',
