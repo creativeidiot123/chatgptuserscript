@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.2.0
+// @version      1.2.1
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.2.0
+   * ChatGPT Resilience 1.2.1
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.2.0';
+  const VERSION = '1.2.1';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -516,6 +516,8 @@
     store.del(txnKey(S.route));
     S.verify = null;
     S.recovery = null;
+    S.pendingRecoveryReason = '';
+    S.composerMissingSince = 0;
     S.controlFault = '';
     kickQueue(`txn-clear:${reason}`, 40);
   }
@@ -1642,6 +1644,9 @@
       return false;
     }
     clearTransientNetworkError();
+    // The Stop-triggered abort should have arrived during the 10s grace. Do not
+    // let its suppression window hide a genuine failure of the new continuation.
+    S.suppressTransportErrorsUntil = 0;
     const nextCount = Number(t.continueCount || 0) + 1;
     const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, { newLogicalTask: false });
     if (!ok || !S.txn) return false;
