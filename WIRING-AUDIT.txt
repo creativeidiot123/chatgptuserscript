@@ -1,64 +1,111 @@
-ChatGPT Resilience v1.0.2 — wiring audit
+ChatGPT Resilience v1.3.11 — wiring / edge-case audit
 
-This build is a wiring/stability patch over v1.0.1. The completion protocol remains authoritative:
-  [[CGR_DONE]]
-  [[CGR_HIBERNATE_GITHUB_10M]]
-  [[CGR_WAIT_USER]]
-  continue
+Core contract
+-------------
+- Runtime state is browser-tab local via sessionStorage.
+- Queue contains FUTURE text-only messages.
+- Transaction journal contains ACTIVE logical work.
+- Queueing is always enabled. There is no queue pause/resume state.
+- Normal Enter / native Send:
+    generating -> queue
+    idle       -> native send
+- Automatic queue advancement is stricter than human sending and requires the
+  previous rendered assistant tail to end in [[CGR_DONE]].
+- [[CGR_HIBERNATE_GITHUB_10M]] and [[CGR_WAIT_USER]] do not count as queue
+  completion.
 
-Fixed during the full wiring audit:
+Queue dispatch
+--------------
+1. Programmatic dispatch reserves actionInFlight.
+2. Queue mutations are frozen during the short dispatch window.
+3. The transaction journal is persisted before a queued item is removed.
+4. queueItemId is only a transient crash-recovery claim.
+5. Queue removal is persisted before the claim pointer is cleared.
+6. Native Send is clicked only after the durable transaction/queue handoff.
+7. If the click is swallowed or the tab dies, the journal owns recovery; the
+   future queue item is not duplicated.
 
-1. Native-send journaling
-   - Removed durable send journaling from pointer-down.
-   - Native Enter/Send first creates only a short-lived in-memory send intent.
-   - The intent becomes a durable transaction only after submit, matching conversation POST, or matching user-turn DOM evidence.
-   - Pre-send user/assistant baselines are captured before the native UI can mutate.
+Generation detection
+--------------------
+Composer controls are signals, not a single source of truth.
 
-2. Manual Stop correctness
-   - Manual Stop is recorded only on an actual trusted click.
-   - Script-generated Stop clicks used for long-thinking recovery are not mistaken for human Stop.
+Strong independent busy evidence:
+- visible Stop control
+- composer spinner / streaming state
+- assistant streaming attributes
+- recent assistant DOM progress during the settle window
+- active long-thinking banner
 
-3. Long-thinking signal lifetime
-   - The exact discovered long-thinking banner node is cached while connected/visible.
-   - A static banner no longer disappears from Resilience's state after five seconds merely because React stopped mutating it.
+Typing a human follow-up can replace Stop with Send while generation continues.
+Therefore:
+- Send + draft never proves generation ended.
+- A recent active generation is retained for a bounded 5s ambiguity grace.
+- The grace does not self-refresh from its own prior state.
+- Voice or Send-with-no-draft are explicit idle affordances and beat stale busy
+  attributes.
+- Generation evidence is reset on project-chat route changes and runtime exit.
 
-4. React root replacement
-   - The observer is rebound if ChatGPT replaces <main> or disconnects the old root.
+Human overrides / hibernation
+-----------------------------
+- Native human sends can resume sleeping or wait-user hibernation.
+- Manual Send on a queued item follows the same rule.
+- Waking state remains serialized by actionInFlight.
+- Automatic queue advancement stays blocked during hibernation.
 
-5. Terminal-marker wiring
-   - Terminal markers are proven from the rendered DOM, so adjacent Markdown blocks whose textContent is flattened still commit correctly.
-   - Completion is serialized through the per-chat lease and revalidated against the durable transaction before queue ownership is changed.
+Queue editing
+-------------
+- Queue-edit text is isolated from normal composer draft persistence.
+- Starting an edit clears any stale normal draft.
+- Edit keystrokes are not persisted as a separate draft.
+- Escape really cancels the edit and clears the composer.
+- Route changes cannot resurrect queue-edit text as an ordinary draft.
 
-6. Queue multi-tab race
-   - Automated queue dispatch acquires the lease before marking an item in-flight.
-   - Durable queue/transaction/hibernation state is re-read after winning the lease.
-   - A second tab cannot safely send a stale local copy of the same queued item.
+Input edge cases
+----------------
+- Held/repeated Enter is swallowed so repeated keydown events cannot bypass the
+  queue interceptor.
+- Shift+Enter remains available for multiline input.
+- Attachments are deliberately not queued because they cannot be reconstructed
+  safely.
+- Native Send and Enter share the same generating-vs-idle queue rule.
+- Ctrl+Enter remains an explicit immediate send/steer path.
 
-7. GitHub wake race
-   - Wake acquires the lease before changing sleeping -> waking.
-   - Durable state is re-read after lease acquisition.
+Race / mutation safety
+-----------------------
+During actionInFlight:
+- add-from-composer, delete, clear, reorder, begin-edit, and commit-edit queue
+  mutations all fail closed;
+- queue controls are rendered disabled;
+- a reorder/delete cannot race a staged prompt and change which item is sent.
 
-8. Ctrl+Enter / WAIT_USER ownership
-   - Hibernation and blocked-state ownership are not cleared until the immediate send/steer actually dispatches successfully.
-   - A failed dispatch therefore cannot orphan an in-flight queued task.
+Validated edge cases
+--------------------
+PASS  Stop -> generating
+PASS  streaming/busy evidence -> generating
+PASS  active generation + human draft + hidden Stop -> remains generating
+PASS  hidden-Stop draft ambiguity expires instead of latching forever
+PASS  idle + draft -> stays idle
+PASS  empty Send -> idle even with stale busy attribute
+PASS  Voice -> idle even with stale busy attribute
+PASS  queue pause state/API/UI fully absent
+PASS  sleeping hibernation can be overridden by explicit queued Send
+PASS  route change resets generation evidence
+PASS  queue-edit typing does not enter normal draft persistence
+PASS  repeated Enter cannot fall through to native ChatGPT
+PASS  queue mutations honor actionInFlight
+PASS  JavaScript syntax parses successfully
 
-9. Error false positives
-   - Assistant prose is not interpreted as product-error boilerplate while the assistant is actively generating.
+Known intentional behavior
+--------------------------
+- Automatic queue progression does NOT run past hibernate/wait-user or an
+  unfinished tail.
+- Recovery/rate-limit pauses are separate from the removed queue pause feature.
+- Existing bounded page-reload recovery remains part of the recovery subsystem;
+  it is not part of queue dispatch.
 
-10. Reload dead ends
-   - Conversation-load recovery is bounded.
-   - With a transaction, reload exhaustion fails closed while preserving task/queue state.
-   - Without a transaction, at most two page-level recovery reloads occur in five minutes before automation blocks instead of looping.
-
-11. Performance
-   - A pending queue by itself no longer forces the 1-second active watchdog.
-   - Clearing the composer wakes the queue event-driven, so the queue can remain on the slow idle watchdog while blocked by a draft.
-   - No response-stream clone, no network-open liveness, no per-token persistent writes, no global style/class mutation observer.
-
-12. Strict completion contract
-   - Removed the historical-tail adoption bypass. In this dedicated project browser, an assistant tail without a terminal marker is not silently treated as committed for queue progression.
-
-Static audit: 29/29 architecture/wiring invariants passed.
-JavaScript syntax: PASS (node --check).
-
-Real authenticated ChatGPT DOM can still change independently of this build, so runtime behavior should be validated in the dedicated project browser.
+Repository validation
+---------------------
+- Userscript version: 1.3.11
+- GitHub Actions workflows in this repository: none
+- Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
+  remains the final integration environment.
