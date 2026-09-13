@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.0
+// @version      1.3.1
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.0
+   * ChatGPT Resilience 1.3.1
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,10 +55,9 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
   const PROTOCOL = Object.freeze({
     DONE: '[[CGR_DONE]]',
@@ -153,14 +152,14 @@
   });
 
 
-  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection (?:reset|closed|lost|failed|interrupted|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|ptab context try again|ptab context start a new (?:chat|conversation))*$/i;
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection (?:reset|closed|lost|failed|interrupted|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
   const ERROR_RULES = [
     { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare challenge|automated traffic|security check|you have been blocked/i },
-    { id: 'auth', kind: 'hard', re: /session (?:has )?expired|ptab context (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
+    { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
     { id: 'policy', kind: 'hard', re: /content policy|may violate|can(?:not|'t|’t) assist with that|can(?:not|'t|’t) help with that request/i },
     { id: 'artifact-expired', kind: 'hard', re: /download failed|file not found|generated file (?:has )?expired|file (?:has )?expired/i },
     { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
-    { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|ptab context wait before trying again/i },
+    { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|please wait before trying again/i },
     { id: 'conversation-load', kind: 'reload', re: /conversation not found|(?:unable|failed|error) to load (?:this )?(?:conversation|chat)|problem preparing your chat|couldn(?:'|’)t load (?:this )?(?:conversation|chat)|chat not found/i },
     { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|fetch failed|connection (?:error|reset|closed|lost|failed|interrupted|terminated)|websocket|socket (?:error|closed)|disconnected|upstream connect error|disconnect\/reset before headers|transport error|err_network/i },
     { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|connection timed out|message[- ]delivery (?:timed? out|timeout)|gateway time[- ]?out|err_timed_out|too late/i },
@@ -3197,14 +3196,14 @@
       ['flattened done marker', terminalMarker('all done.[[CGR_DONE]]'), 'done'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
-      ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists ptab context contact us through our help center.')?.kind, 'continue'],
+      ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
       ['upstream reset continues', classifyError('upstream connect error or disconnect/reset before headers')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
       ['HTTP 520 server', classifyHttpStatus(520)?.id, 'server'],
       ['HTTP 422 recoverable request', classifyHttpStatus(422)?.kind, 'continue'],
       ['rate classified', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
-      ['auth blocks', classifyError('Session expired. Ptab context sign in')?.kind, 'hard'],
+      ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
       ['maximum length ignored', classifyError('This conversation has reached its maximum length')?.kind || null, null],
       ['wait parser', parseWaitMs('Try again in 45 seconds'), 45000],
       ['classifier can recognize network phrase', classifyError('We should handle network error conditions carefully')?.id || null, 'network'],
@@ -3246,7 +3245,7 @@
 
     addStyles();
     installInputHooks();
-        installMenu();
+    installMenu();
 
     if (S.projectActive && isProjectUrl()) {
       activateProjectRuntime('boot');
