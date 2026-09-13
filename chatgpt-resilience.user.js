@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.2
+// @version      1.3.3
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.2
+   * ChatGPT Resilience 1.3.3
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.2';
+  const VERSION = '1.3.3';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1698,15 +1698,18 @@
   function queueIndexById(id) { return S.queue.findIndex(x => x.id === id); }
 
   function setQueuePaused(value, reason = 'user') {
+    if (!verifyTabContext()) return false;
     S.queuePaused = !!value;
     store.set('queueUserPaused', S.queuePaused);
     S.queueHoldReason = S.queuePaused ? reason : '';
     renderQueueList();
     paintUI(true);
     if (!S.queuePaused) kickQueue('resume', 30);
+    return true;
   }
 
   function enqueuePrompt(text) {
+    if (!verifyTabContext()) return null;
     const p = promptText(text);
     if (!norm(p)) return null;
     const item = {
@@ -1726,6 +1729,7 @@
   }
 
   function removeQueueItem(id, reason = 'removed') {
+    if (!verifyTabContext()) return false;
     const i = queueIndexById(id);
     if (i < 0) return false;
     const [item] = S.queue.splice(i, 1);
@@ -1741,11 +1745,13 @@
   }
 
   function clearPendingQueue() {
+    if (!verifyTabContext()) return false;
     if (S.queueEditingId) cancelQueueEdit();
     S.queue = S.queue.filter(x => x.status === 'inflight');
     saveQueue();
     S.queueHoldReason = '';
     renderQueueList();
+    return true;
   }
 
   function clearComposer(input = getComposer()) {
@@ -1794,6 +1800,7 @@
   }
 
   function moveQueueItem(id, targetIndex) {
+    if (!verifyTabContext()) return false;
     const from = queueIndexById(id);
     if (from < 0 || S.queue[from].status !== 'pending') return false;
     const before = captureQueueRects();
@@ -1809,6 +1816,7 @@
   }
 
   function beginQueueEdit(id) {
+    if (!verifyTabContext()) return false;
     const item = S.queue.find(x => x.id === id && x.status === 'pending');
     const input = getComposer();
     if (!item || !input || norm(composerText(input))) return false;
@@ -1829,6 +1837,7 @@
   }
 
   function commitQueueEdit() {
+    if (!verifyTabContext()) return false;
     const id = S.queueEditingId;
     const item = S.queue.find(x => x.id === id && x.status === 'pending');
     const input = getComposer();
@@ -1921,7 +1930,7 @@
   }
 
   function kickQueue(reason = 'event', delay = 0) {
-    if (!S.queue.length) return;
+    if (!verifyTabContext() || !S.queue.length) return;
     const due = now() + Math.max(0, delay);
     if (DC.queuePumpTimer && DC.queuePumpDueAt <= due) return;
     if (DC.queuePumpTimer) clearTimeout(DC.queuePumpTimer);
@@ -2946,6 +2955,7 @@
     }, true);
 
     document.addEventListener('submit', e => {
+      if (!S.projectActive || !isProjectUrl()) return;
       const input = getComposer();
       if (!input || !e.target?.contains?.(input)) return;
       const p = promptText(composerText(input));
@@ -3189,13 +3199,17 @@
   }
 
   function installMenu() {
+    const inProject = fn => (...args) => {
+      if (!verifyTabContext()) return;
+      return fn(...args);
+    };
     try {
-      GM_registerMenuCommand('Toggle ChatGPT Resilience', () => { S.enabled = !S.enabled; store.set('enabled', S.enabled); paintUI(true); if (S.enabled) scheduleEvaluate('menu-enable', 0); });
-      GM_registerMenuCommand('Continue unfinished task now', () => { clearPause(); clearBlock('menu'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); sendLiteralContinue('menu'); } });
-      GM_registerMenuCommand('Pause / resume queue', () => setQueuePaused(!S.queuePaused));
-      GM_registerMenuCommand('Clear pending queue', clearPendingQueue);
-      GM_registerMenuCommand('GitHub wake now', () => attemptGithubWake('menu', true));
-      GM_registerMenuCommand('Clear recovery state', () => { clearPause(); clearBlock('menu-clear'); clearTxn('menu-clear'); clearHibernation('menu-clear'); paintUI(true); });
+      GM_registerMenuCommand('Toggle ChatGPT Resilience', inProject(() => { S.enabled = !S.enabled; store.set('enabled', S.enabled); paintUI(true); if (S.enabled) scheduleEvaluate('menu-enable', 0); }));
+      GM_registerMenuCommand('Continue unfinished task now', inProject(() => { clearPause(); clearBlock('menu'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); sendLiteralContinue('menu'); } }));
+      GM_registerMenuCommand('Pause / resume queue', inProject(() => setQueuePaused(!S.queuePaused)));
+      GM_registerMenuCommand('Clear pending queue', inProject(clearPendingQueue));
+      GM_registerMenuCommand('GitHub wake now', inProject(() => attemptGithubWake('menu', true)));
+      GM_registerMenuCommand('Clear recovery state', inProject(() => { clearPause(); clearBlock('menu-clear'); clearTxn('menu-clear'); clearHibernation('menu-clear'); paintUI(true); }));
     } catch (_) {}
   }
 
@@ -3236,6 +3250,7 @@
       ['hibernate is not queue completion', markerFromProtocolText('x[[CGR_HIBERNATE_GITHUB_5M]]') === 'done', false],
       ['wait-user is not queue completion', markerFromProtocolText('x[[CGR_WAIT_USER]]') === 'done', false],
       ['normal chat runtime off', isProjectUrl('https://chatgpt.com/c/abc-123'), false],
+      ['normal new-chat runtime off', isProjectUrl('https://chatgpt.com/'), false],
       ['project runtime on', isProjectUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), true],
       ['regular chat route parser remains harmless', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
@@ -3289,12 +3304,12 @@
       version: VERSION,
       protocol: PROTOCOL,
       selfTest,
-      continueNow: () => sendLiteralContinue('console'),
-      githubWakeNow: () => attemptGithubWake('console', true),
-      githubCancel: () => clearHibernation('console'),
-      queueNow: queueCurrentComposer,
-      pauseQueue: () => setQueuePaused(true),
-      resumeQueue: () => setQueuePaused(false),
+      continueNow: () => verifyTabContext() ? sendLiteralContinue('console') : false,
+      githubWakeNow: () => verifyTabContext() ? attemptGithubWake('console', true) : false,
+      githubCancel: () => verifyTabContext() ? clearHibernation('console') : false,
+      queueNow: () => verifyTabContext() ? queueCurrentComposer() : false,
+      pauseQueue: () => verifyTabContext() ? setQueuePaused(true) : false,
+      resumeQueue: () => verifyTabContext() ? setQueuePaused(false) : false,
       state: () => ({
         projectActive: S.projectActive && isProjectUrl(),
         storage: 'tab-session',
