@@ -2908,7 +2908,8 @@
       if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
       const input = getComposer();
       const p = promptText(composerText(input));
-      if (!norm(p)) return;
+      const hasAttachments = hasComposerAttachments(input);
+      if (!norm(p) && !hasAttachments) return;
 
       // Native Send and Enter obey the same queue rule. A busy message with
       // attachments is blocked rather than sent because attachments cannot be
@@ -2919,6 +2920,9 @@
         return;
       }
 
+      // Attachment-only idle sends stay native; there is no reconstructable
+      // text to journal as a transaction prompt.
+      if (!norm(p)) return;
       if (e.isTrusted) cancelRecovery('human-send');
       setSendIntent(p, 'human-click', {
         subturn: !!S.txn,
@@ -2976,7 +2980,8 @@
       const input = getComposer();
       if (!input || !e.target?.contains?.(input)) return;
       const p = promptText(composerText(input));
-      if (!norm(p)) return;
+      const hasAttachments = hasComposerAttachments(input);
+      if (!norm(p) && !hasAttachments) return;
 
       // Form submit is a third native send path. Guard it with the same rule so
       // keyboard, button, and submit events cannot disagree about generation.
@@ -2986,6 +2991,7 @@
         return;
       }
 
+      if (!norm(p)) return;
       if (!validSendIntent()) {
         setSendIntent(p, (S.generating || S.txn) ? 'native-submit-followup' : 'native-submit', {
           subturn: !!S.txn, resumeHib: !!S.hib, clearBlocked: !!S.blockedReason,
