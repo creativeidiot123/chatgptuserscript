@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.0.6
+// @version      1.0.7
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -24,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.0.6
+   * ChatGPT Resilience 1.0.7
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -40,6 +40,7 @@
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
+   *   - Send/Voice appearing after turn work without a terminal marker is an immediate incomplete-turn signal
    *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
@@ -54,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.0.6';
+  const VERSION = '1.0.7';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -76,6 +77,7 @@
     answerSettleMs: 1_200,
     incompleteVerifyMs: 5 * 60_000,
     recoveryPauseMs: 10_000,
+    controlMismatchGraceMs: 350,
     sendConfirmMs: 18_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
@@ -123,6 +125,13 @@
       'button[aria-label="Stop generating"]',
       'button[aria-label="Stop response"]',
     ],
+    voice: [
+      'button[data-testid="composer-speech-button"]',
+      'button[aria-label="Start voice mode"]',
+      'button[aria-label="Start voice conversation"]',
+      'button[aria-label="Start voice chat"]',
+      'button[aria-label^="Start voice" i]',
+    ],
     user: [
       '[data-message-author-role="user"]',
     ],
@@ -130,6 +139,7 @@
       '[data-message-author-role="assistant"]',
     ],
     streaming: [
+      '[aria-busy="true"]',
       '[data-is-streaming="true"]',
       '[data-streaming="true"]',
     ],
@@ -604,6 +614,7 @@
     logs: [],
     verify: null,
     sendIntent: null,
+    recovery: null,
   };
   S.txn = loadTxn(S.route);
   S.queue = loadQueue(S.route);
@@ -730,7 +741,22 @@
 
   function findStopButton() {
     const form = composerForm(getComposer());
-    return form ? qFirst(SELECTORS.stop, form) : qFirst(SELECTORS.stop);
+    const local = form ? qFirst(SELECTORS.stop, form) : null;
+    return local || qFirst(SELECTORS.stop);
+  }
+
+  function findVoiceButton(input = getComposer()) {
+    const form = composerForm(input);
+    const roots = form ? [form, document] : [document];
+    for (const root of roots) {
+      for (const sel of SELECTORS.voice) {
+        try {
+          const hit = Array.from(root.querySelectorAll(sel)).find(el => visible(el) && !disabled(el));
+          if (hit) return hit;
+        } catch (_) {}
+      }
+    }
+    return null;
   }
 
   function isContinueButton(btn) {
@@ -754,11 +780,10 @@
     return global.at(-1) || null;
   }
 
-
   function findComposerSpinner(input = getComposer()) {
     const form = composerForm(input);
     if (!form) return null;
-    const selectors = ['[role="progressbar"]', '[aria-busy="true"]', '[data-state="loading"]', '[data-loading="true"]', '.animate-spin', '[class*="spinner" i]'];
+    const selectors = ['[role="progressbar"]', '[data-state="loading"]', '[data-loading="true"]', '.animate-spin', '[class*="spinner" i]'];
     for (const sel of selectors) {
       try {
         const el = Array.from(form.querySelectorAll(sel)).find(visible);
@@ -768,22 +793,78 @@
     return null;
   }
 
+  function hasAssistantBusyEvidence() {
+    const assistant = DC.lastAssistant;
+    if (!assistant?.isConnected) return false;
+    try {
+      if (SELECTORS.streaming.some(sel => assistant.matches?.(sel))) return true;
+      if (SELECTORS.streaming.some(sel => assistant.querySelector?.(sel))) return true;
+      const turn = assistant.closest?.('[data-testid^="conversation-turn"],article');
+      if (turn && SELECTORS.streaming.some(sel => turn.querySelector?.(sel))) return true;
+    } catch (_) {}
+    return false;
+  }
+
   function getComposerControlState() {
+    const input = getComposer();
+    const hasDraft = !!norm(composerText(input));
+    const busyEvidence = hasAssistantBusyEvidence();
+
+    // Primary composer affordance is authoritative. This prevents a stale
+    // aria/data streaming flag elsewhere in the turn from masking that ChatGPT
+    // has already switched back to Send/Voice.
     const stop = findStopButton();
-    if (stop && !disabled(stop)) return { kind: 'stop', label: exactButtonLabel(stop) };
-    if (qFirst(SELECTORS.streaming)) return { kind: 'streaming', label: '' };
-    const spinner = findComposerSpinner();
-    if (spinner) return { kind: 'spinner', label: lower(spinner.getAttribute?.('aria-label') || '') };
-    const send = findSafeSendButton();
-    if (send) return { kind: 'send', label: exactButtonLabel(send) };
-    return { kind: 'idle', label: '' };
+    if (stop && !disabled(stop)) return { kind: 'stop', label: exactButtonLabel(stop), hasDraft, busyEvidence };
+
+    const send = findSafeSendButton(input);
+    if (send) return { kind: 'send', label: exactButtonLabel(send), hasDraft, busyEvidence };
+
+    const voice = findVoiceButton(input);
+    if (voice) return { kind: 'voice', label: exactButtonLabel(voice), hasDraft, busyEvidence };
+
+    const spinner = findComposerSpinner(input);
+    if (spinner) return { kind: 'spinner', label: lower(spinner.getAttribute?.('aria-label') || ''), hasDraft, busyEvidence };
+
+    if (busyEvidence) return { kind: 'streaming', label: '', hasDraft, busyEvidence };
+    return { kind: 'idle', label: '', hasDraft, busyEvidence };
   }
 
   function isGenerating() {
     const next = getComposerControlState();
-    if (next.kind !== S.composerControl.kind) S.lastControlChangeAt = now();
+    const prev = S.composerControl || {};
+    if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = now();
     S.composerControl = next;
-    return ['stop', 'streaming', 'spinner'].includes(next.kind);
+
+    if (next.kind === 'stop') return true;
+
+    // Voice is an idle affordance. A stale busy attribute does not get to
+    // overrule it; that contradiction is handled as a recovery signal.
+    if (next.kind === 'voice') return false;
+
+    // On web Chat, typing a follow-up during a stream can legitimately expose
+    // Send. Only retain "generating" when there is both a draft and structural
+    // assistant-busy evidence.
+    if (next.kind === 'send') return !!(next.hasDraft && next.busyEvidence);
+
+    if (next.kind === 'spinner' || next.kind === 'streaming') return true;
+    return false;
+  }
+
+  function unfinishedControlSignal(t, marker, control = S.composerControl) {
+    if (!t || !t.userTurnConfirmed || t.manualStopped || marker) return '';
+    if (!t.generationObserved && !t.assistantObserved) return '';
+
+    const c = control || {};
+    if (c.kind === 'voice') return c.busyEvidence ? 'voice-while-busy' : 'voice-without-marker';
+
+    if (c.kind === 'send') {
+      // A Send arrow with an active draft can be legitimate mid-stream steering
+      // when the assistant turn is still structurally busy.
+      if (c.hasDraft && c.busyEvidence) return '';
+      return c.busyEvidence ? 'send-while-busy' : 'send-without-marker';
+    }
+
+    return '';
   }
 
   const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think|still thinking/i;
@@ -882,7 +963,15 @@
       S.lastAssistantProgressAt = now();
       scheduleEvaluate('assistant-progress', CFG.tailDebounceMs);
     });
-    try { DC.assistantObserver.observe(DC.lastAssistant, { childList: true, subtree: true, characterData: true }); } catch (_) {}
+    try {
+      DC.assistantObserver.observe(DC.lastAssistant, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['aria-busy', 'data-is-streaming', 'data-streaming'],
+      });
+    } catch (_) {}
   }
 
   function captureLongThinkingFromNode(node) {
@@ -962,7 +1051,14 @@
       DC.form = null;
       scheduleEvaluate('composer-structure', 80);
     });
-    try { DC.composerObserver.observe(host, { childList: true, subtree: true }); } catch (_) {}
+    try {
+      DC.composerObserver.observe(host, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-testid', 'aria-label', 'disabled', 'aria-disabled', 'aria-busy'],
+      });
+    } catch (_) {}
   }
 
   // ---------- lease -------------------------------------------------------------------
@@ -1354,52 +1450,65 @@
 
   async function stopThenContinue(reason = 'recovery') {
     const t = S.txn;
-    if (!t || !t.userTurnConfirmed || t.manualStopped || S.actionInFlight || isPaused() || S.blockedReason) return false;
+    if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
     if (latestMarker(getMessages())) return false;
 
     const expectedTxnId = t.id;
-    const before = getMessages();
+    if (S.recovery?.txnId === expectedTxnId) return false;
+    if (S.actionInFlight) return false;
+
+    const before = getMessages(true);
     const beforeSig = signature(before.lastAssistantText);
-    const stop = findStopButton();
+    S.recovery = { txnId: expectedTxnId, reason, phase: 'stop', startedAt: now() };
+    paintUI(true);
 
-    if (stop && visible(stop) && !disabled(stop)) {
-      S.actionInFlight = true;
-      try {
-        if (!(await verifyLease())) return false;
-        const diskTxn = loadTxn(S.route);
-        if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
-        S.txn = diskTxn;
-        if (!stop.isConnected || disabled(stop) || !visible(stop)) return false;
-        stop.click();
-        log('auto-stop', { reason });
-      } finally { S.actionInFlight = false; }
+    try {
+      const stop = findStopButton();
 
-      await waitForGenerationStop();
-    } else if (isGenerating()) {
-      // We cannot safely invent a Stop target. Re-evaluate until ChatGPT exposes
-      // the real Stop control or becomes idle on its own.
-      scheduleEvaluate(`await-stop:${reason}`, 1_000);
-      return false;
+      if (stop && visible(stop) && !disabled(stop)) {
+        S.actionInFlight = true;
+        try {
+          if (!(await verifyLease())) return false;
+          const diskTxn = loadTxn(S.route);
+          if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
+          S.txn = diskTxn;
+          if (!stop.isConnected || disabled(stop) || !visible(stop)) return false;
+          stop.click();
+          log('auto-stop', { reason });
+        } finally { S.actionInFlight = false; }
+
+        await waitForGenerationStop();
+      } else if (isGenerating()) {
+        // A genuinely busy turn without an accessible Stop control is ambiguous,
+        // commonly because a human draft is exposing Send. Never destroy the draft.
+        scheduleEvaluate(`await-stop:${reason}`, 1_000);
+        return false;
+      }
+
+      S.generating = isGenerating();
+      if (S.generating) return false;
+
+      S.recovery.phase = 'grace';
+      S.recovery.graceAt = now();
+      paintUI(true);
+      log('recovery-wait', { reason, ms: CFG.recoveryPauseMs });
+      await sleep(CFG.recoveryPauseMs);
+
+      // Ten-second grace: any genuine recovery wins over our literal continue.
+      if (!S.txn || S.txn.id !== expectedTxnId || S.txn.manualStopped) return false;
+      const after = getMessages(true);
+      if (latestMarker(after)) return false;
+      if (isGenerating()) return false;
+      if (signature(after.lastAssistantText) !== beforeSig) {
+        S.lastAssistantProgressAt = now();
+        scheduleEvaluate(`recovery-progress:${reason}`, 500);
+        return false;
+      }
+      return sendLiteralContinue(reason);
+    } finally {
+      if (S.recovery?.txnId === expectedTxnId) S.recovery = null;
+      paintUI(true);
     }
-
-    S.generating = isGenerating();
-    if (S.generating) return false;
-
-    log('recovery-wait', { reason, ms: CFG.recoveryPauseMs });
-    await sleep(CFG.recoveryPauseMs);
-
-    // The ten-second grace period is real: if ChatGPT resumed, changed the
-    // response, emitted a terminal marker, or another tab took ownership, abort.
-    if (!S.txn || S.txn.id !== expectedTxnId || S.txn.manualStopped) return false;
-    const after = getMessages(true);
-    if (latestMarker(after)) return false;
-    if (isGenerating()) return false;
-    if (signature(after.lastAssistantText) !== beforeSig) {
-      S.lastAssistantProgressAt = now();
-      scheduleEvaluate(`recovery-progress:${reason}`, 500);
-      return false;
-    }
-    return sendLiteralContinue(reason);
   }
 
   // ---------- queue -------------------------------------------------------------------
@@ -1997,14 +2106,29 @@
         paintUI(); scheduleWatchdog(); return;
       }
 
-      // Native continuation remains useful only for clean, non-error truncation.
-      if (!S.generating && findContinueButton()) {
-        await clickNativeContinue();
+      if (!t.userTurnConfirmed) {
+        await recoverUnconfirmedSend(msgs, err);
         paintUI(); scheduleWatchdog(); return;
       }
 
-      if (!t.userTurnConfirmed) {
-        await recoverUnconfirmedSend(msgs, err);
+      // Strong UI invariant: after this sub-turn has visibly done work, Stop is
+      // the expected primary control until a terminal marker commits the turn.
+      // Send/Voice without a marker means ChatGPT has dropped back to an idle
+      // composer while our logical task is still unfinished.
+      const controlSignal = unfinishedControlSignal(t, marker);
+      if (controlSignal) {
+        if (now() - S.lastControlChangeAt >= CFG.controlMismatchGraceMs) {
+          await stopThenContinue(`control:${controlSignal}`);
+        } else {
+          scheduleEvaluate(`control-grace:${controlSignal}`, CFG.controlMismatchGraceMs);
+        }
+        paintUI(); scheduleWatchdog(); return;
+      }
+
+      // Native continuation is a fallback only when the composer has not already
+      // given us the stronger Send/Voice ended-without-marker signal.
+      if (!S.generating && findContinueButton()) {
+        await clickNativeContinue();
         paintUI(); scheduleWatchdog(); return;
       }
 
@@ -2442,6 +2566,8 @@
     if (S.hib?.phase === 'waking') return ['Checking GitHub', 'active'];
     if (S.hib?.phase === 'wait-user') return ['Waiting for you', 'warn'];
     if (S.txn?.manualStopped) return ['Stopped by you', 'warn'];
+    if (S.recovery?.phase === 'grace') return [`Recovery wait ${Math.max(0, Math.ceil((CFG.recoveryPauseMs - (now() - Number(S.recovery.graceAt || now()))) / 1000))}s`, 'warn'];
+    if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
     if (S.verify) return [`Verifying ${Math.max(0, Math.ceil((CFG.incompleteVerifyMs - (now() - S.verify.since)) / 1000))}s`, 'warn'];
     if (S.error) return [S.error.id, S.error.kind === 'hard' ? 'error' : 'warn'];
@@ -2470,7 +2596,7 @@
     ensureUI(); ensureQueueButton(); renderQueueList();
     const root = document.getElementById('cgr-root'); if (!root) return;
     const [text, state] = statusText();
-    const fp = `${text}|${state}|${S.queuePaused}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}`;
+    const fp = `${text}|${state}|${S.queuePaused}|${S.queue.length}|${S.queueHoldReason}|${S.txn?.continueCount || 0}|${S.hib?.phase || ''}|${S.composerControl?.kind || ''}|${S.composerControl?.busyEvidence ? 1 : 0}|${S.recovery?.phase || ''}`;
     if (!force && fp === DC.uiFingerprint) return;
     DC.uiFingerprint = fp;
     root.dataset.state = state;
@@ -2480,6 +2606,7 @@
     const parts = [];
     if (S.txn) parts.push(`continues ${S.txn.continueCount || 0}/${CFG.maxContinuesPerLogicalTask}`, `reloads ${S.txn.reloadCount || 0}/${CFG.maxReloadsPerLogicalTask}`);
     if (S.queueHoldReason) parts.push(`queue: ${S.queueHoldReason}`);
+    parts.push(`control: ${S.composerControl?.kind || 'unknown'}${S.composerControl?.busyEvidence ? '+busy' : ''}`);
     parts.push('completion: marker required');
     root.querySelector('#cgr-detail').textContent = parts.join(' · ');
   }
@@ -2571,6 +2698,10 @@
       ['regular chat route', routeKey('https://chatgpt.com/c/abc-123'), 'c:abc-123'],
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
+      ['voice after work means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-without-marker'],
+      ['send+busy+draft is valid steer UI', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'send', hasDraft: true, busyEvidence: true }), ''],
+      ['send after work without busy means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'send', hasDraft: true, busyEvidence: false }), 'send-without-marker'],
+      ['terminal marker defeats control signal', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, 'done', { kind: 'voice', hasDraft: false, busyEvidence: false }), ''],
     ];
     // The classifier alone intentionally matches generic prose; collectErrorText
     // is the guard that prevents normal assistant prose from reaching it. Keep
@@ -2622,6 +2753,7 @@
         sendIntent: validSendIntent() ? { source: S.sendIntent.source, ageMs: now() - S.sendIntent.at, subturn: S.sendIntent.subturn } : null,
         error: S.error,
         verify: S.verify ? { ...S.verify } : null,
+        recovery: S.recovery ? { ...S.recovery } : null,
         pausedUntil: S.pausedUntil,
         pausedReason: S.pausedReason,
         blockedReason: S.blockedReason,
