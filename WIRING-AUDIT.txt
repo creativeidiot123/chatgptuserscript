@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.15 — wiring / edge-case audit
+ChatGPT Resilience v1.3.16 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -39,10 +39,10 @@ Strong independent busy evidence:
 Typing a human follow-up can replace Stop with Send while generation continues.
 Therefore:
 - Send + draft never proves generation ended.
-- A recent active generation is retained for a bounded 5s ambiguity grace.
-- The grace does not self-refresh from its own prior state.
-- Voice or Send-with-no-draft are explicit idle affordances and beat stale busy
-  attributes.
+- If the evaluator already says generating, a human draft cannot demote it.
+- There is no draft timeout that can expire into a false idle state.
+- Voice or Send-with-no-draft are explicit idle affordances only after the
+  evaluator is already idle.
 - Generation evidence is reset on project-chat route changes and runtime exit.
 
 Human overrides / hibernation
@@ -67,14 +67,12 @@ Input edge cases
   active generation.
 - Enter, native Send click, and form submit share one fail-safe guard. If the
   evaluator already says generating, the input path must queue.
-- When an intercepted human Send is queued, the composer is cleared first so
-  ChatGPT's real control is visible again. The script then re-checks:
-    busy -> leave queued
-    stable idle -> immediately dispatch that queued item
-- The idle re-check requires two stable observations and preserves FIFO; a newly
-  queued message cannot jump older queued work.
-- This means an ambiguous state fails safe toward queueing instead of risking
-  interruption of a live answer.
+- If the script says generating, intercepted Enter/Send/submit always queues the
+  text and leaves it queued. It never performs a speculative post-clear auto-send.
+- If the busy message contains attachments, native sending is blocked and the
+  user is asked to wait because attachments cannot be reconstructed safely.
+- Ambiguous state therefore fails safe toward queueing/blocking instead of
+  risking interruption of a live answer.
 - Held/repeated Enter is swallowed so repeated keydown events cannot bypass the
   queue interceptor.
 - Shift+Enter remains available for multiline input.
@@ -96,7 +94,7 @@ Validated edge cases
 PASS  Stop -> generating
 PASS  streaming/busy evidence -> generating
 PASS  active generation + human draft + hidden Stop -> remains generating
-PASS  hidden-Stop draft ambiguity expires instead of latching forever
+PASS  hidden-Stop draft preserves active generation until the draft clears
 PASS  idle + draft -> stays idle
 PASS  empty Send -> idle even with stale busy attribute
 PASS  Voice -> idle even with stale busy attribute
@@ -131,7 +129,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.15
+- Userscript version: 1.3.16
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
