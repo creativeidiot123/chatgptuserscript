@@ -872,11 +872,12 @@
     const prev = S.composerControl || {};
     const t = now();
     const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
+    const recentAssistantProgress = !!S.txn && t - Number(S.lastAssistantProgressAt || 0) <= CFG.answerSettleMs;
     if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = t;
     S.composerControl = next;
 
     const explicitIdle = next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft);
-    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence || longThinkingBusy);
+    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence || longThinkingBusy || recentAssistantProgress);
     if (strongBusy) S.lastGenerationEvidenceAt = t;
     const decision = strongBusy ? true : generationDecision(next, S.generating, S.lastGenerationEvidenceAt, t);
 
@@ -1513,6 +1514,8 @@
     // GitHub wake, or a second programmatic send from racing the staged prompt
     // while React is still enabling the native Send control.
     S.actionInFlight = true;
+    renderQueueList();
+    ensureQueueButton();
     try {
       const action = await waitForSendAction(input, p);
       if (!action || S.route !== dispatchRoute) return false;
@@ -1567,6 +1570,8 @@
       return false;
     } finally {
       S.actionInFlight = false;
+      renderQueueList();
+      ensureQueueButton();
     }
   }
 
@@ -1796,7 +1801,6 @@
     const item = S.queue.find(x => x.id === id);
     const input = getComposer();
     if (!item || !input || norm(composerText(input))) return false;
-    cancelPendingDraft(S.route);
     clearDraft(S.route);
     S.queueEditingId = id;
     S.queueEditingOriginalText = item.text;
@@ -2786,7 +2790,6 @@
       if (isComposerTarget(e.target)) {
         if (S.queueEditingId) {
           cancelPendingDraft(S.route);
-          clearDraft(S.route);
           ensureQueueButton();
           renderQueueList();
           return;
