@@ -5,11 +5,10 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.0.3
+// @version      1.0.4
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
-// @match        https://chatgpt.com/*
-// @match        https://chat.openai.com/*
+// @match        https://chatgpt.com/g/*
 // @run-at       document-start
 // @noframes
 // @grant        GM_getValue
@@ -25,7 +24,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.0.3
+   * ChatGPT Resilience 1.0.4
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -53,7 +52,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.0.3';
+  const VERSION = '1.0.4';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const TAB_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
