@@ -31,7 +31,7 @@ If you keep this repo private, use a local clone/local-file development workflow
 See `PROJECT-INSTRUCTIONS.txt`. The project uses these terminal markers:
 
 - `[[CGR_DONE]]`
-- `[[CGR_HIBERNATE_GITHUB_5M]]`
+- `[[CGR_HIBERNATE_GITHUB_10M]]`
 - `[[CGR_WAIT_USER]]`
 
 No terminal marker means the logical task is not proven complete.
