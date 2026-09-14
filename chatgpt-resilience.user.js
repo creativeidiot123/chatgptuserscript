@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.20
+// @version      1.3.21
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.20
+   * ChatGPT Resilience 1.3.21
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.20';
+  const VERSION = '1.3.21';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -2382,10 +2382,23 @@
         }
       }
 
-      // The protocol marker is authoritative. Once its rendered tail is stable
-      // for the short settle window, stale Stop/busy UI cannot veto completion.
+      // A valid terminal marker preempts every recovery path immediately.
+      // We still wait for the short tail-settle window before durably committing
+      // it, but nothing below this point may send "continue" in the meantime.
       const markerBelongsToCurrentSubturn = markerBelongsToTxn(msgs, t);
-      if (marker && markerBelongsToCurrentSubturn && now() - S.lastAssistantProgressAt >= CFG.answerSettleMs) {
+      if (marker && markerBelongsToCurrentSubturn) {
+        resetVerification('terminal-marker-visible');
+        S.pendingRecoveryReason = '';
+        S.controlFault = '';
+
+        const settleRemaining = Math.max(0, CFG.answerSettleMs - (now() - S.lastAssistantProgressAt));
+        if (settleRemaining > 0) {
+          scheduleEvaluate(`terminal-settle:${marker}`, settleRemaining + 25);
+          paintUI(true);
+          scheduleWatchdog();
+          return;
+        }
+
         await completeLogicalTask(marker, msgs);
         paintUI(true);
         scheduleWatchdog();
