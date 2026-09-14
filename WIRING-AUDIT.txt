@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.19 — wiring / edge-case audit
+ChatGPT Resilience v1.3.20 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -156,6 +156,14 @@ Notifications
   durably completed.
 - [[CGR_HIBERNATE_GITHUB_10M]] does not notify.
 
+Continuation safety
+-------------------
+- A logical task may auto-send literal "continue" up to 16 times.
+- A 17th required continuation trips continue-safety-cap, preserves the queue,
+  and requires manual attention.
+- GitHub hibernation cycles do not consume this counter. Sleeping, waiting, and
+  the WAKE prompt are separate from literal recovery "continue" turns.
+
 Known intentional behavior
 --------------------------
 - Queue progression happens only after [[CGR_DONE]] on the current assistant tail.
@@ -168,7 +176,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.19
+- Userscript version: 1.3.20
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
