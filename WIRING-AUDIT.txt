@@ -161,6 +161,8 @@ Continuation safety
 - A logical task may auto-send literal "continue" up to 16 times.
 - A 17th required continuation trips continue-safety-cap, preserves the queue,
   and requires manual attention.
+- GitHub hibernation cycles do not consume this counter. Sleeping, waiting, and
+  the WAKE prompt are separate from literal recovery "continue" turns.
 
 Known intentional behavior
 --------------------------
