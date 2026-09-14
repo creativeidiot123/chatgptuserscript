@@ -2388,7 +2388,7 @@
       const markerBelongsToCurrentSubturn = markerBelongsToTxn(msgs, t);
       if (marker && markerBelongsToCurrentSubturn) {
         resetVerification('terminal-marker-visible');
-        S.pendingRecoveryReason = '';
+        cancelRecovery('terminal-marker-visible');
         S.controlFault = '';
 
         const settleRemaining = Math.max(0, CFG.answerSettleMs - (now() - S.lastAssistantProgressAt));
