@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.20 — wiring / edge-case audit
+ChatGPT Resilience v1.3.21 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -133,6 +133,18 @@ PASS  repeated Enter cannot fall through to native ChatGPT
 PASS  queue mutations honor actionInFlight
 PASS  JavaScript syntax parses successfully
 
+Terminal-marker preemption
+--------------------------
+- A valid current-subturn [[CGR_DONE]], [[CGR_HIBERNATE_GITHUB_10M]], or
+  [[CGR_WAIT_USER]] immediately preempts every recovery path.
+- The short assistant-tail settle delay is only for durable marker commit. It is
+  never a window in which Stop/10s/continue may run.
+- Any already-active recovery is cancelled through the single existing
+  cancelRecovery() path. A sleeping 10-second recovery then fails its ownership
+  check and exits without sending literal "continue".
+- This prevents hibernate/wait-user/done markers from racing with long-thinking,
+  error, control-mismatch, verifier, or stuck-turn recovery.
+
 Long-thinking recovery
 ----------------------
 - The exact ChatGPT "thinking a bit more" banner is immediate recovery evidence.
@@ -176,7 +188,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.20
+- Userscript version: 1.3.21
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
