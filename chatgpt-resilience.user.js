@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.21
+// @version      1.3.22
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/g/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.21
+   * ChatGPT Resilience 1.3.22
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.21';
+  const VERSION = '1.3.22';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -342,7 +342,7 @@
           const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
           return value === token;
         });
-        if (exact && rawMarker === marker) return marker;
+        if (exact) return marker;
       }
 
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -358,7 +358,7 @@
         if (!parent || !visible(parent) || parent.closest?.('pre,code,blockquote')) continue;
         const value = String(tn.nodeValue || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
         for (const [token, marker] of tokens) {
-          if (value === token && rawMarker === marker) return marker;
+          if (value === token) return marker;
         }
       }
     } catch (_) {}
@@ -1543,6 +1543,19 @@
         if (norm(queueClaim.text) !== norm(p)) return false;
       }
 
+      // Recovery continue gets one final marker veto after every await and
+      // immediately before synchronous journaling + native Send. From here to
+      // action.run() there is no await, so a terminal marker cannot race in.
+      if (options.abortOnTerminalMarker) {
+        const terminal = latestMarker(getMessages(true));
+        if (terminal) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          log('dispatch-abort-terminal-marker', { source, marker: terminal });
+          scheduleEvaluate(`dispatch-terminal:${terminal}`, 0);
+          return false;
+        }
+      }
+
       let t;
       if (options.newLogicalTask) t = armNewTxn(p, source, options.queueItemId || null);
       else if (S.txn) t = beginSubturn(p, source);
@@ -1595,7 +1608,10 @@
     // let its suppression window hide a genuine failure of the new continuation.
     S.suppressTransportErrorsUntil = 0;
     const nextCount = Number(t.continueCount || 0) + 1;
-    const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, { newLogicalTask: false });
+    const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, {
+      newLogicalTask: false,
+      abortOnTerminalMarker: true,
+    });
     if (!ok || !S.txn) return false;
     S.txn.continueCount = nextCount;
     S.txn.nextRecoveryAt = now() + CFG.recoveryPauseMs;
