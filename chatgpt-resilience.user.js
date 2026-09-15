@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.23
+// @version      1.3.24
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.23
+   * ChatGPT Resilience 1.3.24
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -36,7 +36,7 @@
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
-   *   - Send/Voice appearing after turn work without a terminal marker is an immediate incomplete-turn signal
+   *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
    *   - Retry/Try again/Regenerate controls are failure signals only; they are never clicked
    *   - There is one continuation path: Stop if needed -> 10s grace -> literal "continue"
    *   - Runtime is hard-gated to https://chatgpt.com/g/* even across SPA navigation.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.23';
+  const VERSION = '1.3.24';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -79,8 +79,6 @@
     recoveryPauseMs: 10_000,
     intentionalStopNetworkSuppressMs: 15_000,
     composerMissingGraceMs: 12_000,
-    controlMismatchGraceMs: 350,
-    noStartControlGraceMs: 2_500,
     sendConfirmMs: 18_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
@@ -853,12 +851,14 @@
   }
 
   function generationDecision(next, wasGenerating) {
-    // Explicit idle controls are trustworthy only when the human draft is gone.
-    if (next.kind === 'voice') return false;
-    if (next.kind === 'send' && !next.hasDraft) return false;
-
+    // Independent busy evidence wins over transient composer affordances.
+    // ChatGPT may briefly expose Send/Voice while a response is still streaming.
     const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence;
     if (strongBusy) return true;
+
+    // With no independent busy evidence, empty Send/Voice can mark an idle UI.
+    if (next.kind === 'voice') return false;
+    if (next.kind === 'send' && !next.hasDraft) return false;
 
     // Typing can hide Stop and expose Send. Never let that human-only UI change
     // demote a live generation. Clearing/queueing the draft reveals the real state.
@@ -876,41 +876,16 @@
     if (next.kind !== prev.kind || next.busyEvidence !== prev.busyEvidence) S.lastControlChangeAt = t;
     S.composerControl = next;
 
-    const explicitIdle = next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft);
-    const strongBusy = !explicitIdle && (next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' || next.busyEvidence || longThinkingBusy || recentAssistantProgress);
+    // Recent assistant DOM progress is authoritative busy evidence even if the
+    // composer transiently exposes Send/Voice during an active response.
+    const strongBusy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
+      next.busyEvidence || longThinkingBusy || recentAssistantProgress;
     if (strongBusy) S.lastGenerationEvidenceAt = t;
     const decision = strongBusy ? true : generationDecision(next, S.generating);
 
     // Typing can replace Stop with Send while the response is still running.
     // Keep that active state until the draft is cleared and real controls return.
     return decision;
-  }
-
-  function unfinishedControlSignal(t, marker, control = S.composerControl) {
-    if (!t || !t.userTurnConfirmed || t.manualStopped || marker) return '';
-
-    const c = control || {};
-    const worked = !!(t.generationObserved || t.assistantObserved);
-    const confirmedFor = now() - Number(t.confirmedAt || t.subturnAt || 0);
-
-    // Do not declare a no-start failure during the normal tiny handoff between
-    // the user turn appearing and ChatGPT replacing the idle control with Stop.
-    if (!worked && confirmedFor < CFG.noStartControlGraceMs) return '';
-
-    if (c.kind === 'voice') {
-      if (!worked) return 'voice-no-start';
-      return c.busyEvidence ? 'voice-while-busy' : 'voice-without-marker';
-    }
-
-    if (c.kind === 'send') {
-      // A human draft changes the composer to Send during normal generation.
-      // It cannot prove that the assistant stopped, so never fault on it.
-      if (c.hasDraft) return '';
-      if (!worked) return 'send-no-start';
-      return c.busyEvidence ? 'send-while-busy' : 'send-without-marker';
-    }
-
-    return '';
   }
 
   const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think|still thinking/i;
@@ -2470,22 +2445,10 @@
         paintUI(); scheduleWatchdog(); return;
       }
 
-      // Strong UI invariant: after this sub-turn has visibly done work, Stop is
-      // the expected primary control until a terminal marker commits the turn.
-      // Send/Voice without a marker means ChatGPT has dropped back to an idle
-      // composer while our logical task is still unfinished.
-      const controlSignal = unfinishedControlSignal(t, marker);
-      S.controlFault = controlSignal || '';
-      if (controlSignal) {
-        if (now() - S.lastControlChangeAt >= CFG.controlMismatchGraceMs) {
-          await stopThenContinue(`control:${controlSignal}`);
-        } else {
-          scheduleEvaluate(`control-grace:${controlSignal}`, CFG.controlMismatchGraceMs);
-        }
-        paintUI(); scheduleWatchdog(); return;
-      }
-
-      S.controlFault = '';
+      // Composer affordances are not reliable enough to stop a response. If
+      // ChatGPT appears idle without a terminal marker, the normal five-minute
+      // quiet verifier below decides whether recovery is actually needed.
+      if (S.controlFault !== 'composer-missing') S.controlFault = '';
 
       if (await maybeRecoverStall(msgs, longThinking)) {
         paintUI(); scheduleWatchdog(); return;
@@ -3277,8 +3240,8 @@
       ['idle draft does not invent generation', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, false), false],
       ['empty Send is idle', generationDecision({ kind:'send', hasDraft:false, busyEvidence:false }, true), false],
       ['busy evidence wins over draft Send', generationDecision({ kind:'send', hasDraft:true, busyEvidence:true }, false), true],
-      ['voice beats stale busy evidence', generationDecision({ kind:'voice', hasDraft:false,busyEvidence:true }, true), false],
-      ['empty Send beats stale busy evidence', generationDecision({ kind:'send',hasDraft:false,busyEvidence:true }, true), false],
+      ['busy evidence beats transient Voice', generationDecision({ kind:'voice', hasDraft:false,busyEvidence:true }, true), true],
+      ['busy evidence beats transient empty Send', generationDecision({ kind:'send',hasDraft:false,busyEvidence:true }, true), true],
       ['post-stop Send is settled even with stale busy attr', postStopControlSettled({ kind:'send', hasDraft:true, busyEvidence:true }), true],
       ['post-stop Voice is settled even with stale busy attr', postStopControlSettled({ kind:'voice', hasDraft:false, busyEvidence:true }), true],
       ['post-stop Stop is not settled', postStopControlSettled({ kind:'stop', hasDraft:false, busyEvidence:false }), false],
@@ -3294,12 +3257,6 @@
       ['project chat route', routeKey('https://chatgpt.com/g/g-p-project/c/abc-123'), 'c:abc-123'],
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
       ['project key stable', projectKeyFromUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), 'g-p-project'],
-      ['voice after work means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-without-marker'],
-      ['voice no-start after grace means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: false, generationObserved: false, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'voice', hasDraft: false, busyEvidence: false }), 'voice-no-start'],
-      ['send+busy+draft is normal composer UI', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, null, { kind: 'send', hasDraft: true, busyEvidence: true }), ''],
-      ['send+draft without busy evidence is still not a stop signal', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'send', hasDraft: true, busyEvidence: false }), ''],
-      ['send after work without draft means unfinished', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false, confirmedAt: now() - 5000 }, null, { kind: 'send', hasDraft: false, busyEvidence: false }), 'send-without-marker'],
-      ['terminal marker defeats control signal', unfinishedControlSignal({ userTurnConfirmed: true, assistantObserved: true, generationObserved: true, manualStopped: false }, 'done', { kind: 'voice', hasDraft: false, busyEvidence: false }), ''],
     ];
     // The classifier alone intentionally matches generic prose; collectErrorText
     // is the guard that prevents normal assistant prose from reaching it. Keep
