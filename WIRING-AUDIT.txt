@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.23 — wiring / edge-case audit
+ChatGPT Resilience v1.3.24 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -63,13 +63,15 @@ Strong independent busy evidence:
 - recent assistant DOM progress during the settle window
 - active long-thinking banner
 
-Typing a human follow-up can replace Stop with Send while generation continues.
-Therefore:
+Typing a human follow-up or ChatGPT's own UI transitions can temporarily expose
+Send/Voice while generation continues. Therefore:
 - Send + draft never proves generation ended.
+- Independent busy evidence and recent assistant DOM progress beat transient
+  Send/Voice affordances.
 - If the evaluator already says generating, a human draft cannot demote it.
+- Send/Voice alone never trigger Stop -> continue recovery.
+- Idle-without-marker is handled by the five-minute quiet verifier instead.
 - There is no draft timeout that can expire into a false idle state.
-- Voice or Send-with-no-draft are explicit idle affordances only after the
-  evaluator is already idle.
 - Generation evidence is reset on project-chat route changes and runtime exit.
 
 Human overrides / hibernation
@@ -123,8 +125,11 @@ PASS  streaming/busy evidence -> generating
 PASS  active generation + human draft + hidden Stop -> remains generating
 PASS  hidden-Stop draft preserves active generation until the draft clears
 PASS  idle + draft -> stays idle
-PASS  empty Send -> idle even with stale busy attribute
-PASS  Voice -> idle even with stale busy attribute
+PASS  empty Send without busy evidence -> idle
+PASS  Voice without busy evidence -> idle
+PASS  busy evidence beats transient empty Send
+PASS  busy evidence beats transient Voice
+PASS  composer control changes alone cannot trigger Stop
 PASS  queue pause state/API/UI fully absent
 PASS  sleeping hibernation can be overridden by explicit queued Send
 PASS  route change resets generation evidence
@@ -166,7 +171,16 @@ Terminal-marker preemption
   cancelRecovery() path. A sleeping 10-second recovery then fails its ownership
   check and exits without sending literal "continue".
 - This prevents hibernate/wait-user/done markers from racing with long-thinking,
-  error, control-mismatch, verifier, or stuck-turn recovery.
+  error, verifier, or stuck-turn recovery.
+
+Mid-generation Stop protection
+------------------------------
+- Composer Send/Voice state is not a recovery trigger.
+- The old 350 ms control-mismatch Stop path was removed completely.
+- Healthy generation stays active when assistant DOM progress or streaming/busy
+  evidence is still present, even if the composer transiently shows Send/Voice.
+- Missing terminal markers are recovered only through explicit error handling,
+  the long-thinking path, or the five-minute quiet verifier.
 
 Long-thinking recovery
 ----------------------
@@ -211,7 +225,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.23
+- Userscript version: 1.3.24
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
