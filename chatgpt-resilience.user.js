@@ -1591,6 +1591,7 @@
 
   async function sendLiteralContinue(reason = 'incomplete') {
     if (!verifyTabContext()) return false;
+    if (latestMarker(getMessages(true))) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || S.generating || S.actionInFlight || isPaused() || S.blockedReason) return false;
     if (Number(t.continueCount || 0) >= CFG.maxContinuesPerLogicalTask) {
