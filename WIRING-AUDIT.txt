@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.21 — wiring / edge-case audit
+ChatGPT Resilience v1.3.22 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -133,6 +133,19 @@ PASS  repeated Enter cannot fall through to native ChatGPT
 PASS  queue mutations honor actionInFlight
 PASS  JavaScript syntax parses successfully
 
+Hard terminal veto
+------------------
+- Exact visible protocol tokens are authoritative even if the surrounding
+  assistant container has extra suffix text. The rendered token is not discarded
+  just because flattened text has trailing UI/content.
+- Literal recovery "continue" checks for a fresh terminal marker before staging.
+- Recovery continue also requests a final forced marker check inside dispatchPrompt
+  after all awaits and immediately before synchronous journaling + native Send.
+- There is no await between that final veto and the click, so React/network DOM
+  updates cannot interleave and sneak a terminal marker into the send window.
+- If the final veto fires, the staged "continue" is cleared and the evaluator is
+  re-run to commit DONE / HIBERNATE / WAIT_USER normally.
+
 Terminal-marker preemption
 --------------------------
 - A valid current-subturn [[CGR_DONE]], [[CGR_HIBERNATE_GITHUB_10M]], or
@@ -188,7 +201,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.21
+- Userscript version: 1.3.22
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
