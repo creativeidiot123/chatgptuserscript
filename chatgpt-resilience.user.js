@@ -694,13 +694,22 @@
   }
 
   function tailTurnRoot() {
-    return DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || DC.lastAssistant || null;
+    const assistant = DC.lastAssistant;
+    const user = DC.lastUser;
+    if (!assistant?.isConnected) return null;
+    if (user?.isConnected) {
+      try {
+        if (!(user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING)) return null;
+      } catch (_) { return null; }
+    }
+    return assistant.closest?.('[data-testid^="conversation-turn"],article') || assistant;
   }
 
   function isTailRelevantElement(el) {
     if (!el?.isConnected) return false;
     const assistant = DC.lastAssistant;
-    if (!assistant?.isConnected) {
+    const turn = tailTurnRoot();
+    if (!turn) {
       const user = DC.lastUser;
       if (!user?.isConnected) return false;
       try {
@@ -710,8 +719,7 @@
         return true;
       } catch (_) { return false; }
     }
-    const turn = tailTurnRoot();
-    if (turn?.contains?.(el) || assistant.contains?.(el)) return true;
+    if (turn.contains?.(el) || assistant.contains?.(el)) return true;
 
     const ownTurn = el.closest?.('[data-testid^="conversation-turn"],article');
     if (ownTurn && turn && ownTurn !== turn) return false;
@@ -947,11 +955,10 @@
 
   function collectErrorText(msgs = getMessages()) {
     const chunks = [];
-    const assistantText = norm(msgs.lastAssistantText);
+    const assistantText = assistantIsCurrentTail(msgs) ? norm(msgs.lastAssistantText) : '';
     const tail = assistantText.slice(-1400);
-    // Product error messages are compact. Do not reinterpret the ending of a
-    // long, healthy assistant answer as ChatGPT error chrome just because it
-    // happens to contain phrases such as "network error" or "timed out".
+    // Product error messages are compact. Do not reinterpret an old/long,
+    // healthy assistant answer as current ChatGPT error chrome.
     if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
 
     const root = document.querySelector('main') || document;
@@ -1021,13 +1028,18 @@
     const dom = classifyError(collectErrorText(msgs));
     if (dom) return dom;
 
+    const liveGeneration = !!S.txn && hasLiveGenerationEvidence();
+
     const age = now() - Number(S.lastHttpStatusAt || 0);
     if (age < 20_000) {
       const http = classifyHttpStatus(S.lastHttpStatus);
-      if (http) return http;
+      // Hard/rate statuses remain meaningful. Recoverable HTTP noise is only
+      // actionable once the visible turn no longer looks alive.
+      if (http && (http.kind === 'hard' || http.kind === 'rate' || !liveGeneration)) return http;
     }
 
-    if (S.lastNetworkFailureAt && now() - S.lastNetworkFailureAt < 20_000 && !transportFailureSuppressed()) {
+    if (!liveGeneration && S.lastNetworkFailureAt &&
+        now() - S.lastNetworkFailureAt < 20_000 && !transportFailureSuppressed()) {
       return {
         id: S.lastNetworkFailureKind === 'timeout' ? 'timeout' : 'network',
         kind: 'continue',
@@ -2307,9 +2319,8 @@
     const t = S.txn;
     if (!err) return false;
 
-    // These are not recoverable generation glitches. Do not automate through
-    // authentication, anti-abuse, policy, or hard conversation-context gates.
-    if (['auth', 'anti-abuse', 'policy'].includes(err.id)) {
+    // Hard states need a human. Never automate through them.
+    if (err.kind === 'hard') {
       blockAutomation(err.id, `${err.id} needs human attention. Queue and task state are preserved.`);
       return true;
     }
@@ -2317,6 +2328,17 @@
     if (!t) return false;
     if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
     if (t.manualStopped) return false;
+
+    // Rate limits are a scheduler condition, not a broken generation. Preserve
+    // the live answer and wait instead of pressing continue into the limit.
+    if (err.kind === 'rate') {
+      pauseUntil(now() + rateWaitMs(err.sourceText), 'rate-limit');
+      return true;
+    }
+
+    // Once the user turn is confirmed, a message-send error belongs to stale
+    // send UI/network state and is not evidence that the active answer failed.
+    if (err.kind === 'send') return false;
 
     // Recoverable errors use one deterministic path, but the recovery boundary
     // itself refuses to interrupt a visibly progressing assistant turn.
