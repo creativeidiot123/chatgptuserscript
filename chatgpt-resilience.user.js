@@ -35,7 +35,7 @@
    *   - A confirmed unfinished turn with no text/control progress for 15 minutes
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
-   *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
+   *   - Long-thinking is a separate state from ordinary product/error recovery
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
    *   - Retry/Try again controls are failure signals only; they are never clicked
    *   - Regenerate is normal answer UI and is never treated as failure evidence
@@ -1617,9 +1617,16 @@
           return false;
         }
 
-        if (!postStopControlSettled()) {
+        const finalControl = getComposerControlState();
+        const hardBusyControl = ['stop', 'spinner', 'streaming'].includes(finalControl.kind);
+        const newAssistantBusy = finalControl.busyEvidence && !options.expectedBusyEvidence;
+        if (hardBusyControl || newAssistantBusy || S.generating) {
           if (norm(composerText(input)) === norm(p)) clearComposer(input);
-          log('dispatch-abort-generation-restarted', { source });
+          log('dispatch-abort-generation-restarted', {
+            source,
+            control: finalControl.kind,
+            busyEvidence: !!finalControl.busyEvidence,
+          });
           scheduleEvaluate('dispatch-generation-restarted', 0);
           return false;
         }
@@ -1687,10 +1694,12 @@
     S.suppressTransportErrorsUntil = 0;
     const nextCount = Number(t.continueCount || 0) + 1;
     const expectedAssistantSig = signature(getMessages(true).lastAssistantText);
+    const expectedBusyEvidence = hasAssistantBusyEvidence();
     const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, {
       newLogicalTask: false,
       abortOnTerminalMarker: true,
       expectedAssistantSig,
+      expectedBusyEvidence,
     });
     if (!ok || !S.txn) return false;
     S.txn.continueCount = nextCount;
