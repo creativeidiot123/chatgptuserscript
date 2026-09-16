@@ -80,8 +80,8 @@
     recoveryStopQuietMs: 15_000,
     longThinkingRecoveryMs: 10 * 60_000,
     intentionalStopNetworkSuppressMs: 15_000,
-    composerMissingGraceMs: 12_000,
     sendConfirmMs: 18_000,
+    networkOwnershipMs: 15_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
     interTurnSettleMs: 1_200,
@@ -2769,19 +2769,29 @@
         UW.fetch = async function (input, init = {}) {
           const url = typeof input === 'string' ? input : input?.url || '';
           const method = init?.method || input?.method || 'GET';
-          const tracked = isConversationRequest(url, method);
-          if (tracked) {
-            S.lastNetworkAt = now();
-            S.lastNetworkFailureAt = 0;
-            S.lastNetworkFailureKind = '';
-            S.lastHttpStatus = 0;
-            S.lastHttpStatusAt = 0;
+          const candidate = isConversationRequest(url, method);
+          let ownerTxnId = '';
+          let ownerRoute = '';
+          if (candidate) {
             if (validSendIntent()) promoteSendIntent('network');
-            if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
+            const t = S.txn;
+            const dispatchedAt = Number(t?.dispatchAt || t?.subturnAt || 0);
+            if (t && now() - dispatchedAt <= CFG.networkOwnershipMs) {
+              ownerTxnId = t.id;
+              ownerRoute = S.route;
+              S.lastNetworkAt = now();
+              S.lastNetworkFailureAt = 0;
+              S.lastNetworkFailureKind = '';
+              S.lastHttpStatus = 0;
+              S.lastHttpStatusAt = 0;
+              t.sendObserved = true;
+              saveTxn();
+            }
           }
+          const owned = () => !!ownerTxnId && ownerRoute === S.route && S.txn?.id === ownerTxnId;
           try {
             const res = await orig(input, init);
-            if (tracked) {
+            if (owned()) {
               S.lastNetworkAt = now();
               S.lastNetworkFailureAt = 0;
               S.lastNetworkFailureKind = '';
@@ -2795,7 +2805,7 @@
             }
             return res;
           } catch (e) {
-            if (tracked) {
+            if (owned()) {
               if (e?.name === 'AbortError') {
                 S.lastNetworkAt = now();
                 log('transport-abort-ignored', { transport: 'fetch' });
@@ -2820,41 +2830,52 @@
           return open.call(this, method, url, ...rest);
         };
         X.prototype.send = function (...args) {
-          const tracked = isConversationRequest(this.__cgr1Url, this.__cgr1Method);
-          if (tracked) {
-            S.lastNetworkAt = now();
-            S.lastNetworkFailureAt = 0;
-            S.lastNetworkFailureKind = '';
-            S.lastHttpStatus = 0;
-            S.lastHttpStatusAt = 0;
-            this.__cgr1TransportFailed = false;
+          const candidate = isConversationRequest(this.__cgr1Url, this.__cgr1Method);
+          if (candidate) {
             if (validSendIntent()) promoteSendIntent('network');
-            if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
+            const t = S.txn;
+            const dispatchedAt = Number(t?.dispatchAt || t?.subturnAt || 0);
+            if (t && now() - dispatchedAt <= CFG.networkOwnershipMs) {
+              this.__cgr1TxnId = t.id;
+              this.__cgr1Route = S.route;
+              S.lastNetworkAt = now();
+              S.lastNetworkFailureAt = 0;
+              S.lastNetworkFailureKind = '';
+              S.lastHttpStatus = 0;
+              S.lastHttpStatusAt = 0;
+              this.__cgr1TransportFailed = false;
+              t.sendObserved = true;
+              saveTxn();
 
-            const fail = kind => {
-              this.__cgr1TransportFailed = true;
-              noteTransportFailure(kind);
-            };
-            this.addEventListener('error', () => fail('xhr-error'), { once: true });
-            this.addEventListener('timeout', () => fail('timeout'), { once: true });
-            this.addEventListener('abort', () => {
-              S.lastNetworkAt = now();
-              log('transport-abort-ignored', { transport: 'xhr' });
-            }, { once: true });
-            this.addEventListener('loadend', () => {
-              S.lastNetworkAt = now();
-              S.lastHttpStatus = Number(this.status || 0);
-              S.lastHttpStatusAt = now();
-              if (!this.__cgr1TransportFailed && S.lastHttpStatus > 0) {
-                S.lastNetworkFailureAt = 0;
-                S.lastNetworkFailureKind = '';
-              }
-              if (S.lastHttpStatus === 429) {
-                const retryMs = parseRetryAfterMs(this.getResponseHeader?.('Retry-After'));
-                if (retryMs) S.rateRetryAt = now() + retryMs;
-              }
-              scheduleEvaluate('xhr-end', 80);
-            }, { once: true });
+              const owned = () => this.__cgr1TxnId && this.__cgr1Route === S.route && S.txn?.id === this.__cgr1TxnId;
+              const fail = kind => {
+                if (!owned()) return;
+                this.__cgr1TransportFailed = true;
+                noteTransportFailure(kind);
+              };
+              this.addEventListener('error', () => fail('xhr-error'), { once: true });
+              this.addEventListener('timeout', () => fail('timeout'), { once: true });
+              this.addEventListener('abort', () => {
+                if (!owned()) return;
+                S.lastNetworkAt = now();
+                log('transport-abort-ignored', { transport: 'xhr' });
+              }, { once: true });
+              this.addEventListener('loadend', () => {
+                if (!owned()) return;
+                S.lastNetworkAt = now();
+                S.lastHttpStatus = Number(this.status || 0);
+                S.lastHttpStatusAt = now();
+                if (!this.__cgr1TransportFailed && S.lastHttpStatus > 0) {
+                  S.lastNetworkFailureAt = 0;
+                  S.lastNetworkFailureKind = '';
+                }
+                if (S.lastHttpStatus === 429) {
+                  const retryMs = parseRetryAfterMs(this.getResponseHeader?.('Retry-After'));
+                  if (retryMs) S.rateRetryAt = now() + retryMs;
+                }
+                scheduleEvaluate('xhr-end', 80);
+              }, { once: true });
+            }
           }
           return send.apply(this, args);
         };
