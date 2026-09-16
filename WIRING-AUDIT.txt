@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.27 — wiring / edge-case audit
+ChatGPT Resilience v1.3.28 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -6,15 +6,17 @@ Core contract
 - Queue contains FUTURE text-only messages.
 - Transaction journal contains ACTIVE logical work.
 - Queueing is always enabled. There is no queue pause/resume state.
-- Normal Enter / native Send:
-    generating -> queue
-    idle       -> native send
+- Plain Enter / trusted native Send click / trusted native form submit:
+    always -> immediate native send
+- Ctrl+Enter:
+    always -> queue current text-only composer message
 - Queued messages have exactly one dispatch path: the automatic queue pump.
 - The pump is locked unless the CURRENT rendered assistant tail ends in
   [[CGR_DONE]].
 - Errors, [[CGR_HIBERNATE_GITHUB_10M]], [[CGR_WAIT_USER]], recovery, generation,
   and ambiguous states never release queued work.
-- There is no manual queued Send/Steer bypass.
+- Ctrl+Enter only adds future work to the queue; it never bypasses the automatic
+  DONE-gated queue dispatch path.
 
 Queue release readiness
 -----------------------
@@ -156,23 +158,20 @@ Queue editing
 Input edge cases
 ----------------
 - Human typing can replace ChatGPT's Stop control with the user's Send control.
-  While a draft exists, that UI change is NEVER allowed to demote an already
-  active generation.
-- Enter, native Send click, and form submit share one fail-safe guard. If the
-  evaluator already says generating, the input path must queue.
-- If the script says generating, intercepted Enter/Send/submit always queues the
-  text and leaves it queued. It never performs a speculative post-clear auto-send.
-- If the busy message contains attachments, native sending is blocked and the
-  user is asked to wait because attachments cannot be reconstructed safely.
-- Ambiguous state therefore fails safe toward queueing/blocking instead of
-  risking interruption of a live answer.
-- Held/repeated Enter is swallowed so repeated keydown events cannot bypass the
-  queue interceptor.
+  Generation detection remains independent from the human send policy.
+- Plain Enter is always left to ChatGPT's native immediate-send behavior, even
+  while another answer is generating.
+- A trusted manual Send click is also always immediate/native.
+- Trusted form submit is part of the same immediate-send path and is never
+  converted into queued work.
+- Ctrl+Enter prevents native sending and queues the current text-only composer
+  message instead.
+- Ctrl+Enter with attachments remains blocked from queueing because attachments
+  cannot be reconstructed safely.
+- Queueing clears the composer only after the queue item is durably added.
+- Held/repeated Enter is swallowed to avoid accidental duplicate native sends.
 - Shift+Enter remains available for multiline input.
-- Attachments are deliberately not queued because they cannot be reconstructed
-  safely.
-- Native Send and Enter share the same generating-vs-idle queue rule.
-- Ctrl+Enter remains an explicit immediate send/steer path.
+- Queue editing keeps its existing Enter/Escape behavior.
 
 Race / mutation safety
 -----------------------
@@ -203,7 +202,10 @@ PASS  composer remount alone cannot create recovery
 PASS  stale network completions cannot cross subturn ownership
 PASS  rate limits pause instead of continuing
 PASS  queue pause state/API/UI fully absent
-PASS  sleeping hibernation can be overridden by explicit queued Send
+PASS  Ctrl+Enter queues without bypassing hibernation/DONE queue gates
+PASS  plain Enter is not intercepted into the queue
+PASS  trusted native Send click is not intercepted into the queue
+PASS  trusted form submit is not intercepted into the queue
 PASS  route change resets generation evidence
 PASS  queue-edit typing does not enter normal draft persistence
 PASS  repeated Enter cannot fall through to native ChatGPT
@@ -333,7 +335,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.27
+- Userscript version: 1.3.28
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
