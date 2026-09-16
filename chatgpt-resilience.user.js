@@ -2771,6 +2771,8 @@
           const candidate = isConversationRequest(url, method);
           let ownerTxnId = '';
           let ownerRoute = '';
+          let ownerDispatchAt = 0;
+          let ownerPromptHash = '';
           if (candidate) {
             if (validSendIntent()) promoteSendIntent('network');
             const t = S.txn;
@@ -2778,6 +2780,8 @@
             if (t && now() - dispatchedAt <= CFG.networkOwnershipMs) {
               ownerTxnId = t.id;
               ownerRoute = S.route;
+              ownerDispatchAt = Number(t.dispatchAt || t.subturnAt || 0);
+              ownerPromptHash = String(t.currentPromptHash || '');
               S.lastNetworkAt = now();
               S.lastNetworkFailureAt = 0;
               S.lastNetworkFailureKind = '';
@@ -2787,7 +2791,10 @@
               saveTxn();
             }
           }
-          const owned = () => !!ownerTxnId && ownerRoute === S.route && S.txn?.id === ownerTxnId;
+          const owned = () => !!ownerTxnId && ownerRoute === S.route &&
+            S.txn?.id === ownerTxnId &&
+            Number(S.txn?.dispatchAt || S.txn?.subturnAt || 0) === ownerDispatchAt &&
+            String(S.txn?.currentPromptHash || '') === ownerPromptHash;
           try {
             const res = await orig(input, init);
             if (owned()) {
@@ -2837,6 +2844,8 @@
             if (t && now() - dispatchedAt <= CFG.networkOwnershipMs) {
               this.__cgr1TxnId = t.id;
               this.__cgr1Route = S.route;
+              this.__cgr1DispatchAt = Number(t.dispatchAt || t.subturnAt || 0);
+              this.__cgr1PromptHash = String(t.currentPromptHash || '');
               S.lastNetworkAt = now();
               S.lastNetworkFailureAt = 0;
               S.lastNetworkFailureKind = '';
@@ -2846,7 +2855,10 @@
               t.sendObserved = true;
               saveTxn();
 
-              const owned = () => this.__cgr1TxnId && this.__cgr1Route === S.route && S.txn?.id === this.__cgr1TxnId;
+              const owned = () => this.__cgr1TxnId && this.__cgr1Route === S.route &&
+                S.txn?.id === this.__cgr1TxnId &&
+                Number(S.txn?.dispatchAt || S.txn?.subturnAt || 0) === this.__cgr1DispatchAt &&
+                String(S.txn?.currentPromptHash || '') === this.__cgr1PromptHash;
               const fail = kind => {
                 if (!owned()) return;
                 this.__cgr1TransportFailed = true;
