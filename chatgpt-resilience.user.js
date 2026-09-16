@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.27
+// @version      1.3.28
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.27
+   * ChatGPT Resilience 1.3.28
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.27';
+  const VERSION = '1.3.28';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -2930,41 +2930,6 @@
     return false;
   }
 
-  function humanSendMustQueue() {
-    // The evaluator owns clearing S.generating. Human input may respect it or
-    // promote it from fresh busy evidence, but it never demotes it.
-    if (S.generating) return true;
-
-    // Input handlers may only promote idle -> generating from fresh independent
-    // evidence. The evaluator remains the sole owner of clearing S.generating.
-    const next = getComposerControlState();
-
-    // If the evaluator already considers the turn idle, a real idle composer
-    // control should remain usable immediately.
-    if (next.kind === 'voice' || (next.kind === 'send' && !next.hasDraft)) return false;
-
-    const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
-    const recentAssistantProgress = !!S.txn && now() - Number(S.lastAssistantProgressAt || 0) <= CFG.answerSettleMs;
-    const busy = next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
-      next.busyEvidence || longThinkingBusy || recentAssistantProgress;
-    if (!busy) return false;
-
-    S.composerControl = next;
-    S.generating = true;
-    S.lastGenerationEvidenceAt = now();
-    return true;
-  }
-
-  function interceptBusyHumanSend(input = getComposer()) {
-    if (!humanSendMustQueue()) return false;
-    if (hasComposerAttachments(input)) {
-      maybeNotify(`${APP}: wait for current response`, 'This message has attachments, so it cannot be queued safely. It was not sent.');
-      return true;
-    }
-    queueCurrentComposer();
-    return true;
-  }
-
   function installInputHooks() {
     document.addEventListener('input', e => {
       if (!S.projectActive || !isProjectUrl()) return;
@@ -3015,16 +2980,9 @@
       const hasAttachments = hasComposerAttachments(input);
       if (!norm(p) && !hasAttachments) return;
 
-      // Native Send and Enter obey the same queue rule. A busy message with
-      // attachments is blocked rather than sent because attachments cannot be
-      // reconstructed safely in the queue.
-      if (e.isTrusted && interceptBusyHumanSend(input)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        return;
-      }
-
-      // Attachment-only idle sends stay native; there is no reconstructable
+      // A trusted manual Send click is always immediate. Never convert it into
+      // queued work merely because ChatGPT is currently generating.
+      // Attachment-only sends also stay native; there is no reconstructable
       // text to journal as a transaction prompt.
       if (!norm(p)) return;
       if (e.isTrusted) cancelRecovery('human-send');
@@ -3044,32 +3002,17 @@
       if (S.queueEditingId) { e.preventDefault(); e.stopImmediatePropagation(); commitQueueEdit(); return; }
       if (S.actionInFlight) { e.preventDefault(); e.stopImmediatePropagation(); return; }
       if (e.ctrlKey) {
-        e.preventDefault(); e.stopImmediatePropagation();
-        const input = getComposer(); const p = promptText(composerText(input)); if (!norm(p)) return;
-        cancelRecovery('ctrl-enter');
-        const active = !!S.txn || S.generating;
-        const hadHib = !!S.hib;
-        const hadBlock = !!S.blockedReason;
-        dispatchPrompt(p, active ? 'ctrl-enter-steer' : 'ctrl-enter', { newLogicalTask: !active })
-          .then(ok => {
-            if (!ok) return;
-            if (hadHib && S.hib) clearHibernation('human-resume-confirmed', { suppressQueueKick: true });
-            if (hadBlock && S.blockedReason) clearBlock('ctrl-enter-confirmed');
-          })
-          .catch(err => log('ctrl-enter-error', { message: String(err?.message || err) }));
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        queueCurrentComposer();
         return;
       }
       if (hasComposerPopup(e.target)) return;
       const isHumanWaitReply = S.hib?.phase === 'wait-user' && !S.txn && !S.generating;
       const isBlockedReply = !!S.blockedReason && !S.generating;
-      if (!isHumanWaitReply && !isBlockedReply && interceptBusyHumanSend(e.target)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        return;
-      }
-      // Idle Enter remains native, but only records an ephemeral intent. If a
-      // slash/autocomplete UI or React swallows the keystroke, nothing durable is
-      // created and the intent simply expires.
+      // Plain Enter is always immediate/native, including while generation is
+      // active. We only journal a short-lived send intent around the native UI.
+      // If slash/autocomplete UI or React swallows the keystroke, the intent expires.
       const p = promptText(composerText(e.target));
       if (!norm(p)) return;
       setSendIntent(p, isBlockedReply ? 'blocked-human-reply' : isHumanWaitReply ? 'wait-user-reply' : 'native-enter', {
@@ -3087,14 +3030,8 @@
       const hasAttachments = hasComposerAttachments(input);
       if (!norm(p) && !hasAttachments) return;
 
-      // Form submit is a third native send path. Guard it with the same rule so
-      // keyboard, button, and submit events cannot disagree about generation.
-      if (e.isTrusted && !S.actionInFlight && interceptBusyHumanSend(input)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        return;
-      }
-
+      // Form submit is part of the native immediate-send path. Never convert a
+      // trusted submit into queued work merely because another answer is active.
       if (!norm(p)) return;
       if (!validSendIntent()) {
         setSendIntent(p, (S.generating || S.txn) ? 'native-submit-followup' : 'native-submit', {
