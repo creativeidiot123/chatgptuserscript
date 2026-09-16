@@ -37,11 +37,12 @@
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
-   *   - Retry/Try again/Regenerate controls are failure signals only; they are never clicked
+   *   - Retry/Try again controls are failure signals only; they are never clicked
+   *   - Regenerate is normal answer UI and is never treated as failure evidence
    *   - There is one continuation path: Stop if needed -> 10s grace -> literal "continue"
    *   - Runtime is hard-gated to https://chatgpt.com/g/* even across SPA navigation.
    *   - All task/queue/recovery state is tab-session local; tabs never coordinate or share ownership.
-   *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
+   *   - Retry / Regenerate are never clicked automatically. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
    *   - ChatGPT's maximum-conversation-length banner is ignored UI chrome.
@@ -128,10 +129,8 @@
     ],
     retry: [
       'button[data-testid*="retry" i]',
-      'button[data-testid*="regenerate" i]',
       'button[aria-label="Retry" i]',
       'button[aria-label="Try again" i]',
-      'button[aria-label^="Regenerate" i]',
     ],
     user: [
       '[data-message-author-role="user"]',
@@ -781,7 +780,7 @@
     return null;
   }
 
-  const RETRY_CONTROL_RE = /^(?:retry|try again|regenerate|regenerate response)$/i;
+  const RETRY_CONTROL_RE = /^(?:retry|try again)$/i;
 
   function retryControlLabel(el) {
     if (!el) return '';
@@ -794,7 +793,7 @@
     for (const value of values) {
       const v = norm(value || '');
       if (!v) continue;
-      if (RETRY_CONTROL_RE.test(v) || /^retry[-_ ]?button$/i.test(v) || /regenerate/i.test(v)) return v;
+      if (RETRY_CONTROL_RE.test(v) || /^retry[-_ ]?button$/i.test(v)) return v;
     }
     return '';
   }
@@ -3351,6 +3350,7 @@
       ['product error tail guard', ASSISTANT_ERROR_TAIL_RE.test('There was an error generating a response. Try again'), true],
       ['retry label exact', RETRY_CONTROL_RE.test('Retry'), true],
       ['try again label exact', RETRY_CONTROL_RE.test('Try again'), true],
+      ['regenerate is normal UI, not error evidence', RETRY_CONTROL_RE.test('Regenerate'), false],
       ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
       ['known long-thinking banner detected', isLongThinkingText('Our systems are thinking a bit more about this request'), true],
       ['exact still-thinking status detected', isLongThinkingText('Still thinking...'), true],
