@@ -78,6 +78,7 @@
     incompleteVerifyMs: 5 * 60_000,
     recoveryPauseMs: 10_000,
     recoveryStopQuietMs: 15_000,
+    longThinkingRecoveryMs: 10 * 60_000,
     intentionalStopNetworkSuppressMs: 15_000,
     composerMissingGraceMs: 12_000,
     sendConfirmMs: 18_000,
@@ -699,7 +700,16 @@
   function isTailRelevantElement(el) {
     if (!el?.isConnected) return false;
     const assistant = DC.lastAssistant;
-    if (!assistant?.isConnected) return true;
+    if (!assistant?.isConnected) {
+      const user = DC.lastUser;
+      if (!user?.isConnected) return false;
+      try {
+        if (!(user.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+        const form = composerForm(getComposer());
+        if (form && !(el.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+        return true;
+      } catch (_) { return false; }
+    }
     const turn = tailTurnRoot();
     if (turn?.contains?.(el) || assistant.contains?.(el)) return true;
 
@@ -937,8 +947,12 @@
 
   function collectErrorText(msgs = getMessages()) {
     const chunks = [];
-    const tail = msgs.lastAssistantText.slice(-1400);
-    if (tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
+    const assistantText = norm(msgs.lastAssistantText);
+    const tail = assistantText.slice(-1400);
+    // Product error messages are compact. Do not reinterpret the ending of a
+    // long, healthy assistant answer as ChatGPT error chrome just because it
+    // happens to contain phrases such as "network error" or "timed out".
+    if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
 
     const root = document.querySelector('main') || document;
     const alerts = qAll(SELECTORS.alerts, root).slice(-16);
@@ -1603,6 +1617,14 @@
     return true;
   }
 
+  function hasLiveGenerationEvidence() {
+    const next = getComposerControlState();
+    const recentAssistantProgress = !!S.txn &&
+      now() - Number(S.lastAssistantProgressAt || 0) < CFG.recoveryStopQuietMs;
+    return next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
+      next.busyEvidence || recentAssistantProgress;
+  }
+
   function postStopControlSettled(control = getComposerControlState()) {
     const c = control || {};
     if (c.kind === 'send' || c.kind === 'voice') return true;
@@ -1619,15 +1641,23 @@
     return false;
   }
 
-  async function stopThenContinue(reason = 'recovery') {
+  async function stopThenContinue(reason = 'recovery', options = {}) {
     if (!verifyTabContext()) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
     if (latestMarker(getMessages(true))) return false;
 
-    // Never interrupt a response that is still visibly making progress. Noisy
-    // network/UI signals may request recovery, but Stop is destructive and only
-    // becomes eligible after the current turn has been quiet for a real window.
+    // Stop is destructive. Ordinary error/UI/network recovery is never allowed
+    // to interrupt a turn that still has live generation evidence. Only paths
+    // with their own long quiet timeout (5m stuck / 10m long-thinking) may stop
+    // while ChatGPT still exposes a Stop/streaming control.
+    if (!options.allowBusyStop && hasLiveGenerationEvidence()) {
+      log('recovery-deferred-live-generation', { reason });
+      scheduleEvaluate(`recovery-live-generation:${reason}`, 1_000);
+      return false;
+    }
+
+    // Even proven-stuck recovery cannot interrupt fresh assistant output.
     if (t.assistantObserved || t.generationObserved) {
       const quietFor = now() - Number(S.lastAssistantProgressAt || 0);
       const waitFor = CFG.recoveryStopQuietMs - quietFor;
@@ -2298,9 +2328,14 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
     if (latestMarker(msgs)) return false;
 
-    // The purple long-thinking state requests recovery, but stopThenContinue()
-    // will not interrupt the turn while assistant output is still progressing.
-    if (longThinking) return stopThenContinue('long-thinking');
+    // Long-thinking is normal for hard requests. It becomes recoverable only
+    // after the banner has persisted for 10 minutes, matching the project rule.
+    // Fresh assistant output still vetoes Stop at the recovery boundary.
+    if (longThinking) {
+      const seenFor = now() - Number(S.longThinkingSeenAt || now());
+      if (seenFor < CFG.longThinkingRecoveryMs) return false;
+      return stopThenContinue('long-thinking-timeout', { allowBusyStop: true });
+    }
 
     const quietFor = now() - Math.max(
       S.lastAssistantProgressAt,
@@ -2309,7 +2344,7 @@
     );
 
     if (quietFor < CFG.incompleteVerifyMs) return false;
-    return stopThenContinue('stuck-5m');
+    return stopThenContinue('stuck-5m', { allowBusyStop: true });
   }
   async function evaluate(reason = 'event') {
     detectRouteChange();
@@ -2421,29 +2456,25 @@
       // this transaction/chat and never freeze unrelated project conversations.
       if (t.manualStopped || t.holdReason) { paintUI(); scheduleWatchdog(); return; }
 
-      // SPA composer remount/disappearance is a real failure class. Give React a
-      // short grace window, then preserve a pending recovery until the composer
-      // comes back instead of spinning, reloading, or losing the logical task.
+      // React may remount the composer during perfectly healthy generation.
+      // Missing/remounted composer state is never proof of a failed turn. It may
+      // only defer a recovery that already has independent error evidence.
       const composerNow = getComposer();
       if (!composerNow) {
         S.composerMissingSince ||= now();
         if (err && !['auth', 'anti-abuse', 'policy'].includes(err.id)) {
           S.pendingRecoveryReason = `error:${err.id}`;
-        } else if (longThinking) {
-          S.pendingRecoveryReason = 'long-thinking';
-        } else if (now() - S.composerMissingSince >= CFG.composerMissingGraceMs) {
-          S.pendingRecoveryReason ||= 'composer-missing';
+        } else if (longThinking &&
+                   now() - Number(S.longThinkingSeenAt || now()) >= CFG.longThinkingRecoveryMs) {
+          S.pendingRecoveryReason = 'long-thinking-timeout';
         }
         if (S.pendingRecoveryReason) S.controlFault = 'composer-missing';
         paintUI(); scheduleWatchdog(); return;
       }
 
       if (S.composerMissingSince) {
-        const missingFor = now() - S.composerMissingSince;
         S.composerMissingSince = 0;
-        if (missingFor >= CFG.composerMissingGraceMs && !S.pendingRecoveryReason) {
-          S.pendingRecoveryReason = 'composer-remounted';
-        }
+        if (!S.pendingRecoveryReason && S.controlFault === 'composer-missing') S.controlFault = '';
       }
 
       if (S.pendingRecoveryReason) {
@@ -2495,7 +2526,7 @@
         now() - S.lastAssistantProgressAt >= CFG.incompleteVerifyMs) {
       const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-5m');
       if (adopted) {
-        await stopThenContinue('untracked-stuck-5m');
+        await stopThenContinue('untracked-stuck-5m', { allowBusyStop: true });
         paintUI(true);
         scheduleWatchdog();
         return;
