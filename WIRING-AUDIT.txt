@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.24 — wiring / edge-case audit
+ChatGPT Resilience v1.3.25 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -51,6 +51,70 @@ Queue dispatch
 9. Once one queued item sends, its new user turn closes the DONE gate again.
 10. If the click is swallowed or the tab dies, the journal owns recovery; the
     future queue item is not duplicated.
+
+Healthy-answer continue audit
+-----------------------------
+Automatic literal "continue" can only originate from stopThenContinue(). The deep
+audit found these prior false-positive sources and closes each one:
+
+1. Composer Send/Voice transitions
+   - Formerly could trigger a 350 ms control-mismatch Stop.
+   - Removed in v1.3.24.
+
+2. Long-thinking banner
+   - Formerly requested recovery immediately.
+   - Now requires 10 continuous minutes before recovery is eligible.
+   - Ordinary prose containing "still thinking" no longer qualifies.
+
+3. Fetch/XHR aborts
+   - Formerly became recoverable network failures.
+   - Abort is now treated as ordinary cancellation noise.
+
+4. Broad/stale network ownership
+   - Conversation-like POST failures could belong to background or older work.
+   - Recovery network evidence is now accepted only for a request that started
+     within 15 seconds of the active dispatch and still matches route, logical
+     transaction, subturn dispatch timestamp, and current prompt hash.
+
+5. Previous-turn Retry/Regenerate UI
+   - A previous assistant turn could briefly remain DC.lastAssistant after the
+     next user turn appeared.
+   - Retry evidence now requires the real current assistant tail / current
+     user-to-composer corridor.
+   - Regenerate is normal answer UI and is never failure evidence.
+
+6. Assistant prose false positives
+   - Long/old assistant text ending in error-like wording could look like product
+     error chrome.
+   - Only the current assistant tail is considered, and prose-tail classification
+     is limited to compact product-error-sized messages.
+
+7. Composer remount
+   - A normal React composer disappearance/remount could manufacture
+     composer-missing / composer-remounted recovery.
+   - Composer lifecycle alone can no longer create a recovery reason; it only
+     defers independently proven recovery.
+
+8. Stale cross-turn state
+   - Long-thinking age and transient HTTP/network evidence could leak into the
+     next subturn.
+   - New sends/tasks reset those transient recovery signals.
+
+9. Error semantics
+   - Rate limits could fall through the generic continue path.
+   - Hard errors now block, rate limits pause, confirmed send errors are ignored,
+     and only recoverable errors may request continuation.
+
+Final destructive-recovery boundary:
+- Ordinary error/UI/network recovery cannot click Stop while independent live
+  generation evidence exists.
+- Even forced stuck recovery requires at least 15 seconds without fresh assistant
+  tail progress.
+- The only callers allowed to bypass the live-control veto are:
+    * 10-minute long-thinking timeout
+    * 5-minute tracked stuck timeout
+    * 5-minute untracked stuck timeout
+- Terminal DONE / HIBERNATE / WAIT_USER markers still hard-veto continuation.
 
 Generation detection
 --------------------
@@ -130,6 +194,14 @@ PASS  Voice without busy evidence -> idle
 PASS  busy evidence beats transient empty Send
 PASS  busy evidence beats transient Voice
 PASS  composer control changes alone cannot trigger Stop
+PASS  live assistant progress defers automatic Stop recovery
+PASS  fetch/XHR abort noise is not treated as a recovery failure
+PASS  ordinary "still thinking" prose does not trigger long-thinking recovery
+PASS  Regenerate is not retry/error evidence
+PASS  previous-turn Retry UI cannot own the new turn
+PASS  composer remount alone cannot create recovery
+PASS  stale network completions cannot cross subturn ownership
+PASS  rate limits pause instead of continuing
 PASS  queue pause state/API/UI fully absent
 PASS  sleeping hibernation can be overridden by explicit queued Send
 PASS  route change resets generation evidence
@@ -179,12 +251,31 @@ Mid-generation Stop protection
 - The old 350 ms control-mismatch Stop path was removed completely.
 - Healthy generation stays active when assistant DOM progress or streaming/busy
   evidence is still present, even if the composer transiently shows Send/Voice.
+- Even explicit recoverable signals cannot click Stop until assistant-tail
+  progress has been quiet for 15 seconds.
 - Missing terminal markers are recovered only through explicit error handling,
   the long-thinking path, or the five-minute quiet verifier.
 
+Recovery boundary
+-----------------
+- No automatic recovery may click Stop while the current assistant turn is still
+  visibly progressing.
+- Recoverable error, transport, long-thinking-timeout, verifier, and pending
+  recovery signals all funnel through stopThenContinue().
+- Ordinary recovery cannot Stop while live generation evidence exists.
+- Only the explicit 10-minute long-thinking and 5-minute stuck paths may bypass
+  the live-control veto, and even those still require 15 seconds without fresh
+  assistant-tail progress.
+- The five-minute stuck verifier naturally satisfies this guard.
+- Fetch/XHR aborts are ignored as normal request cancellation noise rather than
+  being promoted to recoverable network errors.
+
 Long-thinking recovery
 ----------------------
-- The exact ChatGPT "thinking a bit more" banner is immediate recovery evidence.
+- Known ChatGPT "thinking a bit more" product text starts a timer; it does not
+  request destructive recovery until it has remained visible for 10 minutes.
+- Generic prose containing "still thinking" is not enough. Only the known product
+  phrases or an element whose whole text is essentially "Still thinking..." count.
 - If the transaction journal is missing, the current visible user/assistant tail
   is adopted immediately instead of waiting for the generic five-minute orphan
   timeout.
@@ -225,7 +316,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.24
+- Userscript version: 1.3.25
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.

@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.24
+// @version      1.3.25
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.24
+   * ChatGPT Resilience 1.3.25
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -37,11 +37,12 @@
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
-   *   - Retry/Try again/Regenerate controls are failure signals only; they are never clicked
+   *   - Retry/Try again controls are failure signals only; they are never clicked
+   *   - Regenerate is normal answer UI and is never treated as failure evidence
    *   - There is one continuation path: Stop if needed -> 10s grace -> literal "continue"
    *   - Runtime is hard-gated to https://chatgpt.com/g/* even across SPA navigation.
    *   - All task/queue/recovery state is tab-session local; tabs never coordinate or share ownership.
-   *   - Retry / Regenerate are NOT used for confirmed turns. They can destroy partial work.
+   *   - Retry / Regenerate are never clicked automatically. They can destroy partial work.
    *   - A send is retried only when the original can be proven not to have landed.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
    *   - ChatGPT's maximum-conversation-length banner is ignored UI chrome.
@@ -55,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.24';
+  const VERSION = '1.3.25';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -77,9 +78,11 @@
     answerSettleMs: 1_200,
     incompleteVerifyMs: 5 * 60_000,
     recoveryPauseMs: 10_000,
+    recoveryStopQuietMs: 15_000,
+    longThinkingRecoveryMs: 10 * 60_000,
     intentionalStopNetworkSuppressMs: 15_000,
-    composerMissingGraceMs: 12_000,
     sendConfirmMs: 18_000,
+    networkOwnershipMs: 15_000,
     sendIntentMs: 8_000,
     postReloadReconcileMs: 5_000,
     interTurnSettleMs: 1_200,
@@ -126,10 +129,8 @@
     ],
     retry: [
       'button[data-testid*="retry" i]',
-      'button[data-testid*="regenerate" i]',
       'button[aria-label="Retry" i]',
       'button[aria-label="Try again" i]',
-      'button[aria-label^="Regenerate" i]',
     ],
     user: [
       '[data-message-author-role="user"]',
@@ -503,6 +504,9 @@
     S.pendingRecoveryReason = '';
     S.composerMissingSince = 0;
     S.controlFault = '';
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    DC.longThinkingNode = null;
     kickQueue(`txn-clear:${reason}`, 40);
   }
 
@@ -692,15 +696,32 @@
   }
 
   function tailTurnRoot() {
-    return DC.lastAssistant?.closest?.('[data-testid^="conversation-turn"],article') || DC.lastAssistant || null;
+    const assistant = DC.lastAssistant;
+    const user = DC.lastUser;
+    if (!assistant?.isConnected) return null;
+    if (user?.isConnected) {
+      try {
+        if (!(user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING)) return null;
+      } catch (_) { return null; }
+    }
+    return assistant.closest?.('[data-testid^="conversation-turn"],article') || assistant;
   }
 
   function isTailRelevantElement(el) {
     if (!el?.isConnected) return false;
     const assistant = DC.lastAssistant;
-    if (!assistant?.isConnected) return true;
     const turn = tailTurnRoot();
-    if (turn?.contains?.(el) || assistant.contains?.(el)) return true;
+    if (!turn) {
+      const user = DC.lastUser;
+      if (!user?.isConnected) return false;
+      try {
+        if (!(user.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+        const form = composerForm(getComposer());
+        if (form && !(el.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+        return true;
+      } catch (_) { return false; }
+    }
+    if (turn.contains?.(el) || assistant.contains?.(el)) return true;
 
     const ownTurn = el.closest?.('[data-testid^="conversation-turn"],article');
     if (ownTurn && turn && ownTurn !== turn) return false;
@@ -759,7 +780,7 @@
     return null;
   }
 
-  const RETRY_CONTROL_RE = /^(?:retry|try again|regenerate|regenerate response)$/i;
+  const RETRY_CONTROL_RE = /^(?:retry|try again)$/i;
 
   function retryControlLabel(el) {
     if (!el) return '';
@@ -772,7 +793,7 @@
     for (const value of values) {
       const v = norm(value || '');
       if (!v) continue;
-      if (RETRY_CONTROL_RE.test(v) || /^retry[-_ ]?button$/i.test(v) || /regenerate/i.test(v)) return v;
+      if (RETRY_CONTROL_RE.test(v) || /^retry[-_ ]?button$/i.test(v)) return v;
     }
     return '';
   }
@@ -888,7 +909,13 @@
     return decision;
   }
 
-  const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think|still thinking/i;
+  const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think/i;
+  const LONG_THINKING_EXACT_RE = /^still thinking(?:\.{3}|…)?$/i;
+
+  function isLongThinkingText(text) {
+    const t = norm(text);
+    return !!t && (isLongThinkingText(t) || LONG_THINKING_EXACT_RE.test(t));
+  }
   function findLongThinkingNotice() {
     // Preserve a previously discovered non-ARIA banner for as long as the exact
     // live node remains visible and still contains the status text. A static
@@ -898,7 +925,7 @@
       const t = norm(cached.textContent || '');
       const semanticStatus = cached.matches?.('[role="status"],[aria-live]');
       const outsideMessage = !cached.closest?.('[data-message-author-role]');
-      if ((semanticStatus || outsideMessage) && t.length <= 1200 && LONG_THINKING_RE.test(t)) return cached;
+      if ((semanticStatus || outsideMessage) && t.length <= 1200 && isLongThinkingText(t)) return cached;
     }
     DC.longThinkingNode = null;
     const root = document.querySelector('main');
@@ -909,7 +936,7 @@
         const el = nodes[i];
         if (!visible(el)) continue;
         const t = norm(el.textContent || '');
-        if (t.length <= 800 && LONG_THINKING_RE.test(t)) { DC.longThinkingNode = el; return el; }
+        if (t.length <= 800 && isLongThinkingText(t)) { DC.longThinkingNode = el; return el; }
       }
     } catch (_) {}
     return null;
@@ -930,8 +957,11 @@
 
   function collectErrorText(msgs = getMessages()) {
     const chunks = [];
-    const tail = msgs.lastAssistantText.slice(-1400);
-    if (tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
+    const assistantText = assistantIsCurrentTail(msgs) ? norm(msgs.lastAssistantText) : '';
+    const tail = assistantText.slice(-1400);
+    // Product error messages are compact. Do not reinterpret an old/long,
+    // healthy assistant answer as current ChatGPT error chrome.
+    if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
 
     const root = document.querySelector('main') || document;
     const alerts = qAll(SELECTORS.alerts, root).slice(-16);
@@ -1000,13 +1030,18 @@
     const dom = classifyError(collectErrorText(msgs));
     if (dom) return dom;
 
+    const liveGeneration = !!S.txn && hasLiveGenerationEvidence();
+
     const age = now() - Number(S.lastHttpStatusAt || 0);
     if (age < 20_000) {
       const http = classifyHttpStatus(S.lastHttpStatus);
-      if (http) return http;
+      // Hard/rate statuses remain meaningful. Recoverable HTTP noise is only
+      // actionable once the visible turn no longer looks alive.
+      if (http && (http.kind === 'hard' || http.kind === 'rate' || !liveGeneration)) return http;
     }
 
-    if (S.lastNetworkFailureAt && now() - S.lastNetworkFailureAt < 20_000 && !transportFailureSuppressed()) {
+    if (!liveGeneration && S.lastNetworkFailureAt &&
+        now() - S.lastNetworkFailureAt < 20_000 && !transportFailureSuppressed()) {
       return {
         id: S.lastNetworkFailureKind === 'timeout' ? 'timeout' : 'network',
         kind: 'continue',
@@ -1070,7 +1105,7 @@
 
     for (const candidate of candidates) {
       const text = norm(candidate.textContent || '');
-      if (text && text.length < 1200 && LONG_THINKING_RE.test(text)) {
+      if (text && text.length < 1200 && isLongThinkingText(text)) {
         DC.longThinkingNode = candidate;
         S.longThinkingSeenAt ||= now();
         S.longThinkingLastSeenAt = now();
@@ -1180,6 +1215,10 @@
     flushDraftSave();
     const p = promptText(prompt);
     if (!norm(p)) return null;
+    // A new human send starts a new transport epoch. Previous-turn transient
+    // HTTP/network failures must not poison this prompt before its request starts.
+    clearTransientNetworkError();
+    S.error = null;
     const msgs = getMessages(true);
     S.sendIntent = {
       route: S.route, prompt: p, hash: fnv1a(norm(p)), source, at: now(),
@@ -1306,6 +1345,9 @@
     // unrelated transaction that appeared during an await/race. Fail closed.
     if (S.txn) return null;
     S.txn = newTxn(p, source, queueItemId);
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    DC.longThinkingNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1335,6 +1377,9 @@
     t.manualStopped = false;
     t.holdReason = '';
     t.nextRecoveryAt = 0;
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    DC.longThinkingNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1596,6 +1641,15 @@
     return true;
   }
 
+  function hasLiveGenerationEvidence() {
+    const next = getComposerControlState();
+    const recentAssistantProgress = !!S.txn &&
+      now() - Number(S.lastAssistantProgressAt || 0) < CFG.recoveryStopQuietMs;
+    const longThinkingBusy = !!findLongThinkingNotice();
+    return next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
+      next.busyEvidence || longThinkingBusy || recentAssistantProgress;
+  }
+
   function postStopControlSettled(control = getComposerControlState()) {
     const c = control || {};
     if (c.kind === 'send' || c.kind === 'voice') return true;
@@ -1612,11 +1666,32 @@
     return false;
   }
 
-  async function stopThenContinue(reason = 'recovery') {
+  async function stopThenContinue(reason = 'recovery', options = {}) {
     if (!verifyTabContext()) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
-    if (latestMarker(getMessages())) return false;
+    if (latestMarker(getMessages(true))) return false;
+
+    // Stop is destructive. Ordinary error/UI/network recovery is never allowed
+    // to interrupt a turn that still has live generation evidence. Only paths
+    // with their own long quiet timeout (5m stuck / 10m long-thinking) may stop
+    // while ChatGPT still exposes a Stop/streaming control.
+    if (!options.allowBusyStop && hasLiveGenerationEvidence()) {
+      log('recovery-deferred-live-generation', { reason });
+      scheduleEvaluate(`recovery-live-generation:${reason}`, 1_000);
+      return false;
+    }
+
+    // Even proven-stuck recovery cannot interrupt fresh assistant output.
+    if (t.assistantObserved || t.generationObserved) {
+      const quietFor = now() - Number(S.lastAssistantProgressAt || 0);
+      const waitFor = CFG.recoveryStopQuietMs - quietFor;
+      if (waitFor > 0) {
+        log('recovery-deferred-live-progress', { reason, quietFor, waitFor });
+        scheduleEvaluate(`recovery-live-progress:${reason}`, waitFor + 100);
+        return false;
+      }
+    }
 
     const recoveryInput = getComposer();
     if (!recoveryInput) {
@@ -2257,9 +2332,8 @@
     const t = S.txn;
     if (!err) return false;
 
-    // These are not recoverable generation glitches. Do not automate through
-    // authentication, anti-abuse, policy, or hard conversation-context gates.
-    if (['auth', 'anti-abuse', 'policy'].includes(err.id)) {
+    // Hard states need a human. Never automate through them.
+    if (err.kind === 'hard') {
       blockAutomation(err.id, `${err.id} needs human attention. Queue and task state are preserved.`);
       return true;
     }
@@ -2268,8 +2342,19 @@
     if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
     if (t.manualStopped) return false;
 
-    // Every other recognized ChatGPT/product error follows one deterministic
-    // recovery path: Stop if possible -> fully idle -> wait 10s -> "continue".
+    // Rate limits are a scheduler condition, not a broken generation. Preserve
+    // the live answer and wait instead of pressing continue into the limit.
+    if (err.kind === 'rate') {
+      pauseUntil(now() + rateWaitMs(err.sourceText), 'rate-limit');
+      return true;
+    }
+
+    // Once the user turn is confirmed, a message-send error belongs to stale
+    // send UI/network state and is not evidence that the active answer failed.
+    if (err.kind === 'send') return false;
+
+    // Recoverable errors use one deterministic path, but the recovery boundary
+    // itself refuses to interrupt a visibly progressing assistant turn.
     resetVerification(`error:${err.id}`);
     return stopThenContinue(`error:${err.id}`);
   }
@@ -2278,9 +2363,14 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
     if (latestMarker(msgs)) return false;
 
-    // The purple "our systems are thinking a bit more..." state is treated as
-    // a failed turn immediately: Stop -> 10 seconds -> literal continue.
-    if (longThinking) return stopThenContinue('long-thinking');
+    // Long-thinking is normal for hard requests. It becomes recoverable only
+    // after the banner has persisted for 10 minutes, matching the project rule.
+    // Fresh assistant output still vetoes Stop at the recovery boundary.
+    if (longThinking) {
+      const seenFor = now() - Number(S.longThinkingSeenAt || now());
+      if (seenFor < CFG.longThinkingRecoveryMs) return false;
+      return stopThenContinue('long-thinking-timeout', { allowBusyStop: true });
+    }
 
     const quietFor = now() - Math.max(
       S.lastAssistantProgressAt,
@@ -2289,7 +2379,7 @@
     );
 
     if (quietFor < CFG.incompleteVerifyMs) return false;
-    return stopThenContinue('stuck-5m');
+    return stopThenContinue('stuck-5m', { allowBusyStop: true });
   }
   async function evaluate(reason = 'event') {
     detectRouteChange();
@@ -2401,29 +2491,25 @@
       // this transaction/chat and never freeze unrelated project conversations.
       if (t.manualStopped || t.holdReason) { paintUI(); scheduleWatchdog(); return; }
 
-      // SPA composer remount/disappearance is a real failure class. Give React a
-      // short grace window, then preserve a pending recovery until the composer
-      // comes back instead of spinning, reloading, or losing the logical task.
+      // React may remount the composer during perfectly healthy generation.
+      // Missing/remounted composer state is never proof of a failed turn. It may
+      // only defer a recovery that already has independent error evidence.
       const composerNow = getComposer();
       if (!composerNow) {
         S.composerMissingSince ||= now();
         if (err && !['auth', 'anti-abuse', 'policy'].includes(err.id)) {
           S.pendingRecoveryReason = `error:${err.id}`;
-        } else if (longThinking) {
-          S.pendingRecoveryReason = 'long-thinking';
-        } else if (now() - S.composerMissingSince >= CFG.composerMissingGraceMs) {
-          S.pendingRecoveryReason ||= 'composer-missing';
+        } else if (longThinking &&
+                   now() - Number(S.longThinkingSeenAt || now()) >= CFG.longThinkingRecoveryMs) {
+          S.pendingRecoveryReason = 'long-thinking-timeout';
         }
         if (S.pendingRecoveryReason) S.controlFault = 'composer-missing';
         paintUI(); scheduleWatchdog(); return;
       }
 
       if (S.composerMissingSince) {
-        const missingFor = now() - S.composerMissingSince;
         S.composerMissingSince = 0;
-        if (missingFor >= CFG.composerMissingGraceMs && !S.pendingRecoveryReason) {
-          S.pendingRecoveryReason = 'composer-remounted';
-        }
+        if (!S.pendingRecoveryReason && S.controlFault === 'composer-missing') S.controlFault = '';
       }
 
       if (S.pendingRecoveryReason) {
@@ -2475,7 +2561,7 @@
         now() - S.lastAssistantProgressAt >= CFG.incompleteVerifyMs) {
       const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-5m');
       if (adopted) {
-        await stopThenContinue('untracked-stuck-5m');
+        await stopThenContinue('untracked-stuck-5m', { allowBusyStop: true });
         paintUI(true);
         scheduleWatchdog();
         return;
@@ -2682,19 +2768,36 @@
         UW.fetch = async function (input, init = {}) {
           const url = typeof input === 'string' ? input : input?.url || '';
           const method = init?.method || input?.method || 'GET';
-          const tracked = isConversationRequest(url, method);
-          if (tracked) {
-            S.lastNetworkAt = now();
-            S.lastNetworkFailureAt = 0;
-            S.lastNetworkFailureKind = '';
-            S.lastHttpStatus = 0;
-            S.lastHttpStatusAt = 0;
+          const candidate = isConversationRequest(url, method);
+          let ownerTxnId = '';
+          let ownerRoute = '';
+          let ownerDispatchAt = 0;
+          let ownerPromptHash = '';
+          if (candidate) {
             if (validSendIntent()) promoteSendIntent('network');
-            if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
+            const t = S.txn;
+            const dispatchedAt = Number(t?.dispatchAt || t?.subturnAt || 0);
+            if (t && now() - dispatchedAt <= CFG.networkOwnershipMs) {
+              ownerTxnId = t.id;
+              ownerRoute = S.route;
+              ownerDispatchAt = Number(t.dispatchAt || t.subturnAt || 0);
+              ownerPromptHash = String(t.currentPromptHash || '');
+              S.lastNetworkAt = now();
+              S.lastNetworkFailureAt = 0;
+              S.lastNetworkFailureKind = '';
+              S.lastHttpStatus = 0;
+              S.lastHttpStatusAt = 0;
+              t.sendObserved = true;
+              saveTxn();
+            }
           }
+          const owned = () => !!ownerTxnId && ownerRoute === S.route &&
+            S.txn?.id === ownerTxnId &&
+            Number(S.txn?.dispatchAt || S.txn?.subturnAt || 0) === ownerDispatchAt &&
+            String(S.txn?.currentPromptHash || '') === ownerPromptHash;
           try {
             const res = await orig(input, init);
-            if (tracked) {
+            if (owned()) {
               S.lastNetworkAt = now();
               S.lastNetworkFailureAt = 0;
               S.lastNetworkFailureKind = '';
@@ -2708,7 +2811,14 @@
             }
             return res;
           } catch (e) {
-            if (tracked) noteTransportFailure(e?.name === 'AbortError' ? 'abort' : 'fetch');
+            if (owned()) {
+              if (e?.name === 'AbortError') {
+                S.lastNetworkAt = now();
+                log('transport-abort-ignored', { transport: 'fetch' });
+              } else {
+                noteTransportFailure('fetch');
+              }
+            }
             throw e;
           }
         };
@@ -2726,38 +2836,57 @@
           return open.call(this, method, url, ...rest);
         };
         X.prototype.send = function (...args) {
-          const tracked = isConversationRequest(this.__cgr1Url, this.__cgr1Method);
-          if (tracked) {
-            S.lastNetworkAt = now();
-            S.lastNetworkFailureAt = 0;
-            S.lastNetworkFailureKind = '';
-            S.lastHttpStatus = 0;
-            S.lastHttpStatusAt = 0;
-            this.__cgr1TransportFailed = false;
+          const candidate = isConversationRequest(this.__cgr1Url, this.__cgr1Method);
+          if (candidate) {
             if (validSendIntent()) promoteSendIntent('network');
-            if (S.txn && now() - Number(S.txn.dispatchAt || S.txn.subturnAt || 0) < 10_000) { S.txn.sendObserved = true; saveTxn(); }
-
-            const fail = kind => {
-              this.__cgr1TransportFailed = true;
-              noteTransportFailure(kind);
-            };
-            this.addEventListener('error', () => fail('xhr-error'), { once: true });
-            this.addEventListener('timeout', () => fail('timeout'), { once: true });
-            this.addEventListener('abort', () => fail('abort'), { once: true });
-            this.addEventListener('loadend', () => {
+            const t = S.txn;
+            const dispatchedAt = Number(t?.dispatchAt || t?.subturnAt || 0);
+            if (t && now() - dispatchedAt <= CFG.networkOwnershipMs) {
+              this.__cgr1TxnId = t.id;
+              this.__cgr1Route = S.route;
+              this.__cgr1DispatchAt = Number(t.dispatchAt || t.subturnAt || 0);
+              this.__cgr1PromptHash = String(t.currentPromptHash || '');
               S.lastNetworkAt = now();
-              S.lastHttpStatus = Number(this.status || 0);
-              S.lastHttpStatusAt = now();
-              if (!this.__cgr1TransportFailed && S.lastHttpStatus > 0) {
-                S.lastNetworkFailureAt = 0;
-                S.lastNetworkFailureKind = '';
-              }
-              if (S.lastHttpStatus === 429) {
-                const retryMs = parseRetryAfterMs(this.getResponseHeader?.('Retry-After'));
-                if (retryMs) S.rateRetryAt = now() + retryMs;
-              }
-              scheduleEvaluate('xhr-end', 80);
-            }, { once: true });
+              S.lastNetworkFailureAt = 0;
+              S.lastNetworkFailureKind = '';
+              S.lastHttpStatus = 0;
+              S.lastHttpStatusAt = 0;
+              this.__cgr1TransportFailed = false;
+              t.sendObserved = true;
+              saveTxn();
+
+              const owned = () => this.__cgr1TxnId && this.__cgr1Route === S.route &&
+                S.txn?.id === this.__cgr1TxnId &&
+                Number(S.txn?.dispatchAt || S.txn?.subturnAt || 0) === this.__cgr1DispatchAt &&
+                String(S.txn?.currentPromptHash || '') === this.__cgr1PromptHash;
+              const fail = kind => {
+                if (!owned()) return;
+                this.__cgr1TransportFailed = true;
+                noteTransportFailure(kind);
+              };
+              this.addEventListener('error', () => fail('xhr-error'), { once: true });
+              this.addEventListener('timeout', () => fail('timeout'), { once: true });
+              this.addEventListener('abort', () => {
+                if (!owned()) return;
+                S.lastNetworkAt = now();
+                log('transport-abort-ignored', { transport: 'xhr' });
+              }, { once: true });
+              this.addEventListener('loadend', () => {
+                if (!owned()) return;
+                S.lastNetworkAt = now();
+                S.lastHttpStatus = Number(this.status || 0);
+                S.lastHttpStatusAt = now();
+                if (!this.__cgr1TransportFailed && S.lastHttpStatus > 0) {
+                  S.lastNetworkFailureAt = 0;
+                  S.lastNetworkFailureKind = '';
+                }
+                if (S.lastHttpStatus === 429) {
+                  const retryMs = parseRetryAfterMs(this.getResponseHeader?.('Retry-After'));
+                  if (retryMs) S.rateRetryAt = now() + retryMs;
+                }
+                scheduleEvaluate('xhr-end', 80);
+              }, { once: true });
+            }
           }
           return send.apply(this, args);
         };
@@ -3233,7 +3362,11 @@
       ['product error tail guard', ASSISTANT_ERROR_TAIL_RE.test('There was an error generating a response. Try again'), true],
       ['retry label exact', RETRY_CONTROL_RE.test('Retry'), true],
       ['try again label exact', RETRY_CONTROL_RE.test('Try again'), true],
+      ['regenerate is normal UI, not error evidence', RETRY_CONTROL_RE.test('Regenerate'), false],
       ['ordinary retry prose is not exact control', RETRY_CONTROL_RE.test('I will retry this operation'), false],
+      ['known long-thinking banner detected', isLongThinkingText('Our systems are thinking a bit more about this request'), true],
+      ['exact still-thinking status detected', isLongThinkingText('Still thinking...'), true],
+      ['ordinary still-thinking prose ignored', isLongThinkingText('I am still thinking about how to structure this answer'), false],
       ['queue head is first future message', firstQueueItem([{id:'a'},{id:'b'}])?.id, 'a'],
       ['empty queue has no head', firstQueueItem([]), null],
       ['draft Send preserves active generation until draft clears', generationDecision({ kind:'send', hasDraft:true, busyEvidence:false }, true), true],
