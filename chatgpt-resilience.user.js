@@ -1074,12 +1074,11 @@
       };
     }
 
-    const picked = pickError(dom, http, retryErr, transport);
-
-    // Once the user turn is visibly confirmed, a message-send error is stale
-    // send chrome rather than evidence that the active assistant generation failed.
-    if (picked?.kind === 'send' && S.txn?.userTurnConfirmed) return null;
-    return picked;
+    const candidates = [dom, http, retryErr, transport].filter(Boolean);
+    const usable = S.txn?.userTurnConfirmed
+      ? candidates.filter(err => err.kind !== 'send')
+      : candidates;
+    return pickError(...usable);
   }
 
   function hasComposerAttachments(input = getComposer()) {
@@ -1596,15 +1595,40 @@
 
       if (!navigator.onLine) return false;
 
-      // Recovery continue gets one final marker veto after every await and
-      // immediately before synchronous journaling + native Send. From here to
-      // action.run() there is no await, so a terminal marker cannot race in.
+      // Recovery continue gets one final synchronous veto after every await and
+      // immediately before journaling + native Send. From here to action.run()
+      // there is no await, so DOM/network state cannot interleave with the click.
       if (options.abortOnTerminalMarker) {
-        const terminal = latestMarker(getMessages(true));
+        const freshMsgs = getMessages(true);
+        const terminal = latestMarker(freshMsgs);
         if (terminal) {
           if (norm(composerText(input)) === norm(p)) clearComposer(input);
           log('dispatch-abort-terminal-marker', { source, marker: terminal });
           scheduleEvaluate(`dispatch-terminal:${terminal}`, 0);
+          return false;
+        }
+
+        if (options.expectedAssistantSig &&
+            signature(freshMsgs.lastAssistantText) !== options.expectedAssistantSig) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          S.lastAssistantProgressAt = now();
+          log('dispatch-abort-assistant-progress', { source });
+          scheduleEvaluate('dispatch-assistant-progress', 0);
+          return false;
+        }
+
+        if (!postStopControlSettled()) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          log('dispatch-abort-generation-restarted', { source });
+          scheduleEvaluate('dispatch-generation-restarted', 0);
+          return false;
+        }
+
+        const blocker = currentError(freshMsgs);
+        if (blocker && ['hard', 'rate', 'reload', 'send'].includes(blocker.kind)) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          log('dispatch-abort-error-state', { source, id: blocker.id, kind: blocker.kind });
+          scheduleEvaluate(`dispatch-error:${blocker.id}`, 0);
           return false;
         }
       }
@@ -1662,9 +1686,11 @@
     // let its suppression window hide a genuine failure of the new continuation.
     S.suppressTransportErrorsUntil = 0;
     const nextCount = Number(t.continueCount || 0) + 1;
+    const expectedAssistantSig = signature(getMessages(true).lastAssistantText);
     const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, {
       newLogicalTask: false,
       abortOnTerminalMarker: true,
+      expectedAssistantSig,
     });
     if (!ok || !S.txn) return false;
     S.txn.continueCount = nextCount;
@@ -2334,7 +2360,10 @@
   async function reloadForRecovery(reason) {
     const t = S.txn;
     if (!t || S.actionInFlight || isPaused()) return false;
-    if (Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) return false;
+    if (Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
+      blockAutomation('reload-safety-cap', 'This task still cannot recover after the maximum controlled reloads. Queue and task state are preserved.');
+      return false;
+    }
     if (t.lastReloadAt && now() - t.lastReloadAt < CFG.reloadCooldownMs) return false;
     const expectedTxnId = t.id;
     S.actionInFlight = true;
@@ -2344,7 +2373,10 @@
       if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
       S.txn = diskTxn;
       const live = S.txn;
-      if (Number(live.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) return false;
+      if (Number(live.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
+        blockAutomation('reload-safety-cap', 'This task still cannot recover after the maximum controlled reloads. Queue and task state are preserved.');
+        return false;
+      }
       if (live.lastReloadAt && now() - live.lastReloadAt < CFG.reloadCooldownMs) return false;
       live.reloadCount = Number(live.reloadCount || 0) + 1;
       live.lastReloadAt = now();
@@ -3446,6 +3478,7 @@
       ['hard outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'auth',kind:'hard'})?.id, 'auth'],
       ['rate outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'rate',kind:'rate'})?.id, 'rate'],
       ['reload outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'load',kind:'reload'})?.id, 'load'],
+      ['send outranks retry before confirmation', pickError({id:'retry',kind:'continue'},{id:'send',kind:'send'})?.id, 'send'],
       ['rendered product error may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'dom'}), true],
       ['retry control may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'retry'}), true],
       ['transport error cannot bypass live-control veto', errorAllowsBusyStop({kind:'continue',source:'transport'}), false],
