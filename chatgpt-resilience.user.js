@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.24
+// @version      1.3.25
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.24
+   * ChatGPT Resilience 1.3.25
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -55,7 +55,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.24';
+  const VERSION = '1.3.25';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -77,6 +77,7 @@
     answerSettleMs: 1_200,
     incompleteVerifyMs: 5 * 60_000,
     recoveryPauseMs: 10_000,
+    recoveryStopQuietMs: 15_000,
     intentionalStopNetworkSuppressMs: 15_000,
     composerMissingGraceMs: 12_000,
     sendConfirmMs: 18_000,
@@ -1616,7 +1617,20 @@
     if (!verifyTabContext()) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
-    if (latestMarker(getMessages())) return false;
+    if (latestMarker(getMessages(true))) return false;
+
+    // Never interrupt a response that is still visibly making progress. Noisy
+    // network/UI signals may request recovery, but Stop is destructive and only
+    // becomes eligible after the current turn has been quiet for a real window.
+    if (t.assistantObserved || t.generationObserved) {
+      const quietFor = now() - Number(S.lastAssistantProgressAt || 0);
+      const waitFor = CFG.recoveryStopQuietMs - quietFor;
+      if (waitFor > 0) {
+        log('recovery-deferred-live-progress', { reason, quietFor, waitFor });
+        scheduleEvaluate(`recovery-live-progress:${reason}`, waitFor + 100);
+        return false;
+      }
+    }
 
     const recoveryInput = getComposer();
     if (!recoveryInput) {
@@ -2268,8 +2282,8 @@
     if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
     if (t.manualStopped) return false;
 
-    // Every other recognized ChatGPT/product error follows one deterministic
-    // recovery path: Stop if possible -> fully idle -> wait 10s -> "continue".
+    // Recoverable errors use one deterministic path, but the recovery boundary
+    // itself refuses to interrupt a visibly progressing assistant turn.
     resetVerification(`error:${err.id}`);
     return stopThenContinue(`error:${err.id}`);
   }
@@ -2278,8 +2292,8 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
     if (latestMarker(msgs)) return false;
 
-    // The purple "our systems are thinking a bit more..." state is treated as
-    // a failed turn immediately: Stop -> 10 seconds -> literal continue.
+    // The purple long-thinking state requests recovery, but stopThenContinue()
+    // will not interrupt the turn while assistant output is still progressing.
     if (longThinking) return stopThenContinue('long-thinking');
 
     const quietFor = now() - Math.max(
@@ -2708,7 +2722,14 @@
             }
             return res;
           } catch (e) {
-            if (tracked) noteTransportFailure(e?.name === 'AbortError' ? 'abort' : 'fetch');
+            if (tracked) {
+              if (e?.name === 'AbortError') {
+                S.lastNetworkAt = now();
+                log('transport-abort-ignored', { transport: 'fetch' });
+              } else {
+                noteTransportFailure('fetch');
+              }
+            }
             throw e;
           }
         };
@@ -2743,7 +2764,10 @@
             };
             this.addEventListener('error', () => fail('xhr-error'), { once: true });
             this.addEventListener('timeout', () => fail('timeout'), { once: true });
-            this.addEventListener('abort', () => fail('abort'), { once: true });
+            this.addEventListener('abort', () => {
+              S.lastNetworkAt = now();
+              log('transport-abort-ignored', { transport: 'xhr' });
+            }, { once: true });
             this.addEventListener('loadend', () => {
               S.lastNetworkAt = now();
               S.lastHttpStatus = Number(this.status || 0);
