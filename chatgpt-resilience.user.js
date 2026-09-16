@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.26
+// @version      1.3.27
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.26
+   * ChatGPT Resilience 1.3.27
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -32,7 +32,7 @@
    *   [[CGR_WAIT_USER]]            suspend the logical task for human input
    *
    * Recovery policy:
-   *   - A confirmed unfinished turn with no text/control progress for 5 minutes
+   *   - A confirmed unfinished turn with no text/control progress for 15 minutes
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
    *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.26';
+  const VERSION = '1.3.27';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -76,7 +76,7 @@
     tailDebounceMs: 300,
     draftWriteDebounceMs: 600,
     answerSettleMs: 1_200,
-    incompleteVerifyMs: 5 * 60_000,
+    incompleteVerifyMs: 15 * 60_000,
     recoveryPauseMs: 10_000,
     recoveryStopQuietMs: 15_000,
     longThinkingRecoveryMs: 10 * 60_000,
@@ -2383,7 +2383,7 @@
     );
 
     if (quietFor < CFG.incompleteVerifyMs) return false;
-    return stopThenContinue('stuck-5m', { allowBusyStop: true });
+    return stopThenContinue('stuck-15m', { allowBusyStop: true });
   }
   async function evaluate(reason = 'event') {
     detectRouteChange();
@@ -2549,7 +2549,7 @@
       }
 
       // Idle + confirmed + no terminal marker remains unfinished. The verifier
-      // now waits five full quiet minutes, then uses the same Stop/10s/continue path.
+      // now waits fifteen full quiet minutes, then uses the same Stop/10s/continue path.
       if (!marker) {
         armVerification(msgs, 'missing-terminal-marker');
         await maybeFinishVerification(msgs, err);
@@ -2558,14 +2558,14 @@
     }
 
     // A journal can be missing after installation/reload while the rendered tail
-    // remains unfinished. The same five-minute no-progress rule may adopt that
+    // remains unfinished. The same fifteen-minute no-progress rule may adopt that
     // current tail, but never an active hibernation or a safety-blocked response.
     if (!S.txn && !S.hib && !marker && assistantIsCurrentTail(msgs) && msgs.lastUserText &&
         !['auth', 'anti-abuse', 'policy'].includes(err?.id || '') &&
         now() - S.lastAssistantProgressAt >= CFG.incompleteVerifyMs) {
-      const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-5m');
+      const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-15m');
       if (adopted) {
-        await stopThenContinue('untracked-stuck-5m', { allowBusyStop: true });
+        await stopThenContinue('untracked-stuck-15m', { allowBusyStop: true });
         paintUI(true);
         scheduleWatchdog();
         return;
