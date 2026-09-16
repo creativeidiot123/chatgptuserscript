@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.25
+// @version      1.3.26
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.25
+   * ChatGPT Resilience 1.3.26
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.25';
+  const VERSION = '1.3.26';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1638,6 +1638,10 @@
     S.txn.nextRecoveryAt = now() + CFG.recoveryPauseMs;
     saveTxn();
     log('literal-continue', { reason, count: nextCount, cooldown: CFG.recoveryPauseMs });
+    maybeNotify(
+      `${APP}: continue #${nextCount}/${CFG.maxContinuesPerLogicalTask}`,
+      `Reason: ${String(reason || 'incomplete')}`,
+    );
     return true;
   }
 
