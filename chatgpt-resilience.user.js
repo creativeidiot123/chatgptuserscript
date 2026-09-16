@@ -889,7 +889,13 @@
     return decision;
   }
 
-  const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think|still thinking/i;
+  const LONG_THINKING_RE = /our systems are thinking a bit more about this request|thinking a bit more about this request|taking a bit longer to think/i;
+  const LONG_THINKING_EXACT_RE = /^still thinking(?:\.{3}|…)?$/i;
+
+  function isLongThinkingText(text) {
+    const t = norm(text);
+    return !!t && (isLongThinkingText(t) || LONG_THINKING_EXACT_RE.test(t));
+  }
   function findLongThinkingNotice() {
     // Preserve a previously discovered non-ARIA banner for as long as the exact
     // live node remains visible and still contains the status text. A static
@@ -899,7 +905,7 @@
       const t = norm(cached.textContent || '');
       const semanticStatus = cached.matches?.('[role="status"],[aria-live]');
       const outsideMessage = !cached.closest?.('[data-message-author-role]');
-      if ((semanticStatus || outsideMessage) && t.length <= 1200 && LONG_THINKING_RE.test(t)) return cached;
+      if ((semanticStatus || outsideMessage) && t.length <= 1200 && isLongThinkingText(t)) return cached;
     }
     DC.longThinkingNode = null;
     const root = document.querySelector('main');
@@ -910,7 +916,7 @@
         const el = nodes[i];
         if (!visible(el)) continue;
         const t = norm(el.textContent || '');
-        if (t.length <= 800 && LONG_THINKING_RE.test(t)) { DC.longThinkingNode = el; return el; }
+        if (t.length <= 800 && isLongThinkingText(t)) { DC.longThinkingNode = el; return el; }
       }
     } catch (_) {}
     return null;
@@ -1071,7 +1077,7 @@
 
     for (const candidate of candidates) {
       const text = norm(candidate.textContent || '');
-      if (text && text.length < 1200 && LONG_THINKING_RE.test(text)) {
+      if (text && text.length < 1200 && isLongThinkingText(text)) {
         DC.longThinkingNode = candidate;
         S.longThinkingSeenAt ||= now();
         S.longThinkingLastSeenAt = now();
