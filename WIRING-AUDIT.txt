@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.26 — wiring / edge-case audit
+ChatGPT Resilience v1.3.27 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -112,8 +112,8 @@ Final destructive-recovery boundary:
   tail progress.
 - The only callers allowed to bypass the live-control veto are:
     * 10-minute long-thinking timeout
-    * 5-minute tracked stuck timeout
-    * 5-minute untracked stuck timeout
+    * 15-minute tracked stuck timeout
+    * 15-minute untracked stuck timeout
 - Terminal DONE / HIBERNATE / WAIT_USER markers still hard-veto continuation.
 
 Generation detection
@@ -263,7 +263,7 @@ Recovery boundary
 - Recoverable error, transport, long-thinking-timeout, verifier, and pending
   recovery signals all funnel through stopThenContinue().
 - Ordinary recovery cannot Stop while live generation evidence exists.
-- Only the explicit 10-minute long-thinking and 5-minute stuck paths may bypass
+- Only the explicit 10-minute long-thinking and 15-minute stuck paths may bypass
   the live-control veto, and even those still require 15 seconds without fresh
   assistant-tail progress.
 - The five-minute stuck verifier naturally satisfies this guard.
@@ -304,6 +304,15 @@ Notifications
   vetoed, or failed continuation attempts do not produce false diagnostics.
 - [[CGR_HIBERNATE_GITHUB_10M]] does not notify.
 
+Blind stuck timeout
+-------------------
+- The generic unfinished-turn timeout is now 15 minutes instead of 5 minutes.
+- This applies consistently to tracked stuck generation, idle missing-marker
+  verification, and untracked orphan-turn adoption.
+- Diagnostic reasons were renamed to stuck-15m / untracked-stuck-15m so continue
+  notifications identify the new timeout clearly.
+- The unrelated two-reloads-per-5-minutes safety window is unchanged.
+
 Continuation safety
 -------------------
 - A logical task may auto-send literal "continue" up to 16 times.
@@ -324,7 +333,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.26
+- Userscript version: 1.3.27
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
