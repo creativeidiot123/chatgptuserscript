@@ -505,6 +505,9 @@
     S.pendingRecoveryReason = '';
     S.composerMissingSince = 0;
     S.controlFault = '';
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    DC.longThinkingNode = null;
     kickQueue(`txn-clear:${reason}`, 40);
   }
 
@@ -1213,6 +1216,10 @@
     flushDraftSave();
     const p = promptText(prompt);
     if (!norm(p)) return null;
+    // A new human send starts a new transport epoch. Previous-turn transient
+    // HTTP/network failures must not poison this prompt before its request starts.
+    clearTransientNetworkError();
+    S.error = null;
     const msgs = getMessages(true);
     S.sendIntent = {
       route: S.route, prompt: p, hash: fnv1a(norm(p)), source, at: now(),
@@ -1339,6 +1346,9 @@
     // unrelated transaction that appeared during an await/race. Fail closed.
     if (S.txn) return null;
     S.txn = newTxn(p, source, queueItemId);
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    DC.longThinkingNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1368,6 +1378,9 @@
     t.manualStopped = false;
     t.holdReason = '';
     t.nextRecoveryAt = 0;
+    S.longThinkingSeenAt = 0;
+    S.longThinkingLastSeenAt = 0;
+    DC.longThinkingNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1633,8 +1646,9 @@
     const next = getComposerControlState();
     const recentAssistantProgress = !!S.txn &&
       now() - Number(S.lastAssistantProgressAt || 0) < CFG.recoveryStopQuietMs;
+    const longThinkingBusy = !!findLongThinkingNotice();
     return next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
-      next.busyEvidence || recentAssistantProgress;
+      next.busyEvidence || longThinkingBusy || recentAssistantProgress;
   }
 
   function postStopControlSettled(control = getComposerControlState()) {
