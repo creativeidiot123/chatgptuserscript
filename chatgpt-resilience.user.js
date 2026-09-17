@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.28
+// @version      1.3.29
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.28
+   * ChatGPT Resilience 1.3.29
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -35,7 +35,7 @@
    *   - A confirmed unfinished turn with no text/control progress for 15 minutes
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
-   *   - Long-thinking is a separate state from ordinary product/error recovery
+   *   - The exact long-thinking product state requests Stop -> settle -> 10 seconds -> continue
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
    *   - Retry/Try again controls are failure signals only; they are never clicked
    *   - Regenerate is normal answer UI and is never treated as failure evidence
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.28';
+  const VERSION = '1.3.29';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -79,7 +79,6 @@
     incompleteVerifyMs: 15 * 60_000,
     recoveryPauseMs: 10_000,
     recoveryStopQuietMs: 15_000,
-    longThinkingRecoveryMs: 10 * 60_000,
     intentionalStopNetworkSuppressMs: 15_000,
     sendConfirmMs: 18_000,
     networkOwnershipMs: 15_000,
@@ -2474,13 +2473,11 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
     if (latestMarker(msgs)) return false;
 
-    // Long-thinking is normal for hard requests. It becomes recoverable only
-    // after the banner has persisted for 10 minutes, matching the project rule.
-    // Fresh assistant output still vetoes Stop at the recovery boundary.
+    // The exact ChatGPT long-thinking state is itself strong recovery evidence.
+    // It may bypass a stale Stop/streaming control, but stopThenContinue() still
+    // requires 15 seconds without fresh assistant text before destructive Stop.
     if (longThinking) {
-      const seenFor = now() - Number(S.longThinkingSeenAt || now());
-      if (seenFor < CFG.longThinkingRecoveryMs) return false;
-      return stopThenContinue('long-thinking-timeout', { allowBusyStop: true });
+      return stopThenContinue('long-thinking', { allowBusyStop: true });
     }
 
     const quietFor = now() - Math.max(
@@ -2617,9 +2614,8 @@
         S.composerMissingSince ||= now();
         if (err?.kind === 'continue') {
           S.pendingRecoveryReason = `error:${err.id}`;
-        } else if (longThinking &&
-                   now() - Number(S.longThinkingSeenAt || now()) >= CFG.longThinkingRecoveryMs) {
-          S.pendingRecoveryReason = 'long-thinking-timeout';
+        } else if (longThinking) {
+          S.pendingRecoveryReason = 'long-thinking';
         }
         if (S.pendingRecoveryReason) S.controlFault = 'composer-missing';
         paintUI(); scheduleWatchdog(); return;
@@ -2638,6 +2634,12 @@
         if (pendingReason.startsWith('error:')) {
           if (err) await handleError(err, msgs);
           else log('pending-error-cleared', { reason: pendingReason });
+        } else if (pendingReason === 'long-thinking') {
+          if (longThinking) {
+            await stopThenContinue('long-thinking', { allowBusyStop: true });
+          } else {
+            log('pending-long-thinking-cleared');
+          }
         } else {
           await stopThenContinue(pendingReason);
         }
