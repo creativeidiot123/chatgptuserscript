@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.28 — wiring / edge-case audit
+ChatGPT Resilience v1.3.29 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -64,9 +64,10 @@ audit found these prior false-positive sources and closes each one:
    - Removed in v1.3.24.
 
 2. Long-thinking banner
-   - Formerly requested recovery immediately.
-   - Now requires 10 continuous minutes before recovery is eligible.
-   - Ordinary prose containing "still thinking" no longer qualifies.
+   - The exact ChatGPT long-thinking product state is immediate recovery evidence.
+   - It bypasses stale Stop/streaming control state, but the destructive boundary
+     still requires 15 seconds without fresh assistant text before clicking Stop.
+   - Ordinary prose containing "still thinking" does not qualify.
 
 3. Fetch/XHR aborts
    - Formerly became recoverable network failures.
@@ -113,7 +114,7 @@ Final destructive-recovery boundary:
 - Even forced stuck recovery requires at least 15 seconds without fresh assistant
   tail progress.
 - The only callers allowed to bypass the live-control veto are:
-    * 10-minute long-thinking timeout
+    * exact current-turn long-thinking product state
     * 15-minute tracked stuck timeout
     * 15-minute untracked stuck timeout
 - Terminal DONE / HIBERNATE / WAIT_USER markers still hard-veto continuation.
@@ -306,8 +307,8 @@ Recovery boundary
 - Recoverable generation errors, verifier recovery, and validated pending
   continuation signals funnel through stopThenContinue().
 - Ordinary recovery cannot Stop while live generation evidence exists.
-- Only the explicit 10-minute long-thinking and 15-minute stuck paths may bypass
-  the live-control veto, and even those still require 15 seconds without fresh
+- The exact long-thinking product state and the 15-minute stuck paths may bypass
+  the live-control veto, and all still require 15 seconds without fresh
   assistant-tail progress.
 - The fifteen-minute stuck verifier naturally satisfies this guard.
 - Fetch/XHR aborts are ignored as normal request cancellation noise rather than
@@ -321,8 +322,9 @@ Recovery boundary
 
 Long-thinking recovery
 ----------------------
-- Known ChatGPT "thinking a bit more" product text starts a timer; it does not
-  request destructive recovery until it has remained visible for 10 minutes.
+- Known ChatGPT "thinking a bit more" product text requests recovery immediately.
+- It does not blindly click Stop: the shared destructive boundary still requires
+  15 seconds without fresh assistant output first.
 - Generic prose containing "still thinking" is not enough. Only the known product
   phrases or an element whose whole text is essentially "Still thinking..." count.
 - If the transaction journal is missing, the current visible user/assistant tail
@@ -382,7 +384,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.28
+- Userscript version: 1.3.29
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
