@@ -136,7 +136,7 @@ Send/Voice while generation continues. Therefore:
   Send/Voice affordances.
 - If the evaluator already says generating, a human draft cannot demote it.
 - Send/Voice alone never trigger Stop -> continue recovery.
-- Idle-without-marker is handled by the five-minute quiet verifier instead.
+- Idle-without-marker is handled by the fifteen-minute quiet verifier instead.
 - There is no draft timeout that can expire into a false idle state.
 - Generation evidence is reset on project-chat route changes and runtime exit.
 
@@ -201,6 +201,15 @@ PASS  previous-turn Retry UI cannot own the new turn
 PASS  composer remount alone cannot create recovery
 PASS  stale network completions cannot cross subturn ownership
 PASS  rate limits pause instead of continuing
+PASS  error priority hard > rate > reload > send > continue
+PASS  Retry cannot mask auth/rate/load errors
+PASS  rendered generation errors can recover past stale Stop UI
+PASS  post-Stop baseline is captured after Stop settles
+PASS  10-second grace vetoes fresh output / terminal marker / stronger error
+PASS  final pre-click guard vetoes restarted generation and fresh output
+PASS  active reload cap blocks instead of spinning
+PASS  composer-remount pending errors are revalidated
+PASS  offline state cannot dispatch recovery continue
 PASS  queue pause state/API/UI fully absent
 PASS  Ctrl+Enter queues without bypassing hibernation/DONE queue gates
 PASS  plain Enter is not intercepted into the queue
@@ -256,21 +265,59 @@ Mid-generation Stop protection
 - Even explicit recoverable signals cannot click Stop until assistant-tail
   progress has been quiet for 15 seconds.
 - Missing terminal markers are recovered only through explicit error handling,
-  the long-thinking path, or the five-minute quiet verifier.
+  the long-thinking path, or the fifteen-minute quiet verifier.
+
+Error recovery matrix
+---------------------
+Recoverable generation errors:
+- network / timeout / message-stream / thinking-failed / generation / server /
+  image-generation / Retry / Try again / recoverable HTTP statuses
+- Rendered current-turn error UI may bypass a stale Stop-control liveness veto,
+  but never the 15-second fresh-assistant-progress veto.
+- Flow: Stop if present -> verify Stop settled -> capture post-Stop tail ->
+  wait 10 seconds -> recheck terminal marker, assistant progress, online state,
+  stronger error class, and generation restart -> send literal "continue".
+- The final recovery guard runs after all awaits and immediately before native
+  Send. It rechecks the same tail signature and generation/error state.
+
+Non-continue error classes:
+- hard: auth, anti-abuse, policy, expired/generated-file and unsafe upload states
+  cancel recovery, block automation, preserve queue/task, and notify the user.
+- rate: cancel recovery and pause until parsed Retry-After/reset time or fallback.
+  They never send "continue" into an active rate limit.
+- reload: conversation/chat-load failures use controlled reload recovery. Active
+  tasks have a bounded reload cap; exhausting it blocks and notifies instead of
+  spinning forever.
+- send: before user-turn confirmation, reconcile/reload/resend the original
+  prompt rather than creating a new logical continuation. After confirmation,
+  stale message-send chrome is ignored. Without a journal, fail closed.
+- Long-thinking is tracked separately and is not classified as an ordinary error
+  by this matrix.
+
+Error evidence priority:
+hard > rate > reload > send > continue.
+A specific auth/rate/load/send state therefore cannot be masked by a generic
+Retry button or generic generation error.
 
 Recovery boundary
 -----------------
 - No automatic recovery may click Stop while the current assistant turn is still
   visibly progressing.
-- Recoverable error, transport, long-thinking-timeout, verifier, and pending
-  recovery signals all funnel through stopThenContinue().
+- Recoverable generation errors, verifier recovery, and validated pending
+  continuation signals funnel through stopThenContinue().
 - Ordinary recovery cannot Stop while live generation evidence exists.
 - Only the explicit 10-minute long-thinking and 15-minute stuck paths may bypass
   the live-control veto, and even those still require 15 seconds without fresh
   assistant-tail progress.
-- The five-minute stuck verifier naturally satisfies this guard.
+- The fifteen-minute stuck verifier naturally satisfies this guard.
 - Fetch/XHR aborts are ignored as normal request cancellation noise rather than
   being promoted to recoverable network errors.
+- Error classification is source-aware: current rendered error/Retry UI is
+  stronger evidence than transport noise, while transport/HTTP recovery remains
+  gated against a visibly live answer.
+- A composer remount can defer an already-proven recoverable error, but cannot
+  invent one. Pending error recovery is revalidated when the composer returns.
+- Offline state vetoes both recovery continuation and final native dispatch.
 
 Long-thinking recovery
 ----------------------
@@ -279,7 +326,7 @@ Long-thinking recovery
 - Generic prose containing "still thinking" is not enough. Only the known product
   phrases or an element whose whole text is essentially "Still thinking..." count.
 - If the transaction journal is missing, the current visible user/assistant tail
-  is adopted immediately instead of waiting for the generic five-minute orphan
+  is adopted immediately instead of waiting for the generic fifteen-minute orphan
   timeout.
 - If the journal exists but its user-turn confirmation was lost, the visible
   current turn is reconciled before recovery.

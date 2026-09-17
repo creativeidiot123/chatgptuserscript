@@ -35,7 +35,7 @@
    *   - A confirmed unfinished turn with no text/control progress for 15 minutes
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
-   *   - The long-thinking banner uses Stop -> 10 seconds -> continue immediately
+   *   - Long-thinking is a separate state from ordinary product/error recovery
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
    *   - Retry/Try again controls are failure signals only; they are never clicked
    *   - Regenerate is normal answer UI and is never treated as failure evidence
@@ -914,7 +914,7 @@
 
   function isLongThinkingText(text) {
     const t = norm(text);
-    return !!t && (isLongThinkingText(t) || LONG_THINKING_EXACT_RE.test(t));
+    return !!t && (LONG_THINKING_RE.test(t) || LONG_THINKING_EXACT_RE.test(t));
   }
   function findLongThinkingNotice() {
     // Preserve a previously discovered non-ARIA banner for as long as the exact
@@ -1019,36 +1019,66 @@
     S.lastHttpStatusAt = 0;
   }
 
+  function errorPriority(err) {
+    return ({ hard: 50, rate: 40, reload: 30, send: 20, continue: 10 })[err?.kind] || 0;
+  }
+
+  function sourcedError(err, source) {
+    return err ? { ...err, source } : null;
+  }
+
+  function pickError(...candidates) {
+    let best = null;
+    for (const err of candidates.filter(Boolean)) {
+      if (!best || errorPriority(err) > errorPriority(best)) best = err;
+    }
+    return best;
+  }
+
+  function errorAllowsBusyStop(err) {
+    return err?.kind === 'continue' && (err.source === 'dom' || err.source === 'retry');
+  }
+
   function currentError(msgs = getMessages()) {
+    const dom = sourcedError(classifyError(collectErrorText(msgs)), 'dom');
+
     const retry = findRetryButton();
-    if (retry) return {
+    const retryErr = retry ? {
       id: 'retry-control',
       kind: 'continue',
+      source: 'retry',
       sourceText: retryControlLabel(retry) || 'Retry control visible',
-    };
-
-    const dom = classifyError(collectErrorText(msgs));
-    if (dom) return dom;
+    } : null;
 
     const liveGeneration = !!S.txn && hasLiveGenerationEvidence();
 
+    let http = null;
     const age = now() - Number(S.lastHttpStatusAt || 0);
     if (age < 20_000) {
-      const http = classifyHttpStatus(S.lastHttpStatus);
-      // Hard/rate statuses remain meaningful. Recoverable HTTP noise is only
-      // actionable once the visible turn no longer looks alive.
-      if (http && (http.kind === 'hard' || http.kind === 'rate' || !liveGeneration)) return http;
+      const candidate = classifyHttpStatus(S.lastHttpStatus);
+      // Hard/rate HTTP status always matters. Recoverable/reload HTTP state only
+      // becomes actionable once the visible generation no longer looks alive.
+      if (candidate && (candidate.kind === 'hard' || candidate.kind === 'rate' || !liveGeneration)) {
+        http = sourcedError(candidate, 'http');
+      }
     }
 
+    let transport = null;
     if (!liveGeneration && S.lastNetworkFailureAt &&
         now() - S.lastNetworkFailureAt < 20_000 && !transportFailureSuppressed()) {
-      return {
+      transport = {
         id: S.lastNetworkFailureKind === 'timeout' ? 'timeout' : 'network',
         kind: 'continue',
+        source: 'transport',
         sourceText: S.lastNetworkFailureKind || 'transport failure',
       };
     }
-    return null;
+
+    const candidates = [dom, http, retryErr, transport].filter(Boolean);
+    const usable = S.txn?.userTurnConfirmed
+      ? candidates.filter(err => err.kind !== 'send')
+      : candidates;
+    return pickError(...usable);
   }
 
   function hasComposerAttachments(input = getComposer()) {
@@ -1523,7 +1553,7 @@
   }
 
   async function dispatchPrompt(prompt, source, options = {}) {
-    if (!S.enabled || !verifyTabContext() || S.actionInFlight || isPaused()) return false;
+    if (!S.enabled || !navigator.onLine || !verifyTabContext() || S.actionInFlight || isPaused()) return false;
     const dispatchRoute = S.route;
     const input = getComposer();
     const p = promptText(prompt);
@@ -1539,7 +1569,7 @@
     try {
       const action = await waitForSendAction(input, p);
       if (!action || S.route !== dispatchRoute) return false;
-      if (!verifyTabContext()) return false;
+      if (!navigator.onLine || !verifyTabContext()) return false;
       if (S.route !== dispatchRoute) return false;
       if (!input.isConnected || norm(composerText(input)) !== norm(p)) return false;
 
@@ -1563,15 +1593,49 @@
         if (norm(queueClaim.text) !== norm(p)) return false;
       }
 
-      // Recovery continue gets one final marker veto after every await and
-      // immediately before synchronous journaling + native Send. From here to
-      // action.run() there is no await, so a terminal marker cannot race in.
+      if (!navigator.onLine) return false;
+
+      // Recovery continue gets one final synchronous veto after every await and
+      // immediately before journaling + native Send. From here to action.run()
+      // there is no await, so DOM/network state cannot interleave with the click.
       if (options.abortOnTerminalMarker) {
-        const terminal = latestMarker(getMessages(true));
+        const freshMsgs = getMessages(true);
+        const terminal = latestMarker(freshMsgs);
         if (terminal) {
           if (norm(composerText(input)) === norm(p)) clearComposer(input);
           log('dispatch-abort-terminal-marker', { source, marker: terminal });
           scheduleEvaluate(`dispatch-terminal:${terminal}`, 0);
+          return false;
+        }
+
+        if (options.expectedAssistantSig &&
+            signature(freshMsgs.lastAssistantText) !== options.expectedAssistantSig) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          S.lastAssistantProgressAt = now();
+          log('dispatch-abort-assistant-progress', { source });
+          scheduleEvaluate('dispatch-assistant-progress', 0);
+          return false;
+        }
+
+        const finalControl = getComposerControlState();
+        const hardBusyControl = ['stop', 'spinner', 'streaming'].includes(finalControl.kind);
+        const newAssistantBusy = finalControl.busyEvidence && !options.expectedBusyEvidence;
+        if (hardBusyControl || newAssistantBusy || S.generating) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          log('dispatch-abort-generation-restarted', {
+            source,
+            control: finalControl.kind,
+            busyEvidence: !!finalControl.busyEvidence,
+          });
+          scheduleEvaluate('dispatch-generation-restarted', 0);
+          return false;
+        }
+
+        const blocker = currentError(freshMsgs);
+        if (blocker && ['hard', 'rate', 'reload', 'send'].includes(blocker.kind)) {
+          if (norm(composerText(input)) === norm(p)) clearComposer(input);
+          log('dispatch-abort-error-state', { source, id: blocker.id, kind: blocker.kind });
+          scheduleEvaluate(`dispatch-error:${blocker.id}`, 0);
           return false;
         }
       }
@@ -1610,7 +1674,7 @@
 
 
   async function sendLiteralContinue(reason = 'incomplete') {
-    if (!verifyTabContext()) return false;
+    if (!navigator.onLine || !verifyTabContext()) return false;
     if (latestMarker(getMessages(true))) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || S.generating || S.actionInFlight || isPaused() || S.blockedReason) return false;
@@ -1629,9 +1693,13 @@
     // let its suppression window hide a genuine failure of the new continuation.
     S.suppressTransportErrorsUntil = 0;
     const nextCount = Number(t.continueCount || 0) + 1;
+    const expectedAssistantSig = signature(getMessages(true).lastAssistantText);
+    const expectedBusyEvidence = hasAssistantBusyEvidence();
     const ok = await dispatchPrompt(PROTOCOL.CONTINUE, `continue:${reason}`, {
       newLogicalTask: false,
       abortOnTerminalMarker: true,
+      expectedAssistantSig,
+      expectedBusyEvidence,
     });
     if (!ok || !S.txn) return false;
     S.txn.continueCount = nextCount;
@@ -1678,7 +1746,7 @@
 
     // Stop is destructive. Ordinary error/UI/network recovery is never allowed
     // to interrupt a turn that still has live generation evidence. Only paths
-    // with their own long quiet timeout (5m stuck / 10m long-thinking) may stop
+    // with their own long quiet timeout (15m stuck / 10m long-thinking) may stop
     // while ChatGPT still exposes a Stop/streaming control.
     if (!options.allowBusyStop && hasLiveGenerationEvidence()) {
       log('recovery-deferred-live-generation', { reason });
@@ -1719,8 +1787,6 @@
     if (S.recovery?.txnId === expectedTxnId) return false;
     if (S.actionInFlight) return false;
 
-    const before = getMessages(true);
-    const beforeSig = signature(before.lastAssistantText);
     const recovery = { txnId: expectedTxnId, reason, phase: 'stop', startedAt: now() };
     S.recovery = recovery;
     paintUI(true);
@@ -1755,6 +1821,11 @@
         return false;
       }
 
+      // Capture the tail only after Stop has fully settled. React may finalize
+      // partial text while processing Stop; that expected mutation must not be
+      // mistaken for fresh generation during the ten-second grace.
+      const settledSig = signature(getMessages(true).lastAssistantText);
+
       if (S.recovery !== recovery) return false;
       recovery.phase = 'grace';
       recovery.graceAt = now();
@@ -1762,9 +1833,14 @@
       log('recovery-wait', { reason, ms: CFG.recoveryPauseMs });
       await sleep(CFG.recoveryPauseMs);
 
-      // Ten-second grace: any genuine recovery wins over our literal continue.
+      // Ten-second grace: terminal markers, fresh output, offline state, or a
+      // newly stronger error class all veto the literal continuation.
       if (S.recovery !== recovery) return false;
       if (!S.txn || S.txn.id !== expectedTxnId || S.txn.manualStopped) return false;
+      if (!navigator.onLine) {
+        scheduleEvaluate(`recovery-offline:${reason}`, 1_000);
+        return false;
+      }
       if (!getComposer()) {
         S.pendingRecoveryReason = reason;
         S.controlFault = 'composer-missing';
@@ -1772,11 +1848,19 @@
       }
       const after = getMessages(true);
       if (latestMarker(after)) return false;
-      if (signature(after.lastAssistantText) !== beforeSig) {
+      if (signature(after.lastAssistantText) !== settledSig) {
         S.lastAssistantProgressAt = now();
         scheduleEvaluate(`recovery-progress:${reason}`, 500);
         return false;
       }
+
+      const freshError = currentError(after);
+      if (freshError && ['hard', 'rate', 'reload', 'send'].includes(freshError.kind)) {
+        log('recovery-veto-error-state', { reason, id: freshError.id, kind: freshError.kind });
+        scheduleEvaluate(`recovery-error-veto:${freshError.id}`, 0);
+        return false;
+      }
+
       // After our own Stop, only live composer/streaming controls can prove the
       // generation restarted. A lingering long-thinking banner cannot.
       if (!postStopControlSettled()) return false;
@@ -2285,7 +2369,10 @@
   async function reloadForRecovery(reason) {
     const t = S.txn;
     if (!t || S.actionInFlight || isPaused()) return false;
-    if (Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) return false;
+    if (Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
+      blockAutomation('reload-safety-cap', 'This task still cannot recover after the maximum controlled reloads. Queue and task state are preserved.');
+      return false;
+    }
     if (t.lastReloadAt && now() - t.lastReloadAt < CFG.reloadCooldownMs) return false;
     const expectedTxnId = t.id;
     S.actionInFlight = true;
@@ -2295,7 +2382,10 @@
       if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
       S.txn = diskTxn;
       const live = S.txn;
-      if (Number(live.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) return false;
+      if (Number(live.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
+        blockAutomation('reload-safety-cap', 'This task still cannot recover after the maximum controlled reloads. Queue and task state are preserved.');
+        return false;
+      }
       if (live.lastReloadAt && now() - live.lastReloadAt < CFG.reloadCooldownMs) return false;
       live.reloadCount = Number(live.reloadCount || 0) + 1;
       live.lastReloadAt = now();
@@ -2336,31 +2426,48 @@
     const t = S.txn;
     if (!err) return false;
 
-    // Hard states need a human. Never automate through them.
+    // Hard states need a human and must cancel any sleeping recovery.
     if (err.kind === 'hard') {
+      cancelRecovery(`error:${err.id}`);
+      resetVerification(`error:${err.id}`);
       blockAutomation(err.id, `${err.id} needs human attention. Queue and task state are preserved.`);
       return true;
     }
 
-    if (!t) return false;
-    if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
-    if (t.manualStopped) return false;
-
-    // Rate limits are a scheduler condition, not a broken generation. Preserve
-    // the live answer and wait instead of pressing continue into the limit.
+    // Rate limits are scheduler state, not a failed generation. This takes
+    // precedence even before the user turn has been DOM-confirmed.
     if (err.kind === 'rate') {
+      cancelRecovery(`error:${err.id}`);
+      resetVerification(`error:${err.id}`);
       pauseUntil(now() + rateWaitMs(err.sourceText), 'rate-limit');
       return true;
     }
 
-    // Once the user turn is confirmed, a message-send error belongs to stale
-    // send UI/network state and is not evidence that the active answer failed.
+    if (!t) return false;
+    if (t.manualStopped) return false;
+
+    // Conversation/page-load failures recover by controlled reload, never by
+    // sending "continue" into a broken conversation shell.
+    if (err.kind === 'reload') {
+      cancelRecovery(`error:${err.id}`);
+      resetVerification(`error:${err.id}`);
+      return reloadForRecovery(`error:${err.id}`);
+    }
+
+    // Until the user turn is confirmed, continuing would risk creating a second
+    // logical request. Reconcile/resend the original send instead.
+    if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
+
+    // Once the user turn is confirmed, message-send chrome is stale by definition.
     if (err.kind === 'send') return false;
 
-    // Recoverable errors use one deterministic path, but the recovery boundary
-    // itself refuses to interrupt a visibly progressing assistant turn.
+    // Rendered Retry/product-error evidence may outlive ChatGPT's Stop control.
+    // It may bypass the control-level live veto, but the shared recovery boundary
+    // still requires 15 seconds without fresh assistant output before clicking Stop.
     resetVerification(`error:${err.id}`);
-    return stopThenContinue(`error:${err.id}`);
+    return stopThenContinue(`error:${err.id}`, {
+      allowBusyStop: errorAllowsBusyStop(err),
+    });
   }
   async function maybeRecoverStall(msgs, longThinking) {
     const t = S.txn;
@@ -2418,7 +2525,7 @@
 
     // The exact long-thinking product banner is strong current-turn evidence.
     // If recovery lost its journal, adopt the visible user/assistant tail now
-    // instead of waiting for the generic five-minute orphan fallback.
+    // instead of waiting for the generic fifteen-minute orphan fallback.
     if (longThinking && !marker && !S.hib && !S.txn && msgs.lastUserText &&
         assistantIsCurrentTail(msgs) && !['auth', 'anti-abuse', 'policy'].includes(err?.id || '')) {
       adoptUntrackedTurn(msgs, 'long-thinking-adopt');
@@ -2435,7 +2542,7 @@
 
     // A failed UI can outlive the journal after reload/navigation/script install.
     // Recoverable Retry/error states may adopt only the current visible tail.
-    if (!S.txn && err && !['auth', 'anti-abuse', 'policy'].includes(err.id)) {
+    if (!S.txn && err?.kind === 'continue') {
       const adopted = adoptUntrackedTurn(msgs, `error-adopt:${err.id}`);
       if (adopted) {
         await handleError(err, msgs);
@@ -2495,13 +2602,20 @@
       // this transaction/chat and never freeze unrelated project conversations.
       if (t.manualStopped || t.holdReason) { paintUI(); scheduleWatchdog(); return; }
 
+      // Hard/rate/reload errors and errors on an unconfirmed send do not need a
+      // mounted composer to choose the correct recovery class.
+      if (err && (['hard', 'rate', 'reload'].includes(err.kind) || !t.userTurnConfirmed)) {
+        await handleError(err, msgs);
+        paintUI(); scheduleWatchdog(); return;
+      }
+
       // React may remount the composer during perfectly healthy generation.
       // Missing/remounted composer state is never proof of a failed turn. It may
       // only defer a recovery that already has independent error evidence.
       const composerNow = getComposer();
       if (!composerNow) {
         S.composerMissingSince ||= now();
-        if (err && !['auth', 'anti-abuse', 'policy'].includes(err.id)) {
+        if (err?.kind === 'continue') {
           S.pendingRecoveryReason = `error:${err.id}`;
         } else if (longThinking &&
                    now() - Number(S.longThinkingSeenAt || now()) >= CFG.longThinkingRecoveryMs) {
@@ -2520,7 +2634,13 @@
         const pendingReason = S.pendingRecoveryReason;
         S.pendingRecoveryReason = '';
         if (S.controlFault === 'composer-missing') S.controlFault = '';
-        await stopThenContinue(pendingReason);
+
+        if (pendingReason.startsWith('error:')) {
+          if (err) await handleError(err, msgs);
+          else log('pending-error-cleared', { reason: pendingReason });
+        } else {
+          await stopThenContinue(pendingReason);
+        }
         paintUI(); scheduleWatchdog(); return;
       }
 
@@ -2536,7 +2656,7 @@
       }
 
       // Composer affordances are not reliable enough to stop a response. If
-      // ChatGPT appears idle without a terminal marker, the normal five-minute
+      // ChatGPT appears idle without a terminal marker, the normal fifteen-minute
       // quiet verifier below decides whether recovery is actually needed.
       if (S.controlFault !== 'composer-missing') S.controlFault = '';
 
@@ -2570,6 +2690,13 @@
         scheduleWatchdog();
         return;
       }
+    }
+
+    // A send failure without a journal cannot be reconstructed safely.
+    if (!S.txn && err?.kind === 'send') {
+      blockAutomation('message-send', 'The last message failed to send and there is no recoverable transaction journal. Queue is preserved.');
+      scheduleWatchdog();
+      return;
     }
 
     // No active journal. Account/security/rate states still own the scheduler.
@@ -3294,6 +3421,13 @@
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
       ['HTTP 520 server', classifyHttpStatus(520)?.id, 'server'],
       ['HTTP 422 recoverable request', classifyHttpStatus(422)?.kind, 'continue'],
+      ['hard outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'auth',kind:'hard'})?.id, 'auth'],
+      ['rate outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'rate',kind:'rate'})?.id, 'rate'],
+      ['reload outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'load',kind:'reload'})?.id, 'load'],
+      ['send outranks retry before confirmation', pickError({id:'retry',kind:'continue'},{id:'send',kind:'send'})?.id, 'send'],
+      ['rendered product error may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'dom'}), true],
+      ['retry control may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'retry'}), true],
+      ['transport error cannot bypass live-control veto', errorAllowsBusyStop({kind:'continue',source:'transport'}), false],
       ['rate classified', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
       ['auth blocks', classifyError('Session expired. Please sign in')?.kind, 'hard'],
       ['maximum length ignored', classifyError('This conversation has reached its maximum length')?.kind || null, null],
