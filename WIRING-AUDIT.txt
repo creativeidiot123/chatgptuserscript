@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.29 — wiring / edge-case audit
+ChatGPT Resilience v1.3.30 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -237,6 +237,12 @@ Hard terminal veto
 - Exact visible protocol tokens are authoritative even if the surrounding
   assistant container has extra suffix text. The rendered token is not discarded
   just because flattened text has trailing UI/content.
+- Exact marker search covers the whole current assistant/turn root rather than a
+  fixed tail window. Large Sources/citation panels therefore cannot push a valid
+  marker out of the search range.
+- Flattened text also accepts ChatGPT's trailing Sources UI and maximum-length
+  chrome after an exact terminal marker, while arbitrary assistant prose after a
+  marker still invalidates it.
 - Literal recovery "continue" checks for a fresh terminal marker before staging.
 - Recovery continue also requests a final forced marker check inside dispatchPrompt
   after all awaits and immediately before synchronous journaling + native Send.
@@ -384,7 +390,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.29
+- Userscript version: 1.3.30
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
