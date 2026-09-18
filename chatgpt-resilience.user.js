@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.29
+// @version      1.3.30
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.29
+   * ChatGPT Resilience 1.3.30
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.29';
+  const VERSION = '1.3.30';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -297,6 +297,7 @@
   }
 
   const MAX_LENGTH_UI_RE = /(?:you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
+  const TRAILING_PRODUCT_UI_RE = /^(?:sources\b|you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
 
   function markerFromProtocolText(text) {
     const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
@@ -310,10 +311,10 @@
       const i = clean.lastIndexOf(token);
       if (i < 0) continue;
       const suffix = clean.slice(i + token.length).trim();
-      // ChatGPT may append the maximum-length UI after the assistant response.
-      // The protocol token itself is intentionally unique, so flattened DOM text
-      // such as "...finished.[[CGR_DONE]]" is still authoritative.
-      if (!suffix || MAX_LENGTH_UI_RE.test(suffix)) return marker;
+      // ChatGPT may append product chrome after the assistant response, notably
+      // Sources/citation UI and the maximum-length banner. Those are not assistant
+      // content, so they must not invalidate an otherwise exact terminal marker.
+      if (!suffix || TRAILING_PRODUCT_UI_RE.test(suffix)) return marker;
     }
     return null;
   }
@@ -328,36 +329,32 @@
       [PROTOCOL.WAIT_USER, 'wait-user'],
     ];
 
-    // Prefer rendered evidence. Search exact element text first, then exact text
-    // nodes because React/Markdown can wrap the marker in a parent whose
-    // textContent also includes adjacent content.
+    // Prefer rendered evidence. Search the whole current assistant/turn root in
+    // one reverse pass. Sources/citation UI can append hundreds of descendants
+    // after the answer, so fixed tail caps can hide a valid terminal marker.
     try {
-      const nodes = Array.from(root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6')).slice(-160).reverse();
-      for (const [token, marker] of tokens) {
-        const exact = nodes.find(el => {
-          if (!visible(el)) return false;
-          if (el.closest?.('pre,code,blockquote') || el.querySelector?.('pre,code,blockquote')) return false;
-          const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-          return value === token;
-        });
-        if (exact) return marker;
+      const tokenMap = new Map(tokens);
+      const nodes = root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6');
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const el = nodes[i];
+        if (!visible(el)) continue;
+        if (el.closest?.('pre,code,blockquote') || el.querySelector?.('pre,code,blockquote')) continue;
+        const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+        const marker = tokenMap.get(value);
+        if (marker) return marker;
       }
 
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-      const tailTextNodes = [];
+      const textNodes = [];
       let node;
-      while ((node = walker.nextNode())) {
-        tailTextNodes.push(node);
-        if (tailTextNodes.length > 240) tailTextNodes.shift();
-      }
-      for (let i = tailTextNodes.length - 1; i >= 0; i--) {
-        const tn = tailTextNodes[i];
+      while ((node = walker.nextNode())) textNodes.push(node);
+      for (let i = textNodes.length - 1; i >= 0; i--) {
+        const tn = textNodes[i];
         const parent = tn.parentElement;
         if (!parent || !visible(parent) || parent.closest?.('pre,code,blockquote')) continue;
         const value = String(tn.nodeValue || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-        for (const [token, marker] of tokens) {
-          if (value === token) return marker;
-        }
+        const marker = tokenMap.get(value);
+        if (marker) return marker;
       }
     } catch (_) {}
 
@@ -3413,6 +3410,9 @@
       ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
       ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_10M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
+      ['marker before Sources UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_10M]]\nSources\nGitHub\nActions'), 'hibernate'],
+      ['marker before Sources UI done', terminalMarker('done\n[[CGR_DONE]]\nSources\nReference 1'), 'done'],
+      ['non-product suffix still rejects marker', terminalMarker('[[CGR_DONE]]\nactual assistant prose'), null],
       ['flattened hibernate marker', terminalMarker('work complete.[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
       ['flattened done marker', terminalMarker('all done.[[CGR_DONE]]'), 'done'],
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
