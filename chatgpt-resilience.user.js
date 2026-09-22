@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.30
+// @version      1.3.31
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.30
+   * ChatGPT Resilience 1.3.31
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -34,8 +34,9 @@
    * Recovery policy:
    *   - A confirmed unfinished turn with no text/control progress for 15 minutes
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
-   *   - Any recognized product/workflow error uses Stop -> 10 seconds -> continue
-   *   - The exact long-thinking product state requests Stop -> settle -> 10 seconds -> continue
+   *   - Rendered product state is scanned once from semantic current-turn UI
+   *   - Recoverable generation errors use Stop -> settle -> 10 seconds -> continue
+   *   - Exact long-thinking uses the same recovery boundary as a dedicated state
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
    *   - Retry/Try again controls are failure signals only; they are never clicked
    *   - Regenerate is normal answer UI and is never treated as failure evidence
@@ -56,7 +57,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.30';
+  const VERSION = '1.3.31';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -142,9 +143,10 @@
       '[data-is-streaming="true"]',
       '[data-streaming="true"]',
     ],
-    alerts: [
+    productState: [
       '[role="alert"]',
-      '[aria-live="assertive"]',
+      '[role="status"]',
+      '[aria-live]',
       '[data-testid*="error" i]',
     ],
   });
@@ -159,6 +161,7 @@
     { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
     { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|please wait before trying again/i },
     { id: 'conversation-load', kind: 'reload', re: /conversation not found|(?:unable|failed|error) to load (?:this )?(?:conversation|chat)|problem preparing your chat|couldn(?:'|’)t load (?:this )?(?:conversation|chat)|chat not found/i },
+    { id: 'connection-interrupted', kind: 'continue', re: /connection interrupted(?:\.\s*waiting for the complete answer)?|waiting for the complete answer/i },
     { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|fetch failed|connection (?:error|reset|closed|lost|failed|interrupted|terminated)|websocket|socket (?:error|closed)|disconnected|upstream connect error|disconnect\/reset before headers|transport error|err_network/i },
     { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|connection timed out|message[- ]delivery (?:timed? out|timeout)|gateway time[- ]?out|err_timed_out|too late/i },
     { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted|closed unexpectedly)|incomplete chunked encoding|premature eof/i },
@@ -503,6 +506,7 @@
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
     kickQueue(`txn-clear:${reason}`, 40);
   }
 
@@ -598,6 +602,7 @@
     composerNode: null,
     assistantNode: null,
     longThinkingNode: null,
+    productStateNode: null,
     evaluateTimer: null,
     evaluateDueAt: 0,
     watchdogTimer: null,
@@ -912,63 +917,157 @@
     const t = norm(text);
     return !!t && (LONG_THINKING_RE.test(t) || LONG_THINKING_EXACT_RE.test(t));
   }
-  function findLongThinkingNotice() {
-    // Preserve a previously discovered non-ARIA banner for as long as the exact
-    // live node remains visible and still contains the status text. A static
-    // banner must not age out merely because React stopped mutating it.
-    const cached = DC.longThinkingNode;
-    if (cached?.isConnected && visible(cached)) {
-      const t = norm(cached.textContent || '');
-      const semanticStatus = cached.matches?.('[role="status"],[aria-live]');
-      const outsideMessage = !cached.closest?.('[data-message-author-role]');
-      if ((semanticStatus || outsideMessage) && t.length <= 1200 && isLongThinkingText(t)) return cached;
+
+  function classifyProductText(text) {
+    const t = norm(text);
+    if (!t || t.length >= 4000 || MAX_LENGTH_UI_RE.test(t)) return null;
+    if (isLongThinkingText(t)) {
+      return { id: 'long-thinking', kind: 'long-thinking', sourceText: t.slice(-800) };
     }
-    DC.longThinkingNode = null;
-    const root = document.querySelector('main');
-    if (!root) return null;
+    return classifyError(t);
+  }
+
+  function scanRenderedProductState(msgs = getMessages()) {
+    const errors = [];
+    let longThinkingNode = null;
+
+    // Compact assistant-tail product errors are legitimate rendered evidence,
+    // but ordinary assistant prose never enters the error classifier.
+    const assistantText = assistantIsCurrentTail(msgs) ? norm(msgs.lastAssistantText) : '';
+    const tail = assistantText.slice(-1400);
+    if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) {
+      const err = classifyError(tail);
+      if (err) errors.push({ ...err, source: 'rendered' });
+    }
+
+    // ChatGPT currently exposes transient product state through semantic live
+    // regions (alert/status/aria-live) and error test ids. Scan only those nodes,
+    // then scope them to the current turn/corridor. No page-wide text sweep.
+    const root = document.querySelector('main') || document;
+    for (const el of qAll(SELECTORS.productState, root)) {
+      if (!controlVisible(el) || !isTailRelevantElement(el)) continue;
+      if (el.closest?.('[data-message-author-role="user"]')) continue;
+      const state = classifyProductText(el.textContent || '');
+      if (!state) continue;
+      if (state.kind === 'long-thinking') {
+        longThinkingNode = el;
+        continue;
+      }
+      errors.push({ ...state, source: 'rendered' });
+    }
+
+    // Some long-thinking wrappers are not semantic themselves. Preserve a node
+    // discovered by the mutation adapter while it remains valid and visible.
+    const cached = DC.longThinkingNode;
+    if (!longThinkingNode && cached?.isConnected && visible(cached) &&
+        isLongThinkingText(cached.textContent || '')) {
+      longThinkingNode = cached;
+    }
+
+    // A mutation may discover a small non-semantic product card. Reuse that
+    // exact node only while it remains visible, current-turn relevant, and still
+    // classifies as a known product error.
+    const cachedProduct = DC.productStateNode;
+    if (cachedProduct?.isConnected && controlVisible(cachedProduct) &&
+        isTailRelevantElement(cachedProduct)) {
+      const state = classifyProductText(cachedProduct.textContent || '');
+      if (state && state.kind !== 'long-thinking') {
+        errors.push({ ...state, source: 'rendered' });
+      } else {
+        DC.productStateNode = null;
+      }
+    } else if (cachedProduct) {
+      DC.productStateNode = null;
+    }
+
+    const retry = findRetryButton();
+    if (retry) {
+      errors.push({
+        id: 'retry-control',
+        kind: 'continue',
+        source: 'retry',
+        sourceText: retryControlLabel(retry) || 'Retry control visible',
+      });
+    }
+
+    DC.longThinkingNode = longThinkingNode;
+    if (longThinkingNode) {
+      if (!S.longThinkingSeenAt) S.longThinkingSeenAt = now();
+      S.longThinkingLastSeenAt = now();
+    } else {
+      S.longThinkingSeenAt = 0;
+      S.longThinkingLastSeenAt = 0;
+    }
+
+    return {
+      error: pickError(...errors),
+      longThinking: !!longThinkingNode,
+    };
+  }
+
+  function mutationProductState(node) {
+    const el = node?.nodeType === 1 ? node : node?.parentElement;
+    if (!el) return null;
+
+    const selector = SELECTORS.productState.join(',');
+    const candidates = [];
     try {
-      const nodes = root.querySelectorAll('[role="status"],[aria-live]');
-      for (let i = Math.max(0, nodes.length - 40); i < nodes.length; i++) {
-        const el = nodes[i];
-        if (!visible(el)) continue;
-        const t = norm(el.textContent || '');
-        if (t.length <= 800 && isLongThinkingText(t)) { DC.longThinkingNode = el; return el; }
+      if (el.matches?.(selector)) candidates.push(el);
+      const nested = el.querySelectorAll?.(selector) || [];
+      for (let i = Math.max(0, nested.length - 16); i < nested.length; i++) candidates.push(nested[i]);
+    } catch (_) {}
+
+    for (const candidate of candidates) {
+      const state = classifyProductText(candidate.textContent || '');
+      if (!state) continue;
+      if (state.kind === 'long-thinking') {
+        DC.longThinkingNode = candidate;
+        S.longThinkingSeenAt ||= now();
+        S.longThinkingLastSeenAt = now();
+      } else {
+        DC.productStateNode = candidate;
+      }
+      return state;
+    }
+
+    // Historical long-thinking/error cards have also appeared in small
+    // non-semantic wrappers. Inspect only wrappers outside message prose and the
+    // composer, then require either exact long-thinking or strongly error-shaped
+    // product text before caching the node.
+    try {
+      const form = composerForm(getComposer());
+      const outsideMessage = !el.closest?.('[data-message-author-role]');
+      const outsideComposer = !form?.contains?.(el) && !el.closest?.('#cgr-root,#cgr-queue-tray');
+      const t = outsideMessage && outsideComposer && (el.childElementCount || 0) <= 12
+        ? norm(el.textContent || '')
+        : '';
+      if (t && t.length < 1200) {
+        if (isLongThinkingText(t)) {
+          DC.longThinkingNode = el;
+          S.longThinkingSeenAt ||= now();
+          S.longThinkingLastSeenAt = now();
+          return { id: 'long-thinking', kind: 'long-thinking', sourceText: t };
+        }
+        const state = classifyProductText(t);
+        const strongCard = state && (
+          state.id === 'connection-interrupted' ||
+          ['hard', 'rate', 'reload'].includes(state.kind) ||
+          ASSISTANT_ERROR_TAIL_RE.test(t)
+        );
+        if (strongCard) {
+          DC.productStateNode = el;
+          return state;
+        }
+      }
+    } catch (_) {}
+
+    try {
+      const buttons = Array.from(el.matches?.('button') ? [el] : el.querySelectorAll?.('button') || []).slice(-12);
+      if (buttons.some(btn => !!retryControlLabel(btn))) {
+        return { id: 'retry-control', kind: 'continue', sourceText: 'Retry control visible' };
       }
     } catch (_) {}
     return null;
-  }
-
-  function updateLongThinking() {
-    const hit = findLongThinkingNotice();
-    if (hit) {
-      DC.longThinkingNode = hit;
-      if (!S.longThinkingSeenAt) S.longThinkingSeenAt = now();
-      S.longThinkingLastSeenAt = now();
-      return true;
-    }
-    S.longThinkingSeenAt = 0;
-    S.longThinkingLastSeenAt = 0;
-    return false;
-  }
-
-  function collectErrorText(msgs = getMessages()) {
-    const chunks = [];
-    const assistantText = assistantIsCurrentTail(msgs) ? norm(msgs.lastAssistantText) : '';
-    const tail = assistantText.slice(-1400);
-    // Product error messages are compact. Do not reinterpret an old/long,
-    // healthy assistant answer as current ChatGPT error chrome.
-    if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
-
-    const root = document.querySelector('main') || document;
-    const alerts = qAll(SELECTORS.alerts, root).slice(-16);
-    for (const el of alerts) {
-      if (!controlVisible(el) || !isTailRelevantElement(el)) continue;
-      if (el.closest?.('[data-message-author-role="user"]')) continue;
-      const t = norm(el.textContent || '');
-      if (!t || t.length >= 4000 || MAX_LENGTH_UI_RE.test(t)) continue;
-      chunks.push(t);
-    }
-    return chunks.join('\n').slice(-10_000);
   }
 
   function classifyHttpStatus(status) {
@@ -1032,19 +1131,13 @@
   }
 
   function errorAllowsBusyStop(err) {
-    return err?.kind === 'continue' && (err.source === 'dom' || err.source === 'retry');
+    return err?.kind === 'continue' && (err.source === 'rendered' || err.source === 'retry');
   }
 
-  function currentError(msgs = getMessages()) {
-    const dom = sourcedError(classifyError(collectErrorText(msgs)), 'dom');
-
-    const retry = findRetryButton();
-    const retryErr = retry ? {
-      id: 'retry-control',
-      kind: 'continue',
-      source: 'retry',
-      sourceText: retryControlLabel(retry) || 'Retry control visible',
-    } : null;
+  function currentError(msgs = getMessages(), renderedError = undefined) {
+    const rendered = renderedError === undefined
+      ? scanRenderedProductState(msgs).error
+      : renderedError;
 
     const liveGeneration = !!S.txn && hasLiveGenerationEvidence();
 
@@ -1070,7 +1163,7 @@
       };
     }
 
-    const candidates = [dom, http, retryErr, transport].filter(Boolean);
+    const candidates = [rendered, http, transport].filter(Boolean);
     const usable = S.txn?.userTurnConfirmed
       ? candidates.filter(err => err.kind !== 'send')
       : candidates;
@@ -1116,31 +1209,6 @@
     } catch (_) {}
   }
 
-  function captureLongThinkingFromNode(node) {
-    if (!node || node.nodeType !== 1) return false;
-    const el = node;
-    const insideMessage = !!el.closest?.('[data-message-author-role]');
-
-    const candidates = [];
-    if (el.matches?.('[role="status"],[aria-live]')) candidates.push(el);
-    if (!insideMessage && (el.childElementCount || 0) <= 12) candidates.push(el);
-    try {
-      const nested = el.querySelectorAll?.('[role="status"],[aria-live]') || [];
-      for (let i = Math.max(0, nested.length - 8); i < nested.length; i++) candidates.push(nested[i]);
-    } catch (_) {}
-
-    for (const candidate of candidates) {
-      const text = norm(candidate.textContent || '');
-      if (text && text.length < 1200 && isLongThinkingText(text)) {
-        DC.longThinkingNode = candidate;
-        S.longThinkingSeenAt ||= now();
-        S.longThinkingLastSeenAt = now();
-        return true;
-      }
-    }
-    return false;
-  }
-
   function installRootObserver() {
     if (!S.projectActive || !isProjectUrl()) return;
     const root = document.querySelector('main') || document.body;
@@ -1150,45 +1218,60 @@
     DC.rootObserver = new MutationObserver(records => {
       if (!S.projectActive || !isProjectUrl()) return;
       let structureChanged = false;
-      let statusChanged = false;
+      let productStateChanged = false;
       let composerChanged = false;
+
       for (const rec of records) {
-        // Token-level DOM churn inside the active assistant is handled by the
-        // dedicated tail observer. Do not invalidate the entire message cache.
+        // Token-level assistant churn already has its own observer. If product
+        // state is nested there, that observer will schedule the same evaluation.
         if (DC.lastAssistant && (rec.target === DC.lastAssistant || DC.lastAssistant.contains?.(rec.target))) continue;
-        // Some status banners keep the same wrapper and only replace a text
-        // child. Inspect that small mutation target as well as newly added nodes.
-        if (rec.target?.nodeType === 1 && captureLongThinkingFromNode(rec.target)) statusChanged = true;
+
+        const targetEl = rec.target?.nodeType === 1 ? rec.target : rec.target?.parentElement;
+        const touchesTrackedProduct = !!targetEl && (
+          (DC.productStateNode && (targetEl === DC.productStateNode ||
+            DC.productStateNode.contains?.(targetEl) || targetEl.contains?.(DC.productStateNode))) ||
+          (DC.longThinkingNode && (targetEl === DC.longThinkingNode ||
+            DC.longThinkingNode.contains?.(targetEl) || targetEl.contains?.(DC.longThinkingNode)))
+        );
+        if (touchesTrackedProduct) productStateChanged = true;
+        if (mutationProductState(rec.target)) productStateChanged = true;
+
         for (const node of rec.addedNodes || []) {
-          if (captureLongThinkingFromNode(node)) statusChanged = true;
+          if (mutationProductState(node)) productStateChanged = true;
           if (node.nodeType !== 1) continue;
           const el = node;
           if (el.matches?.('[data-message-author-role]') || el.querySelector?.('[data-message-author-role]')) structureChanged = true;
-          if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
-          const alertish = el.matches?.('[role="alert"],[data-testid*="error" i]') || el.querySelector?.('[role="alert"],[data-testid*="error" i]');
-          let retryish = el.matches?.('button') && !!retryControlLabel(el);
-          if (!retryish) {
-            try {
-              const buttons = Array.from(el.querySelectorAll?.('button') || []).slice(-12);
-              retryish = buttons.some(btn => !!retryControlLabel(btn));
-            } catch (_) {}
-          }
-          if (alertish || retryish) statusChanged = true;
+          if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') ||
+              el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
         }
+
         for (const node of rec.removedNodes || []) {
           if (node.nodeType !== 1) continue;
-          if (DC.longThinkingNode && (node === DC.longThinkingNode || node.contains?.(DC.longThinkingNode))) DC.longThinkingNode = null;
+          if (DC.longThinkingNode &&
+              (node === DC.longThinkingNode || node.contains?.(DC.longThinkingNode))) {
+            DC.longThinkingNode = null;
+          }
+          if (DC.productStateNode &&
+              (node === DC.productStateNode || node.contains?.(DC.productStateNode))) {
+            DC.productStateNode = null;
+          }
           if (node.matches?.('[data-message-author-role]') || node.querySelector?.('[data-message-author-role]')) structureChanged = true;
-          if (node.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || node.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
+          if (node.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') ||
+              node.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
         }
       }
+
       if (structureChanged) DC.messagesDirty = true;
       if (composerChanged) { DC.composer = null; DC.form = null; DC.composerNode = null; }
-      if (structureChanged || statusChanged || composerChanged) scheduleEvaluate(structureChanged ? 'structure' : composerChanged ? 'composer-structure' : 'status', CFG.structureDebounceMs);
+      if (structureChanged || productStateChanged || composerChanged) {
+        scheduleEvaluate(
+          structureChanged ? 'structure' : composerChanged ? 'composer-structure' : 'product-state',
+          CFG.structureDebounceMs,
+        );
+      }
     });
-    try { DC.rootObserver.observe(root, { childList: true, subtree: true }); } catch (_) {}
+    try { DC.rootObserver.observe(root, { childList: true, subtree: true, characterData: true }); } catch (_) {}
   }
-
 
   function installComposerObserver() {
     if (!S.projectActive || !isProjectUrl()) return;
@@ -1374,6 +1457,7 @@
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1406,6 +1490,7 @@
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1713,7 +1798,7 @@
     const next = getComposerControlState();
     const recentAssistantProgress = !!S.txn &&
       now() - Number(S.lastAssistantProgressAt || 0) < CFG.recoveryStopQuietMs;
-    const longThinkingBusy = !!findLongThinkingNotice();
+    const longThinkingBusy = !!DC.longThinkingNode?.isConnected && visible(DC.longThinkingNode);
     return next.kind === 'stop' || next.kind === 'spinner' || next.kind === 'streaming' ||
       next.busyEvidence || longThinkingBusy || recentAssistantProgress;
   }
@@ -1742,8 +1827,8 @@
 
     // Stop is destructive. Ordinary error/UI/network recovery is never allowed
     // to interrupt a turn that still has live generation evidence. Only paths
-    // with their own long quiet timeout (15m stuck / 10m long-thinking) may stop
-    // while ChatGPT still exposes a Stop/streaming control.
+    // with independently strong rendered evidence (or the 15m stuck timeout)
+    // may stop while ChatGPT still exposes a stale Stop/streaming control.
     if (!options.allowBusyStop && hasLiveGenerationEvidence()) {
       log('recovery-deferred-live-generation', { reason });
       scheduleEvaluate(`recovery-live-generation:${reason}`, 1_000);
@@ -2494,6 +2579,11 @@
     const msgs = getMessages();
     promoteSendIntentFromDom(msgs);
 
+    // One rendered product-state scan owns alerts, status/live regions, Retry,
+    // long-thinking, and compact current-tail error chrome.
+    const product = scanRenderedProductState(msgs);
+    const longThinking = product.longThinking;
+
     const prevGenerating = S.generating;
     S.generating = isGenerating();
     if (prevGenerating && !S.generating) S.lastGenerationEndAt = now();
@@ -2505,12 +2595,11 @@
 
     confirmTxn(msgs);
     const marker = latestMarker(msgs);
-    let err = currentError(msgs);
+    let err = currentError(msgs, product.error);
     // A terminal protocol marker commits the prior turn. Do not let a stale
     // transient toast from that already-committed turn pin the queue forever.
     if (!S.txn && marker && ['continue', 'send', 'reload'].includes(err?.kind || '')) err = null;
     S.error = err;
-    const longThinking = updateLongThinking();
 
     if (!S.enabled) { paintUI(); return; }
     if (!navigator.onLine) { paintUI(); return; }
@@ -2521,7 +2610,7 @@
     // If recovery lost its journal, adopt the visible user/assistant tail now
     // instead of waiting for the generic fifteen-minute orphan fallback.
     if (longThinking && !marker && !S.hib && !S.txn && msgs.lastUserText &&
-        assistantIsCurrentTail(msgs) && !['auth', 'anti-abuse', 'policy'].includes(err?.id || '')) {
+        assistantIsCurrentTail(msgs) && err?.kind !== 'hard') {
       adoptUntrackedTurn(msgs, 'long-thinking-adopt');
     }
 
@@ -2680,7 +2769,7 @@
     // remains unfinished. The same fifteen-minute no-progress rule may adopt that
     // current tail, but never an active hibernation or a safety-blocked response.
     if (!S.txn && !S.hib && !marker && assistantIsCurrentTail(msgs) && msgs.lastUserText &&
-        !['auth', 'anti-abuse', 'policy'].includes(err?.id || '') &&
+        err?.kind !== 'hard' &&
         now() - S.lastAssistantProgressAt >= CFG.incompleteVerifyMs) {
       const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-15m');
       if (adopted) {
@@ -2745,6 +2834,7 @@
     DC.composer = null;
     DC.form = null;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
 
     for (const key of ['watchdogTimer', 'queuePumpTimer', 'wakeTimer']) {
       if (DC[key]) clearTimeout(DC[key]);
@@ -3418,6 +3508,10 @@
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
+      ['connection interrupted continues', classifyProductText('Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
+      ['connection interrupted is strong nonsemantic card id', ['connection-interrupted'].includes(classifyProductText('Connection interrupted. Waiting for the complete answer')?.id), true],
+      ['ordinary Thinking is not product state', classifyProductText('Thinking')?.id || null, null],
+      ['long-thinking stays separate', classifyProductText('Our systems are thinking a bit more about this request')?.kind, 'long-thinking'],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
       ['upstream reset continues', classifyError('upstream connect error or disconnect/reset before headers')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
@@ -3427,7 +3521,7 @@
       ['rate outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'rate',kind:'rate'})?.id, 'rate'],
       ['reload outranks retry continue', pickError({id:'retry',kind:'continue'},{id:'load',kind:'reload'})?.id, 'load'],
       ['send outranks retry before confirmation', pickError({id:'retry',kind:'continue'},{id:'send',kind:'send'})?.id, 'send'],
-      ['rendered product error may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'dom'}), true],
+      ['rendered product error may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'rendered'}), true],
       ['retry control may stop stale busy UI', errorAllowsBusyStop({kind:'continue',source:'retry'}), true],
       ['transport error cannot bypass live-control veto', errorAllowsBusyStop({kind:'continue',source:'transport'}), false],
       ['rate classified', classifyError('Too many requests. Try again in 45 seconds')?.kind, 'rate'],
@@ -3468,9 +3562,9 @@
       ['nested project chat route', routeKey('https://chatgpt.com/g/g-p-project/project/c/abc-123'), 'c:abc-123'],
       ['project key stable', projectKeyFromUrl('https://chatgpt.com/g/g-p-project/c/abc-123'), 'g-p-project'],
     ];
-    // The classifier alone intentionally matches generic prose; collectErrorText
-    // is the guard that prevents normal assistant prose from reaching it. Keep
-    // that behavior explicit in the test output instead of pretending otherwise.
+    // The raw classifier may match generic prose. scanRenderedProductState()
+    // prevents ordinary assistant prose from reaching it by scanning semantic
+    // product UI plus only compact, error-shaped current assistant tails.
     return cases.map(([name, got, expected], i) => ({ i, name, got, expected, pass: got === expected }));
   }
 
