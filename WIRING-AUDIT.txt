@@ -293,6 +293,9 @@ Product-state adapter
   an error signal and is never clicked automatically.
 - A bounded mutation cache supports small non-semantic product cards without a
   recurring div/page text sweep. Composer/user/assistant prose is excluded.
+- The exact "Connection interrupted. Waiting for the complete answer" card is
+  explicitly accepted by that bounded fallback even if ChatGPT omits semantic
+  role/status attributes.
 - Long-thinking uses the same adapter but remains a dedicated state, not an
   ordinary error class.
 - Mutation and evaluation paths share classifyProductText(), eliminating the old
