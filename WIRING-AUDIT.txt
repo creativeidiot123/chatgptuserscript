@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.30 — wiring / edge-case audit
+ChatGPT Resilience v1.3.31 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -279,6 +279,12 @@ Error recovery matrix
 Recoverable generation errors:
 - network / timeout / message-stream / thinking-failed / generation / server /
   image-generation / Retry / Try again / recoverable HTTP statuses
+- Product status/live regions are scanned too, including role=status and
+  aria-live=polite. They are admitted only when that node's own text matches a
+  known error, so ordinary "Thinking" status chrome does not trigger recovery.
+- "Connection interrupted. Waiting for the complete answer" is therefore
+  classified as the current-turn network recovery state and enters the normal
+  Stop -> settle -> 10-second wait -> continue flow.
 - Rendered current-turn error UI may bypass a stale Stop-control liveness veto,
   but never the 15-second fresh-assistant-progress veto.
 - Flow: Stop if present -> verify Stop settled -> capture post-Stop tail ->
@@ -390,7 +396,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.30
+- Userscript version: 1.3.31
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
