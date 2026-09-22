@@ -506,6 +506,7 @@
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
     kickQueue(`txn-clear:${reason}`, 40);
   }
 
@@ -601,6 +602,7 @@
     composerNode: null,
     assistantNode: null,
     longThinkingNode: null,
+    productStateNode: null,
     evaluateTimer: null,
     evaluateDueAt: 0,
     watchdogTimer: null,
@@ -962,6 +964,18 @@
       longThinkingNode = cached;
     }
 
+    // A mutation may discover a small non-semantic product card. Reuse that
+    // exact node only while it remains visible, current-turn relevant, and still
+    // classifies as a known product error.
+    const cachedProduct = DC.productStateNode;
+    if (cachedProduct?.isConnected && controlVisible(cachedProduct) &&
+        isTailRelevantElement(cachedProduct)) {
+      const state = classifyProductText(cachedProduct.textContent || '');
+      if (state && state.kind !== 'long-thinking') {
+        errors.push({ ...state, source: 'rendered' });
+      }
+    }
+
     const retry = findRetryButton();
     if (retry) {
       errors.push({
@@ -1006,23 +1020,39 @@
         DC.longThinkingNode = candidate;
         S.longThinkingSeenAt ||= now();
         S.longThinkingLastSeenAt = now();
+      } else {
+        DC.productStateNode = candidate;
       }
       return state;
     }
 
-    // Historical long-thinking UI has also appeared in a small non-semantic
-    // wrapper. Support only that exact state here; never run general error rules
-    // against arbitrary wrappers/composer text.
+    // Historical long-thinking/error cards have also appeared in small
+    // non-semantic wrappers. Inspect only wrappers outside message prose and the
+    // composer, then require either exact long-thinking or strongly error-shaped
+    // product text before caching the node.
     try {
+      const form = composerForm(getComposer());
       const outsideMessage = !el.closest?.('[data-message-author-role]');
-      const t = outsideMessage && (el.childElementCount || 0) <= 12
+      const outsideComposer = !form?.contains?.(el) && !el.closest?.('#cgr-root,#cgr-queue-tray');
+      const t = outsideMessage && outsideComposer && (el.childElementCount || 0) <= 12
         ? norm(el.textContent || '')
         : '';
-      if (t && t.length < 1200 && isLongThinkingText(t)) {
-        DC.longThinkingNode = el;
-        S.longThinkingSeenAt ||= now();
-        S.longThinkingLastSeenAt = now();
-        return { id: 'long-thinking', kind: 'long-thinking', sourceText: t };
+      if (t && t.length < 1200) {
+        if (isLongThinkingText(t)) {
+          DC.longThinkingNode = el;
+          S.longThinkingSeenAt ||= now();
+          S.longThinkingLastSeenAt = now();
+          return { id: 'long-thinking', kind: 'long-thinking', sourceText: t };
+        }
+        const state = classifyProductText(t);
+        const strongCard = state && (
+          ['hard', 'rate', 'reload'].includes(state.kind) ||
+          ASSISTANT_ERROR_TAIL_RE.test(t)
+        );
+        if (strongCard) {
+          DC.productStateNode = el;
+          return state;
+        }
       }
     } catch (_) {}
 
@@ -1207,6 +1237,10 @@
           if (DC.longThinkingNode &&
               (node === DC.longThinkingNode || node.contains?.(DC.longThinkingNode))) {
             DC.longThinkingNode = null;
+          }
+          if (DC.productStateNode &&
+              (node === DC.productStateNode || node.contains?.(DC.productStateNode))) {
+            DC.productStateNode = null;
           }
           if (node.matches?.('[data-message-author-role]') || node.querySelector?.('[data-message-author-role]')) structureChanged = true;
           if (node.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') ||
@@ -1410,6 +1444,7 @@
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -1442,6 +1477,7 @@
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
     setDraft(p, S.route);
     saveTxn();
     S.verify = null;
@@ -2785,6 +2821,7 @@
     DC.composer = null;
     DC.form = null;
     DC.longThinkingNode = null;
+    DC.productStateNode = null;
 
     for (const key of ['watchdogTimer', 'queuePumpTimer', 'wakeTimer']) {
       if (DC[key]) clearTimeout(DC[key]);
