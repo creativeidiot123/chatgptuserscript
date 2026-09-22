@@ -161,6 +161,7 @@
     { id: 'file-upload', kind: 'hard', re: /file upload (?:failed|error)|failed to upload|upload failed|failed to process (?:the )?file/i },
     { id: 'rate', kind: 'rate', re: /usage limit|message cap|rate limit|too many requests|try again in\s+\d|limit resets? (?:at|in)|please wait before trying again/i },
     { id: 'conversation-load', kind: 'reload', re: /conversation not found|(?:unable|failed|error) to load (?:this )?(?:conversation|chat)|problem preparing your chat|couldn(?:'|’)t load (?:this )?(?:conversation|chat)|chat not found/i },
+    { id: 'connection-interrupted', kind: 'continue', re: /connection interrupted(?:\.\s*waiting for the complete answer)?|waiting for the complete answer/i },
     { id: 'network', kind: 'continue', re: /network error|networkerror|failed to fetch|fetch failed|connection (?:error|reset|closed|lost|failed|interrupted|terminated)|websocket|socket (?:error|closed)|disconnected|upstream connect error|disconnect\/reset before headers|transport error|err_network/i },
     { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|connection timed out|message[- ]delivery (?:timed? out|timeout)|gateway time[- ]?out|err_timed_out|too late/i },
     { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted|closed unexpectedly)|incomplete chunked encoding|premature eof/i },
@@ -994,13 +995,6 @@
     const candidates = [];
     try {
       if (el.matches?.(selector)) candidates.push(el);
-
-      // The long-thinking banner has appeared in non-semantic wrappers before.
-      // Admit only a small wrapper outside message prose, then classify its whole
-      // text exactly like every other product-state candidate.
-      const outsideMessage = !el.closest?.('[data-message-author-role]');
-      if (outsideMessage && (el.childElementCount || 0) <= 12) candidates.push(el);
-
       const nested = el.querySelectorAll?.(selector) || [];
       for (let i = Math.max(0, nested.length - 16); i < nested.length; i++) candidates.push(nested[i]);
     } catch (_) {}
@@ -1015,6 +1009,22 @@
       }
       return state;
     }
+
+    // Historical long-thinking UI has also appeared in a small non-semantic
+    // wrapper. Support only that exact state here; never run general error rules
+    // against arbitrary wrappers/composer text.
+    try {
+      const outsideMessage = !el.closest?.('[data-message-author-role]');
+      const t = outsideMessage && (el.childElementCount || 0) <= 12
+        ? norm(el.textContent || '')
+        : '';
+      if (t && t.length < 1200 && isLongThinkingText(t)) {
+        DC.longThinkingNode = el;
+        S.longThinkingSeenAt ||= now();
+        S.longThinkingLastSeenAt = now();
+        return { id: 'long-thinking', kind: 'long-thinking', sourceText: t };
+      }
+    } catch (_) {}
 
     try {
       const buttons = Array.from(el.matches?.('button') ? [el] : el.querySelectorAll?.('button') || []).slice(-12);
@@ -2551,7 +2561,7 @@
     // If recovery lost its journal, adopt the visible user/assistant tail now
     // instead of waiting for the generic fifteen-minute orphan fallback.
     if (longThinking && !marker && !S.hib && !S.txn && msgs.lastUserText &&
-        assistantIsCurrentTail(msgs) && !['auth', 'anti-abuse', 'policy'].includes(err?.id || '')) {
+        assistantIsCurrentTail(msgs) && err?.kind !== 'hard') {
       adoptUntrackedTurn(msgs, 'long-thinking-adopt');
     }
 
@@ -2710,7 +2720,7 @@
     // remains unfinished. The same fifteen-minute no-progress rule may adopt that
     // current tail, but never an active hibernation or a safety-blocked response.
     if (!S.txn && !S.hib && !marker && assistantIsCurrentTail(msgs) && msgs.lastUserText &&
-        !['auth', 'anti-abuse', 'policy'].includes(err?.id || '') &&
+        err?.kind !== 'hard' &&
         now() - S.lastAssistantProgressAt >= CFG.incompleteVerifyMs) {
       const adopted = adoptUntrackedTurn(msgs, 'untracked-stuck-15m');
       if (adopted) {
@@ -3448,7 +3458,7 @@
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
-      ['connection interrupted continues', classifyProductText('Connection interrupted. Waiting for the complete answer')?.id, 'network'],
+      ['connection interrupted continues', classifyProductText('Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
       ['ordinary Thinking is not product state', classifyProductText('Thinking')?.id || null, null],
       ['long-thinking stays separate', classifyProductText('Our systems are thinking a bit more about this request')?.kind, 'long-thinking'],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
