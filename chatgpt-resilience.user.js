@@ -1050,6 +1050,7 @@
         }
         const state = classifyProductText(t);
         const strongCard = state && (
+          state.id === 'connection-interrupted' ||
           ['hard', 'rate', 'reload'].includes(state.kind) ||
           ASSISTANT_ERROR_TAIL_RE.test(t)
         );
@@ -1826,8 +1827,8 @@
 
     // Stop is destructive. Ordinary error/UI/network recovery is never allowed
     // to interrupt a turn that still has live generation evidence. Only paths
-    // with their own long quiet timeout (15m stuck / 10m long-thinking) may stop
-    // while ChatGPT still exposes a Stop/streaming control.
+    // with independently strong rendered evidence (or the 15m stuck timeout)
+    // may stop while ChatGPT still exposes a stale Stop/streaming control.
     if (!options.allowBusyStop && hasLiveGenerationEvidence()) {
       log('recovery-deferred-live-generation', { reason });
       scheduleEvaluate(`recovery-live-generation:${reason}`, 1_000);
@@ -3508,6 +3509,7 @@
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
       ['connection interrupted continues', classifyProductText('Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
+      ['connection interrupted is strong nonsemantic card id', ['connection-interrupted'].includes(classifyProductText('Connection interrupted. Waiting for the complete answer')?.id), true],
       ['ordinary Thinking is not product state', classifyProductText('Thinking')?.id || null, null],
       ['long-thinking stays separate', classifyProductText('Our systems are thinking a bit more about this request')?.kind, 'long-thinking'],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
