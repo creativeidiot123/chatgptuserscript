@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.30
+// @version      1.3.31
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.30
+   * ChatGPT Resilience 1.3.31
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -56,7 +56,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.30';
+  const VERSION = '1.3.31';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -144,7 +144,9 @@
     ],
     alerts: [
       '[role="alert"]',
+      '[role="status"]',
       '[aria-live="assertive"]',
+      '[aria-live="polite"]',
       '[data-testid*="error" i]',
     ],
   });
@@ -960,12 +962,16 @@
     if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) chunks.push(tail);
 
     const root = document.querySelector('main') || document;
-    const alerts = qAll(SELECTORS.alerts, root).slice(-16);
+    const alerts = qAll(SELECTORS.alerts, root).slice(-24);
     for (const el of alerts) {
       if (!controlVisible(el) || !isTailRelevantElement(el)) continue;
       if (el.closest?.('[data-message-author-role="user"]')) continue;
       const t = norm(el.textContent || '');
       if (!t || t.length >= 4000 || MAX_LENGTH_UI_RE.test(t)) continue;
+      // Broadly scan product status/live regions, but only admit nodes whose own
+      // text is already a known error. Normal "Thinking"/status chrome therefore
+      // cannot become recovery evidence merely because it uses role=status.
+      if (!classifyError(t)) continue;
       chunks.push(t);
     }
     return chunks.join('\n').slice(-10_000);
@@ -1141,6 +1147,25 @@
     return false;
   }
 
+  function nodeContainsKnownErrorStatus(node) {
+    if (!node) return false;
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    if (!el) return false;
+    const selector = SELECTORS.alerts.join(',');
+    const candidates = [];
+    try {
+      if (el.matches?.(selector)) candidates.push(el);
+      const nested = el.querySelectorAll?.(selector) || [];
+      for (let i = Math.max(0, nested.length - 12); i < nested.length; i++) candidates.push(nested[i]);
+    } catch (_) {}
+    for (const candidate of candidates) {
+      const t = norm(candidate.textContent || '');
+      if (!t || t.length >= 4000 || MAX_LENGTH_UI_RE.test(t)) continue;
+      if (classifyError(t)) return true;
+    }
+    return false;
+  }
+
   function installRootObserver() {
     if (!S.projectActive || !isProjectUrl()) return;
     const root = document.querySelector('main') || document.body;
@@ -1157,15 +1182,15 @@
         // dedicated tail observer. Do not invalidate the entire message cache.
         if (DC.lastAssistant && (rec.target === DC.lastAssistant || DC.lastAssistant.contains?.(rec.target))) continue;
         // Some status banners keep the same wrapper and only replace a text
-        // child. Inspect that small mutation target as well as newly added nodes.
-        if (rec.target?.nodeType === 1 && captureLongThinkingFromNode(rec.target)) statusChanged = true;
+        // child. Inspect the mutation target as well as newly added nodes.
+        if (captureLongThinkingFromNode(rec.target) || nodeContainsKnownErrorStatus(rec.target)) statusChanged = true;
         for (const node of rec.addedNodes || []) {
-          if (captureLongThinkingFromNode(node)) statusChanged = true;
+          if (captureLongThinkingFromNode(node) || nodeContainsKnownErrorStatus(node)) statusChanged = true;
           if (node.nodeType !== 1) continue;
           const el = node;
           if (el.matches?.('[data-message-author-role]') || el.querySelector?.('[data-message-author-role]')) structureChanged = true;
           if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') || el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
-          const alertish = el.matches?.('[role="alert"],[data-testid*="error" i]') || el.querySelector?.('[role="alert"],[data-testid*="error" i]');
+          const alertish = nodeContainsKnownErrorStatus(el);
           let retryish = el.matches?.('button') && !!retryControlLabel(el);
           if (!retryish) {
             try {
@@ -3418,6 +3443,8 @@
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
+      ['connection interrupted status continues', classifyError('Connection interrupted. Waiting for the complete answer')?.id, 'network'],
+      ['ordinary Thinking status is not an error', classifyError('Thinking')?.id || null, null],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
       ['upstream reset continues', classifyError('upstream connect error or disconnect/reset before headers')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
