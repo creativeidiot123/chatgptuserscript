@@ -973,7 +973,11 @@
       const state = classifyProductText(cachedProduct.textContent || '');
       if (state && state.kind !== 'long-thinking') {
         errors.push({ ...state, source: 'rendered' });
+      } else {
+        DC.productStateNode = null;
       }
+    } else if (cachedProduct) {
+      DC.productStateNode = null;
     }
 
     const retry = findRetryButton();
@@ -1221,6 +1225,14 @@
         // state is nested there, that observer will schedule the same evaluation.
         if (DC.lastAssistant && (rec.target === DC.lastAssistant || DC.lastAssistant.contains?.(rec.target))) continue;
 
+        const targetEl = rec.target?.nodeType === 1 ? rec.target : rec.target?.parentElement;
+        const touchesTrackedProduct = !!targetEl && (
+          (DC.productStateNode && (targetEl === DC.productStateNode ||
+            DC.productStateNode.contains?.(targetEl) || targetEl.contains?.(DC.productStateNode))) ||
+          (DC.longThinkingNode && (targetEl === DC.longThinkingNode ||
+            DC.longThinkingNode.contains?.(targetEl) || targetEl.contains?.(DC.longThinkingNode)))
+        );
+        if (touchesTrackedProduct) productStateChanged = true;
         if (mutationProductState(rec.target)) productStateChanged = true;
 
         for (const node of rec.addedNodes || []) {
