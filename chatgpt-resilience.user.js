@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.31
+// @version      1.3.32
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.31
+   * ChatGPT Resilience 1.3.32
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -36,7 +36,7 @@
    *     is stopped if needed, held idle for 10 seconds, then resumed with: continue
    *   - Rendered product state is scanned once from semantic current-turn UI
    *   - Recoverable generation errors use Stop -> settle -> 10 seconds -> continue
-   *   - Exact long-thinking uses the same recovery boundary as a dedicated state
+   *   - Exact long-thinking persists 15s, then forces the shared Stop -> wait -> continue boundary
    *   - Composer Send/Voice controls are liveness hints only; they never trigger Stop by themselves
    *   - Retry/Try again controls are failure signals only; they are never clicked
    *   - Regenerate is normal answer UI and is never treated as failure evidence
@@ -57,7 +57,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.31';
+  const VERSION = '1.3.32';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -80,6 +80,7 @@
     incompleteVerifyMs: 15 * 60_000,
     recoveryPauseMs: 10_000,
     recoveryStopQuietMs: 15_000,
+    longThinkingForceMs: 15_000,
     intentionalStopNetworkSuppressMs: 15_000,
     sendConfirmMs: 18_000,
     networkOwnershipMs: 15_000,
@@ -916,6 +917,11 @@
   function isLongThinkingText(text) {
     const t = norm(text);
     return !!t && (LONG_THINKING_RE.test(t) || LONG_THINKING_EXACT_RE.test(t));
+  }
+
+  function longThinkingRecoveryReady(seenAt, at = now()) {
+    const seen = Number(seenAt || 0);
+    return !!seen && at - seen >= CFG.longThinkingForceMs;
   }
 
   function classifyProductText(text) {
@@ -1835,8 +1841,11 @@
       return false;
     }
 
-    // Even proven-stuck recovery cannot interrupt fresh assistant output.
-    if (t.assistantObserved || t.generationObserved) {
+    // Ordinary recovery also requires fresh assistant text to have gone quiet.
+    // Persistent long-thinking is different: tool/search/activity cards mutate
+    // inside the assistant turn and can refresh lastAssistantProgressAt forever.
+    // Its own persistence clock is the safety gate instead.
+    if (!options.ignoreAssistantTextProgress && (t.assistantObserved || t.generationObserved)) {
       const quietFor = now() - Number(S.lastAssistantProgressAt || 0);
       const waitFor = CFG.recoveryStopQuietMs - quietFor;
       if (waitFor > 0) {
@@ -1929,7 +1938,8 @@
       }
       const after = getMessages(true);
       if (latestMarker(after)) return false;
-      if (signature(after.lastAssistantText) !== settledSig) {
+      if (!options.ignoreAssistantTextProgress &&
+          signature(after.lastAssistantText) !== settledSig) {
         S.lastAssistantProgressAt = now();
         scheduleEvaluate(`recovery-progress:${reason}`, 500);
         return false;
@@ -2555,11 +2565,22 @@
     if (!t || !t.userTurnConfirmed || t.manualStopped) return false;
     if (latestMarker(msgs)) return false;
 
-    // The exact ChatGPT long-thinking state is itself strong recovery evidence.
-    // It may bypass a stale Stop/streaming control, but stopThenContinue() still
-    // requires 15 seconds without fresh assistant text before destructive Stop.
+    // Long-thinking gets its own persistence gate. Tool/search/activity cards
+    // mutate inside the assistant turn, so generic assistant-progress timestamps
+    // are not reliable while this exact product state is visible. If it remains
+    // continuously visible for 15 seconds, force the normal Stop -> settle ->
+    // 10-second grace -> continue loop. Terminal/offline/control vetoes remain.
     if (longThinking) {
-      return stopThenContinue('long-thinking', { allowBusyStop: true });
+      const seenAt = Number(S.longThinkingSeenAt || 0);
+      if (!longThinkingRecoveryReady(seenAt)) {
+        const waitFor = Math.max(50, CFG.longThinkingForceMs - (now() - seenAt));
+        scheduleEvaluate('long-thinking-force-window', waitFor + 50);
+        return false;
+      }
+      return stopThenContinue('long-thinking', {
+        allowBusyStop: true,
+        ignoreAssistantTextProgress: true,
+      });
     }
 
     const quietFor = now() - Math.max(
@@ -2722,7 +2743,7 @@
           else log('pending-error-cleared', { reason: pendingReason });
         } else if (pendingReason === 'long-thinking') {
           if (longThinking) {
-            await stopThenContinue('long-thinking', { allowBusyStop: true });
+            await maybeRecoverStall(msgs, true);
           } else {
             log('pending-long-thinking-cleared');
           }
@@ -3376,7 +3397,11 @@
       const quietRemain = CFG.incompleteVerifyMs - (now() - logicalQuietSince());
       return [`Verifying ${Math.max(1, Math.ceil(Math.max(verifyRemain, quietRemain) / 1000))}s`, 'warn'];
     }
-    if (S.generating) return [S.longThinkingSeenAt ? 'Long thinking' : 'Generating', 'active'];
+    if (S.generating && S.longThinkingSeenAt) {
+      const remain = Math.max(0, CFG.longThinkingForceMs - (now() - Number(S.longThinkingSeenAt || now())));
+      return [remain > 0 ? `Long thinking · recovery in ${Math.ceil(remain / 1000)}s` : 'Long thinking · recovery ready', 'warn'];
+    }
+    if (S.generating) return ['Generating', 'active'];
     if (S.txn) return [S.txn.userTurnConfirmed ? 'Waiting for finish marker' : 'Confirming send', 'active'];
     if (S.queue.length) {
       const reason = queueReleaseBlockReason();
@@ -3512,6 +3537,8 @@
       ['connection interrupted is strong nonsemantic card id', ['connection-interrupted'].includes(classifyProductText('Connection interrupted. Waiting for the complete answer')?.id), true],
       ['ordinary Thinking is not product state', classifyProductText('Thinking')?.id || null, null],
       ['long-thinking stays separate', classifyProductText('Our systems are thinking a bit more about this request')?.kind, 'long-thinking'],
+      ['long-thinking force window not ready early', longThinkingRecoveryReady(1_000, 15_999), false],
+      ['long-thinking force window ready at 15s', longThinkingRecoveryReady(1_000, 16_000), true],
       ['conversation not found classified', classifyError('Conversation not found')?.kind, 'reload'],
       ['upstream reset continues', classifyError('upstream connect error or disconnect/reset before headers')?.kind, 'continue'],
       ['timeout continues', classifyError('Message-delivery timeout')?.kind, 'continue'],
