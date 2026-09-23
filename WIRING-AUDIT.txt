@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.31 — wiring / edge-case audit
+ChatGPT Resilience v1.3.32 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -64,9 +64,12 @@ audit found these prior false-positive sources and closes each one:
    - Removed in v1.3.24.
 
 2. Long-thinking banner
-   - The exact ChatGPT long-thinking product state is immediate recovery evidence.
-   - It bypasses stale Stop/streaming control state, but the destructive boundary
-     still requires 15 seconds without fresh assistant text before clicking Stop.
+   - The exact ChatGPT long-thinking product state has its own 15-second
+     persistence clock.
+   - Tool/search/activity-card mutations inside the assistant turn do not reset
+     that clock and cannot hold long-thinking recovery forever.
+   - After 15 continuous seconds, long-thinking may bypass both stale
+     Stop/streaming controls and the generic assistant-text-progress gate.
    - Ordinary prose containing "still thinking" does not qualify.
 
 3. Fetch/XHR aborts
@@ -121,12 +124,14 @@ Final destructive-recovery boundary:
   evidence exists.
 - Strong rendered current-turn failure UI may bypass a stale Stop/streaming control,
   but never the 15-second fresh-assistant-progress veto.
-- The callers allowed to bypass only the control-level live veto are:
+- The callers allowed to bypass the control-level live veto are:
     * rendered current-turn recoverable error / Retry / Try again
-    * exact current-turn long-thinking product state
+    * persistent exact current-turn long-thinking product state
     * 15-minute tracked stuck timeout
     * 15-minute untracked stuck timeout
-- All four still require 15 seconds without fresh assistant tail progress.
+- Rendered errors and generic stuck recovery still use assistant-progress safety.
+- Long-thinking instead requires its own 15 continuous seconds of product-state
+  persistence, because tool/activity mutations are not reliable answer progress.
 - Terminal DONE / HIBERNATE / WAIT_USER markers hard-veto continuation.
 
 Generation detection
@@ -346,9 +351,10 @@ Recovery boundary
 - Recoverable generation errors, verifier recovery, and validated pending
   continuation signals funnel through stopThenContinue().
 - Ordinary recovery cannot Stop while live generation evidence exists.
-- The exact long-thinking product state and the 15-minute stuck paths may bypass
-  the live-control veto, and all still require 15 seconds without fresh
-  assistant-tail progress.
+- The 15-minute stuck paths may bypass the live-control veto but still require
+  the normal assistant-progress safety.
+- Exact long-thinking uses a separate 15-second persistence gate and then ignores
+  generic assistant-text signature churn from tool/search/activity cards.
 - The fifteen-minute stuck verifier naturally satisfies this guard.
 - Fetch/XHR aborts are ignored as normal request cancellation noise rather than
   being promoted to recoverable network errors.
@@ -361,9 +367,12 @@ Recovery boundary
 
 Long-thinking recovery
 ----------------------
-- Known ChatGPT "thinking a bit more" product text requests recovery immediately.
-- It does not blindly click Stop: the shared destructive boundary still requires
-  15 seconds without fresh assistant output first.
+- Known ChatGPT "thinking a bit more" product text starts a dedicated 15-second
+  persistence window.
+- If the banner remains continuously visible for that window, recovery proceeds
+  even when tool/search/activity UI keeps mutating inside the assistant turn.
+- The status pill shows the remaining recovery countdown instead of only
+  "Long thinking".
 - Generic prose containing "still thinking" is not enough. Only the known product
   phrases or an element whose whole text is essentially "Still thinking..." count.
 - If the transaction journal is missing, the current visible user/assistant tail
@@ -373,6 +382,9 @@ Long-thinking recovery
   current turn is reconciled before recovery.
 - Recovery remains: click Stop -> wait until the composer shows a settled
   Send/Voice/idle state -> wait 10 seconds -> send literal "continue".
+- For this forced long-thinking path, assistant textContent signature churn during
+  the pre-Stop/pause window does not cancel recovery; terminal markers, offline
+  state, Stop-settle failure, and restarted generation controls still veto it.
 - The long-thinking banner may remain mounted after Stop, so post-Stop settling
   intentionally ignores that banner and trusts the actual composer controls.
 
@@ -423,7 +435,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.31
+- Userscript version: 1.3.32
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
