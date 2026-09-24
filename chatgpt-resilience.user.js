@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.32
+// @version      1.3.33
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.32
+   * ChatGPT Resilience 1.3.33
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -57,7 +57,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.32';
+  const VERSION = '1.3.33';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -81,6 +81,7 @@
     recoveryPauseMs: 10_000,
     recoveryStopQuietMs: 15_000,
     longThinkingForceMs: 15_000,
+    connectionInterruptedForceMs: 15_000,
     intentionalStopNetworkSuppressMs: 15_000,
     sendConfirmMs: 18_000,
     networkOwnershipMs: 15_000,
@@ -506,6 +507,7 @@
     S.controlFault = '';
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
+    S.connectionInterruptedSeenAt = 0;
     DC.longThinkingNode = null;
     DC.productStateNode = null;
     kickQueue(`txn-clear:${reason}`, 40);
@@ -576,6 +578,7 @@
     lastUserSig: '',
     longThinkingSeenAt: 0,
     longThinkingLastSeenAt: 0,
+    connectionInterruptedSeenAt: 0,
     logs: [],
     verify: null,
     sendIntent: null,
@@ -933,17 +936,36 @@
     return classifyError(t);
   }
 
+  function classifyRenderedTailError(text) {
+    const tail = norm(text).slice(-1800);
+    if (!tail) return null;
+    const match = tail.match(ASSISTANT_ERROR_TAIL_RE);
+    if (!match?.[0]) return null;
+    return classifyError(match[0]);
+  }
+
+  function connectionInterruptedRecoveryReady(seenAt, at = now()) {
+    const seen = Number(seenAt || 0);
+    return !!seen && at - seen >= CFG.connectionInterruptedForceMs;
+  }
+
   function scanRenderedProductState(msgs = getMessages()) {
     const errors = [];
     let longThinkingNode = null;
 
-    // Compact assistant-tail product errors are legitimate rendered evidence,
-    // but ordinary assistant prose never enters the error classifier.
-    const assistantText = assistantIsCurrentTail(msgs) ? norm(msgs.lastAssistantText) : '';
-    const tail = assistantText.slice(-1400);
-    if (assistantText.length <= 1000 && tail && ASSISTANT_ERROR_TAIL_RE.test(tail)) {
-      const err = classifyError(tail);
-      if (err) errors.push({ ...err, source: 'rendered' });
+    // Product error chrome can be appended inside a long assistant turn without
+    // semantic role/status attributes. Inspect only the tail-anchored product
+    // error suffix, never arbitrary assistant prose.
+    const assistantText = assistantIsCurrentTail(msgs) ? msgs.lastAssistantText : '';
+    const assistantTailError = classifyRenderedTailError(assistantText);
+    if (assistantTailError) errors.push({ ...assistantTailError, source: 'rendered' });
+
+    const turn = tailTurnRoot();
+    if (turn && turn !== msgs.lastAssistant) {
+      const turnTailError = classifyRenderedTailError(rawNodeText(turn));
+      if (turnTailError && !errors.some(err => err.id === turnTailError.id)) {
+        errors.push({ ...turnTailError, source: 'rendered' });
+      }
     }
 
     // ChatGPT currently exposes transient product state through semantic live
@@ -1003,6 +1025,15 @@
     } else {
       S.longThinkingSeenAt = 0;
       S.longThinkingLastSeenAt = 0;
+    }
+
+    const interruptedVisible = errors.some(err =>
+      err.id === 'connection-interrupted' && err.source === 'rendered'
+    );
+    if (interruptedVisible) {
+      S.connectionInterruptedSeenAt ||= now();
+    } else {
+      S.connectionInterruptedSeenAt = 0;
     }
 
     return {
@@ -1462,6 +1493,7 @@
     S.txn = newTxn(p, source, queueItemId);
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
+    S.connectionInterruptedSeenAt = 0;
     DC.longThinkingNode = null;
     DC.productStateNode = null;
     setDraft(p, S.route);
@@ -1495,6 +1527,7 @@
     t.nextRecoveryAt = 0;
     S.longThinkingSeenAt = 0;
     S.longThinkingLastSeenAt = 0;
+    S.connectionInterruptedSeenAt = 0;
     DC.longThinkingNode = null;
     DC.productStateNode = null;
     setDraft(p, S.route);
@@ -2552,9 +2585,26 @@
     // Once the user turn is confirmed, message-send chrome is stale by definition.
     if (err.kind === 'send') return false;
 
-    // Rendered Retry/product-error evidence may outlive ChatGPT's Stop control.
-    // It may bypass the control-level live veto, but the shared recovery boundary
-    // still requires 15 seconds without fresh assistant output before clicking Stop.
+    // Exact rendered interruption state gets its own persistence gate. Tool and
+    // activity cards can mutate inside the assistant turn indefinitely after the
+    // stream is already broken, so generic assistant-progress timestamps are not
+    // reliable for this one product state.
+    if (err.id === 'connection-interrupted' && err.source === 'rendered') {
+      const seenAt = Number(S.connectionInterruptedSeenAt || 0);
+      if (!connectionInterruptedRecoveryReady(seenAt)) {
+        const waitFor = Math.max(50, CFG.connectionInterruptedForceMs - (now() - seenAt));
+        scheduleEvaluate('connection-interrupted-force-window', waitFor + 50);
+        return true;
+      }
+      resetVerification(`error:${err.id}`);
+      return stopThenContinue(`error:${err.id}`, {
+        allowBusyStop: true,
+        ignoreAssistantTextProgress: true,
+      });
+    }
+
+    // Other rendered Retry/product-error evidence may outlive ChatGPT's Stop
+    // control, but still uses the normal assistant-progress safety gate.
     resetVerification(`error:${err.id}`);
     return stopThenContinue(`error:${err.id}`, {
       allowBusyStop: errorAllowsBusyStop(err),
@@ -3391,6 +3441,10 @@
     if (S.recovery) return ['Stopping stuck turn', 'warn'];
     if (S.actionInFlight) return ['Recovering', 'active'];
     if (S.error?.id === 'retry-control') return ['Retry detected', 'warn'];
+    if (S.error?.id === 'connection-interrupted' && S.connectionInterruptedSeenAt) {
+      const remain = Math.max(0, CFG.connectionInterruptedForceMs - (now() - Number(S.connectionInterruptedSeenAt || now())));
+      return [remain > 0 ? `Connection interrupted · recovery in ${Math.ceil(remain / 1000)}s` : 'Connection interrupted · recovery ready', 'warn'];
+    }
     if (S.error) return [S.error.id, S.error.kind === 'hard' ? 'error' : 'warn'];
     if (S.verify) {
       const verifyRemain = CFG.incompleteVerifyMs - (now() - S.verify.since);
@@ -3534,6 +3588,10 @@
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
       ['connection interrupted continues', classifyProductText('Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
+      ['long assistant tail still finds interrupted card', classifyRenderedTailError('normal assistant prose '.repeat(120) + ' Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
+      ['ordinary assistant tail still ignored', classifyRenderedTailError('We should discuss what a network error means in software.')?.id || null, null],
+      ['connection interrupted force window not ready early', connectionInterruptedRecoveryReady(1_000, 15_999), false],
+      ['connection interrupted force window ready at 15s', connectionInterruptedRecoveryReady(1_000, 16_000), true],
       ['connection interrupted is strong nonsemantic card id', ['connection-interrupted'].includes(classifyProductText('Connection interrupted. Waiting for the complete answer')?.id), true],
       ['ordinary Thinking is not product state', classifyProductText('Thinking')?.id || null, null],
       ['long-thinking stays separate', classifyProductText('Our systems are thinking a bit more about this request')?.kind, 'long-thinking'],
