@@ -174,6 +174,12 @@
     '[contenteditable="true"][role="textbox"][data-composer-markdown]',
   ].join(',');
 
+  const USER_MESSAGE_SCOPE_SELECTOR = [
+    '[data-message-author-role="user"]',
+    '[data-user-message-bubble="true"]',
+    '[data-chatgpt-search-unit-key$=":user"]',
+  ].join(',');
+
   const ASSISTANT_SCOPE_SELECTOR = [
     '[data-chatgpt-search-unit-key$=":assistant"]',
     '[data-content-search-unit-key$=":assistant"]',
@@ -1079,7 +1085,7 @@
     const root = document.querySelector('main') || document;
     for (const el of qAll(SELECTORS.productState, root)) {
       if (!controlVisible(el) || !isTailRelevantElement(el)) continue;
-      if (el.closest?.('[data-message-author-role="user"]')) continue;
+      if (el.closest?.(USER_MESSAGE_SCOPE_SELECTOR)) continue;
       const state = classifyProductText(el.textContent || '');
       if (!state) continue;
       if (state.kind === 'long-thinking') {
@@ -1178,7 +1184,7 @@
     // product text before caching the node.
     try {
       const form = composerForm(getComposer());
-      const outsideMessage = !el.closest?.('[data-message-author-role]');
+      const outsideMessage = !el.closest?.(MESSAGE_STRUCTURE_SELECTOR);
       const outsideComposer = !form?.contains?.(el) && !el.closest?.('#cgr-root,#cgr-queue-tray');
       const t = outsideMessage && outsideComposer && (el.childElementCount || 0) <= 12
         ? norm(el.textContent || '')
@@ -1689,8 +1695,8 @@
     if (msgs.lastAssistant && assistantIsCurrentTail(msgs)) {
       const direct = terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
       if (direct) return direct;
-      const turn = msgs.lastAssistant.closest?.('[data-testid^="conversation-turn"],article');
-      if (turn) {
+      const turn = tailTurnRoot();
+      if (turn && turn !== msgs.lastAssistant) {
         const fromTurn = terminalMarker(msgs.lastAssistantText, turn);
         if (fromTurn) return fromTurn;
       }
@@ -1698,7 +1704,7 @@
 
     // Protocol ownership must survive ChatGPT wrapper changes. An exact visible
     // token in the latest-user -> composer corridor belongs to the current turn
-    // even when no data-message-author-role=assistant wrapper exists.
+    // even when ChatGPT changes or omits the assistant wrapper.
     return corridorProtocolMarker(msgs);
   }
 
