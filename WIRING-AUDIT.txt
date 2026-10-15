@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.33 — wiring / edge-case audit
+ChatGPT Resilience v1.3.34 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -252,6 +252,18 @@ Hard terminal veto
 - Exact visible protocol tokens are authoritative even if the surrounding
   assistant container has extra suffix text. The rendered token is not discarded
   just because flattened text has trailing UI/content.
+- Terminal protocol ownership no longer depends on
+  data-message-author-role="assistant". If that wrapper is missing/stale, the
+  runtime searches for an exact visible token after the latest user turn and
+  before the composer. User text, composer text, pre/code/blockquote examples,
+  and stale previous-assistant markers are therefore excluded.
+- The root observer wakes immediately when a terminal protocol token is inserted
+  or an existing text node changes into one, even if ChatGPT used an unknown
+  response wrapper. The observer checks only changed text and newly added nodes,
+  avoiding a page-wide mutation text scan.
+- Orphan HIBERNATE / WAIT_USER markers are reconciled before offline/pause/block
+  recovery gates because terminal protocol is durable state rather than a
+  recovery action. A visible terminal marker must never remain "untracked".
 - Exact marker search covers the whole current assistant/turn root rather than a
   fixed tail window. Large Sources/citation panels therefore cannot push a valid
   marker out of the search range.
@@ -265,6 +277,19 @@ Hard terminal veto
   updates cannot interleave and sneak a terminal marker into the send window.
 - If the final veto fires, the staged "continue" is cleared and the evaluator is
   re-run to commit DONE / HIBERNATE / WAIT_USER normally.
+
+Current-turn marker ownership
+-----------------------------
+- Known assistant wrappers remain the fast path when they are current.
+- A stale previous assistant after a newer user turn can no longer supply a
+  terminal marker.
+- Active transaction ownership is proved by the current user prompt hash plus a
+  current-turn marker; it no longer additionally requires an assistant wrapper.
+- This supports newer "Worked for ..." / tool-rich response shells without
+  weakening the user-turn boundary.
+- HIBERNATE and WAIT_USER can reconstruct their durable state when the journal is
+  absent. DONE remains the queue-release terminal state and is not converted into
+  hibernation state.
 
 Terminal-marker preemption
 --------------------------
@@ -445,7 +470,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.33
+- Userscript version: 1.3.34
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
