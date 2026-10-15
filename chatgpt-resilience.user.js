@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.33
+// @version      1.3.34
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.33
+   * ChatGPT Resilience 1.3.34
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -57,7 +57,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.33';
+  const VERSION = '1.3.34';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -303,6 +303,66 @@
 
   const MAX_LENGTH_UI_RE = /(?:you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
   const TRAILING_PRODUCT_UI_RE = /^(?:sources\b|you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
+
+  function protocolMarkerFromExactText(text) {
+    const value = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    if (value === PROTOCOL.DONE) return 'done';
+    if (value === PROTOCOL.HIBERNATE) return 'hibernate';
+    if (value === PROTOCOL.WAIT_USER) return 'wait-user';
+    return null;
+  }
+
+  function isCurrentTurnCorridorElement(el, msgs = getMessages()) {
+    const user = msgs?.lastUser;
+    if (!el?.isConnected || !user?.isConnected) return false;
+    try {
+      if (user.contains?.(el)) return false;
+      if (!(user.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+      const form = composerForm(getComposer());
+      if (form?.isConnected) {
+        if (form.contains?.(el)) return false;
+        if (!(el.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+      }
+      return true;
+    } catch (_) { return false; }
+  }
+
+  function corridorProtocolMarker(msgs = getMessages()) {
+    if (!msgs?.lastUser?.isConnected) return null;
+    const root = document.querySelector('main') || document.body || document;
+    try {
+      const nodes = root.querySelectorAll('p,div,span,li,h1,h2,h3,h4,h5,h6');
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const el = nodes[i];
+        if (!visible(el) || !isCurrentTurnCorridorElement(el, msgs)) continue;
+        if (el.closest?.('pre,code,blockquote') || el.querySelector?.('pre,code,blockquote')) continue;
+        const marker = protocolMarkerFromExactText(el.textContent || '');
+        if (marker) return marker;
+      }
+
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const textNodes = [];
+      let node;
+      while ((node = walker.nextNode())) textNodes.push(node);
+      for (let i = textNodes.length - 1; i >= 0; i--) {
+        const tn = textNodes[i];
+        const parent = tn.parentElement;
+        if (!parent || !visible(parent) || !isCurrentTurnCorridorElement(parent, msgs)) continue;
+        if (parent.closest?.('pre,code,blockquote')) continue;
+        const marker = protocolMarkerFromExactText(tn.nodeValue || '');
+        if (marker) return marker;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function nodeContainsProtocolToken(node) {
+    if (!node) return false;
+    const text = String(node.nodeType === Node.TEXT_NODE ? node.nodeValue : node.textContent || '');
+    return text.includes(PROTOCOL.DONE) ||
+      text.includes(PROTOCOL.HIBERNATE) ||
+      text.includes(PROTOCOL.WAIT_USER);
+  }
 
   function markerFromProtocolText(text) {
     const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
@@ -1257,10 +1317,19 @@
       let structureChanged = false;
       let productStateChanged = false;
       let composerChanged = false;
+      let protocolChanged = false;
 
       for (const rec of records) {
-        // Token-level assistant churn already has its own observer. If product
-        // state is nested there, that observer will schedule the same evaluation.
+        if (rec.type === 'characterData' && nodeContainsProtocolToken(rec.target)) {
+          protocolChanged = true;
+        }
+        for (const node of rec.addedNodes || []) {
+          if (nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
+        }
+
+        // Token-level assistant churn already has its own observer. Product state
+        // nested there is handled by that observer, but protocol tokens must still
+        // wake evaluation even if ChatGPT changed the assistant wrapper.
         if (DC.lastAssistant && (rec.target === DC.lastAssistant || DC.lastAssistant.contains?.(rec.target))) continue;
 
         const targetEl = rec.target?.nodeType === 1 ? rec.target : rec.target?.parentElement;
@@ -1300,10 +1369,12 @@
 
       if (structureChanged) DC.messagesDirty = true;
       if (composerChanged) { DC.composer = null; DC.form = null; DC.composerNode = null; }
-      if (structureChanged || productStateChanged || composerChanged) {
+      if (structureChanged || productStateChanged || composerChanged || protocolChanged) {
         scheduleEvaluate(
-          structureChanged ? 'structure' : composerChanged ? 'composer-structure' : 'product-state',
-          CFG.structureDebounceMs,
+          protocolChanged ? 'protocol-marker' :
+          structureChanged ? 'structure' :
+          composerChanged ? 'composer-structure' : 'product-state',
+          protocolChanged ? 0 : CFG.structureDebounceMs,
         );
       }
     });
@@ -1570,12 +1641,22 @@
   }
 
   function latestMarker(msgs = getMessages()) {
-    if (!msgs.lastAssistant) return null;
-    const direct = terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
-    if (direct) return direct;
-    const turn = msgs.lastAssistant.closest?.('[data-testid^="conversation-turn"],article');
-    if (!turn) return null;
-    return terminalMarker(msgs.lastAssistantText, turn);
+    // Prefer the known current assistant node when ChatGPT exposes one. Never
+    // accept a stale previous assistant after a newer user turn.
+    if (msgs.lastAssistant && assistantIsCurrentTail(msgs)) {
+      const direct = terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+      if (direct) return direct;
+      const turn = msgs.lastAssistant.closest?.('[data-testid^="conversation-turn"],article');
+      if (turn) {
+        const fromTurn = terminalMarker(msgs.lastAssistantText, turn);
+        if (fromTurn) return fromTurn;
+      }
+    }
+
+    // Protocol ownership must survive ChatGPT wrapper changes. An exact visible
+    // token in the latest-user -> composer corridor belongs to the current turn
+    // even when no data-message-author-role=assistant wrapper exists.
+    return corridorProtocolMarker(msgs);
   }
 
   function firstQueueItem(queue = S.queue) {
@@ -2340,8 +2421,9 @@
 
   // ---------- completion and recovery FSM --------------------------------------------
   function markerBelongsToTxn(msgs, t = S.txn) {
-    if (!t || !t.userTurnConfirmed || !assistantIsCurrentTail(msgs) || !msgs.lastUserText) return false;
-    return fnv1a(norm(msgs.lastUserText)) === t.currentPromptHash;
+    if (!t || !t.userTurnConfirmed || !msgs.lastUserText) return false;
+    if (fnv1a(norm(msgs.lastUserText)) !== t.currentPromptHash) return false;
+    return !!latestMarker(msgs);
   }
 
   function resetVerification(reason = 'activity') {
@@ -2673,6 +2755,16 @@
     S.error = err;
 
     if (!S.enabled) { paintUI(); return; }
+
+    // Terminal protocol is durable state, not a recovery action. Reconstruct
+    // orphan HIBERNATE / WAIT_USER ownership before offline/pause/block gates so
+    // a visible terminal marker can never remain "untracked".
+    if (!S.txn && marker && reconcileOrphanTerminalMarker(marker)) {
+      paintUI(true);
+      scheduleWatchdog();
+      return;
+    }
+
     if (!navigator.onLine) { paintUI(); return; }
     if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
     if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
@@ -2683,15 +2775,6 @@
     if (longThinking && !marker && !S.hib && !S.txn && msgs.lastUserText &&
         assistantIsCurrentTail(msgs) && err?.kind !== 'hard') {
       adoptUntrackedTurn(msgs, 'long-thinking-adopt');
-    }
-
-    // Rendered protocol is durable evidence too. If the journal disappeared
-    // across reload/update, reconstruct sleep/wait ownership before any queue
-    // item can advance.
-    if (!S.txn && marker && reconcileOrphanTerminalMarker(marker)) {
-      paintUI(true);
-      scheduleWatchdog();
-      return;
     }
 
     // A failed UI can outlive the journal after reload/navigation/script install.
@@ -3461,7 +3544,12 @@
       const reason = queueReleaseBlockReason();
       return [reason ? `Queue ${S.queue.length} · ${reason === 'waiting-for-cgr-done' ? 'waiting for DONE' : 'held'}` : `Queue ${S.queue.length} · ready`, 'active'];
     }
-    if (!assistantIsCurrentTail(getMessages()) || latestMarker(getMessages()) !== 'done') return ['Untracked unfinished turn', 'warn'];
+    const tailMsgs = getMessages();
+    const tailMarker = latestMarker(tailMsgs);
+    if (tailMarker === 'hibernate') return ['Hibernate marker detected', 'warn'];
+    if (tailMarker === 'wait-user') return ['Wait-user marker detected', 'warn'];
+    if (!assistantIsCurrentTail(tailMsgs) && !tailMarker) return ['Untracked unfinished turn', 'warn'];
+    if (tailMarker !== 'done') return ['Untracked unfinished turn', 'warn'];
     return ['Healthy', 'ok'];
   }
 
@@ -3581,6 +3669,9 @@
       ['marker before max-length UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_10M]]\nYou’ve reached the maximum length for this conversation, but you can keep talking by starting a new chat.'), 'hibernate'],
       ['marker before Sources UI', terminalMarker('work complete\n[[CGR_HIBERNATE_GITHUB_10M]]\nSources\nGitHub\nActions'), 'hibernate'],
       ['marker before Sources UI done', terminalMarker('done\n[[CGR_DONE]]\nSources\nReference 1'), 'done'],
+      ['exact protocol helper done', protocolMarkerFromExactText(' [[CGR_DONE]] '), 'done'],
+      ['exact protocol helper hibernate', protocolMarkerFromExactText('[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
+      ['exact protocol helper rejects prose suffix', protocolMarkerFromExactText('[[CGR_DONE]] extra'), null],
       ['non-product suffix still rejects marker', terminalMarker('[[CGR_DONE]]\nactual assistant prose'), null],
       ['flattened hibernate marker', terminalMarker('work complete.[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
       ['flattened done marker', terminalMarker('all done.[[CGR_DONE]]'), 'done'],
