@@ -1,4 +1,4 @@
-ChatGPT Resilience v1.3.34 — wiring / edge-case audit
+ChatGPT Resilience v1.3.35 — wiring / edge-case audit
 
 Core contract
 -------------
@@ -278,6 +278,42 @@ Hard terminal veto
 - If the final veto fires, the staged "continue" is cleared and the evaluator is
   re-run to commit DONE / HIBERNATE / WAIT_USER normally.
 
+Current ChatGPT DOM adapter
+---------------------------
+- The October 2026 exported ChatGPT project page no longer contains any
+  data-message-author-role="user" or data-message-author-role="assistant"
+  elements. Those remain legacy fallbacks only.
+- Current user messages are discovered from data-user-message-bubble="true";
+  data-chatgpt-search-unit-key="...:user" is the secondary current-UI fallback.
+- Current assistant answer bodies are discovered from data-dil-message-id. This
+  excludes tertiary tool/activity summaries that also use assistant-message text
+  styling.
+- The current assistant message scope prefers
+  data-chatgpt-search-unit-key="...:assistant" / data-content-search-unit-key,
+  then falls back to legacy conversation-turn/article wrappers.
+- The current composer is discovered from data-composer-input plus its
+  contenteditable role=textbox editor / data-composer-markdown attributes, with
+  the old prompt-textarea selectors retained as fallbacks.
+- Message discovery uses the first selector generation that has visible hits,
+  rather than concatenating old/new wrappers and double-counting one message.
+- Root mutations for the new user bubble, DIL assistant body, search-unit, and
+  composer wrappers invalidate the caches immediately.
+- A protocol-token mutation also dirties the message cache before evaluation, so
+  a newly-rendered terminal marker cannot be evaluated against stale message
+  wrappers.
+- Product-state user exclusion and non-semantic-card filtering use the same
+  old+new message-scope contract instead of assuming data-message-author-role.
+
+Export validation against the supplied new-UI HTML:
+- old user selector hits: 0
+- old assistant selector hits: 0
+- new user bubble hits: 4
+- new DIL assistant body hits: 10
+- new composer textbox hits: 1
+- the latest DIL assistant body contains [[CGR_HIBERNATE_GITHUB_10M]]
+- its ...:assistant search-unit scope is present
+- the containing agent turn reports data-talvt-turn-state="complete"
+
 Current-turn marker ownership
 -----------------------------
 - Known assistant wrappers remain the fast path when they are current.
@@ -470,7 +506,7 @@ Known intentional behavior
 
 Repository validation
 ---------------------
-- Userscript version: 1.3.34
+- Userscript version: 1.3.35
 - GitHub Actions workflows in this repository: none
 - Runtime behavior still depends on ChatGPT's live DOM, so the dedicated browser
   remains the final integration environment.
