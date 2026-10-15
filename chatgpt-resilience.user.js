@@ -1320,7 +1320,9 @@
       let protocolChanged = false;
 
       for (const rec of records) {
-        if (nodeContainsProtocolToken(rec.target)) protocolChanged = true;
+        if (rec.type === 'characterData' && nodeContainsProtocolToken(rec.target)) {
+          protocolChanged = true;
+        }
         for (const node of rec.addedNodes || []) {
           if (nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
         }
