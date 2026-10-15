@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.34
+// @version      1.3.35
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -21,7 +21,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.34
+   * ChatGPT Resilience 1.3.35
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -57,7 +57,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.34';
+  const VERSION = '1.3.35';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -105,6 +105,8 @@
 
   const SELECTORS = Object.freeze({
     composer: [
+      '[data-composer-input] [contenteditable="true"][role="textbox"]',
+      '[contenteditable="true"][role="textbox"][data-composer-markdown]',
       '#prompt-textarea',
       'div[contenteditable="true"][id="prompt-textarea"]',
       'textarea[data-id="root"]',
@@ -121,6 +123,7 @@
       'button[data-testid="stop-button"]',
       'button[aria-label="Stop generating"]',
       'button[aria-label="Stop response"]',
+      'button[aria-label="Stop"]',
     ],
     voice: [
       'button[data-testid="composer-speech-button"]',
@@ -135,9 +138,12 @@
       'button[aria-label="Try again" i]',
     ],
     user: [
+      '[data-user-message-bubble="true"]',
+      '[data-chatgpt-search-unit-key$=":user"]',
       '[data-message-author-role="user"]',
     ],
     assistant: [
+      '[data-dil-message-id]',
       '[data-message-author-role="assistant"]',
     ],
     streaming: [
@@ -152,6 +158,28 @@
       '[data-testid*="error" i]',
     ],
   });
+
+  const MESSAGE_STRUCTURE_SELECTOR = [
+    '[data-message-author-role]',
+    '[data-user-message-bubble="true"]',
+    '[data-dil-message-id]',
+    '[data-chatgpt-search-unit-key$=":user"]',
+    '[data-chatgpt-search-unit-key$=":assistant"]',
+  ].join(',');
+
+  const COMPOSER_STRUCTURE_SELECTOR = [
+    '#prompt-textarea',
+    'textarea[name="prompt-textarea"]',
+    '[data-composer-input]',
+    '[contenteditable="true"][role="textbox"][data-composer-markdown]',
+  ].join(',');
+
+  const ASSISTANT_SCOPE_SELECTOR = [
+    '[data-chatgpt-search-unit-key$=":assistant"]',
+    '[data-content-search-unit-key$=":assistant"]',
+    '[data-testid^="conversation-turn"]',
+    'article',
+  ].join(',');
 
 
   const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection interrupted(?:\.\s*waiting for the complete answer)?|connection (?:reset|closed|lost|failed|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
@@ -280,6 +308,16 @@
       } catch (_) {}
     }
     return out;
+  }
+
+  function qPreferredAll(selectors, root = document) {
+    for (const sel of selectors) {
+      try {
+        const hits = Array.from(root.querySelectorAll(sel)).filter(visible);
+        if (hits.length) return hits;
+      } catch (_) {}
+    }
+    return [];
   }
 
   function exactButtonLabel(btn) {
@@ -729,8 +767,8 @@
     if (!force && !DC.messagesDirty && t - DC.lastMessageRefreshAt < 15_000) return;
     DC.lastMessageRefreshAt = t;
     DC.messagesDirty = false;
-    DC.users = qAll(SELECTORS.user).filter(visible);
-    DC.assistants = qAll(SELECTORS.assistant).filter(visible);
+    DC.users = qPreferredAll(SELECTORS.user);
+    DC.assistants = qPreferredAll(SELECTORS.assistant);
     DC.lastUser = DC.users.at(-1) || null;
     DC.lastAssistant = DC.assistants.at(-1) || null;
     rebindAssistantObserver();
@@ -760,6 +798,11 @@
     } catch (_) { return false; }
   }
 
+  function closestAssistantScope(el) {
+    if (!el?.closest) return null;
+    try { return el.closest(ASSISTANT_SCOPE_SELECTOR); } catch (_) { return null; }
+  }
+
   function tailTurnRoot() {
     const assistant = DC.lastAssistant;
     const user = DC.lastUser;
@@ -769,7 +812,7 @@
         if (!(user.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING)) return null;
       } catch (_) { return null; }
     }
-    return assistant.closest?.('[data-testid^="conversation-turn"],article') || assistant;
+    return closestAssistantScope(assistant) || assistant;
   }
 
   function isTailRelevantElement(el) {
@@ -788,7 +831,7 @@
     }
     if (turn.contains?.(el) || assistant.contains?.(el)) return true;
 
-    const ownTurn = el.closest?.('[data-testid^="conversation-turn"],article');
+    const ownTurn = closestAssistantScope(el);
     if (ownTurn && turn && ownTurn !== turn) return false;
 
     try {
@@ -907,8 +950,10 @@
     try {
       if (SELECTORS.streaming.some(sel => assistant.matches?.(sel))) return true;
       if (SELECTORS.streaming.some(sel => assistant.querySelector?.(sel))) return true;
-      const turn = assistant.closest?.('[data-testid^="conversation-turn"],article');
-      if (turn && SELECTORS.streaming.some(sel => turn.querySelector?.(sel))) return true;
+      const turn = tailTurnRoot();
+      if (turn && turn !== assistant && SELECTORS.streaming.some(sel => turn.querySelector?.(sel))) return true;
+      const activity = assistant.closest?.('[data-talvt-turn-state]');
+      if (activity && SELECTORS.streaming.some(sel => activity.querySelector?.(sel))) return true;
     } catch (_) {}
     return false;
   }
@@ -1346,9 +1391,8 @@
           if (mutationProductState(node)) productStateChanged = true;
           if (node.nodeType !== 1) continue;
           const el = node;
-          if (el.matches?.('[data-message-author-role]') || el.querySelector?.('[data-message-author-role]')) structureChanged = true;
-          if (el.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') ||
-              el.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
+          if (el.matches?.(MESSAGE_STRUCTURE_SELECTOR) || el.querySelector?.(MESSAGE_STRUCTURE_SELECTOR)) structureChanged = true;
+          if (el.matches?.(COMPOSER_STRUCTURE_SELECTOR) || el.querySelector?.(COMPOSER_STRUCTURE_SELECTOR)) composerChanged = true;
         }
 
         for (const node of rec.removedNodes || []) {
@@ -1361,13 +1405,12 @@
               (node === DC.productStateNode || node.contains?.(DC.productStateNode))) {
             DC.productStateNode = null;
           }
-          if (node.matches?.('[data-message-author-role]') || node.querySelector?.('[data-message-author-role]')) structureChanged = true;
-          if (node.matches?.('#prompt-textarea,textarea[name="prompt-textarea"]') ||
-              node.querySelector?.('#prompt-textarea,textarea[name="prompt-textarea"]')) composerChanged = true;
+          if (node.matches?.(MESSAGE_STRUCTURE_SELECTOR) || node.querySelector?.(MESSAGE_STRUCTURE_SELECTOR)) structureChanged = true;
+          if (node.matches?.(COMPOSER_STRUCTURE_SELECTOR) || node.querySelector?.(COMPOSER_STRUCTURE_SELECTOR)) composerChanged = true;
         }
       }
 
-      if (structureChanged) DC.messagesDirty = true;
+      if (structureChanged || protocolChanged) DC.messagesDirty = true;
       if (composerChanged) { DC.composer = null; DC.form = null; DC.composerNode = null; }
       if (structureChanged || productStateChanged || composerChanged || protocolChanged) {
         scheduleEvaluate(
@@ -3287,7 +3330,7 @@
     const b = target?.closest?.('button');
     if (!b) return false;
     const stop = findStopButton();
-    return b === stop || /stop generating|stop response/.test(exactButtonLabel(b));
+    return b === stop || /^(?:stop|stop generating|stop response)$/.test(exactButtonLabel(b));
   }
 
   function hasComposerPopup(input = getComposer()) {
