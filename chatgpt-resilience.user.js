@@ -2910,6 +2910,17 @@
       return;
     }
 
+    // A newly uploaded PPT can start Stage 01 through a native human Send.
+    // Attachment-only/native sends may have no resilience journal. The current
+    // terminal study marker still proves a completed turn; queue Stage 02 safely.
+    if (!S.txn && marker === 'done' && !S.generating &&
+        now() - S.lastAssistantProgressAt >= CFG.answerSettleMs) {
+      const study = studyTailToken(msgs.lastAssistantText);
+      if (study && ['STEP_MORE','STEP_DONE'].includes(study.kind)) {
+        await queueNextStudyStage(msgs);
+      }
+    }
+
     if (!navigator.onLine) { paintUI(); return; }
     if (S.blockedReason) { paintUI(); scheduleWatchdog(); return; }
     if (isPaused()) { paintUI(); scheduleWatchdog(); return; }
