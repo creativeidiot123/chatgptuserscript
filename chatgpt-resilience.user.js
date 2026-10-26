@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.41
+// @version      1.3.42
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.41
+   * ChatGPT Resilience 1.3.42
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -46,7 +46,7 @@
    *   - Runtime is hard-gated to https://chatgpt.com/g/* even across SPA navigation.
    *   - All task/queue/recovery state is tab-session local; tabs never coordinate or share ownership.
    *   - Retry / Regenerate are never clicked automatically. They can destroy partial work.
-   *   - A send is retried only when the original can be proven not to have landed.
+   *   - An unconfirmed send holds; the original prompt is never auto-reposted.
    *   - Auth, anti-abuse, policy and unsafe upload states fail closed.
    *   - ChatGPT's maximum-conversation-length banner is ignored UI chrome.
    *
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.41';
+  const VERSION = '1.3.42';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -95,7 +95,6 @@
     queueStageReadyMs: 3_000,
     stopSettleTimeoutMs: 12_000,
     maxContinuesPerLogicalTask: 16,
-    maxResendAttempts: 1,
     maxReloadsPerLogicalTask: 2,
     reloadCooldownMs: 30_000,
     rateFallbackMs: 60_000,
@@ -953,6 +952,7 @@
 
   const S = {
     enabled: store.get('enabled', true) !== false,
+    automationEpoch: 0,
     projectActive: isProjectUrl(),
     route: routeKey(),
     href: location.href,
@@ -2018,6 +2018,7 @@
     if (!t.userTurnConfirmed && (hashMatches || countAdvanced)) {
       t.userTurnConfirmed = true;
       t.confirmedAt = now();
+      if (t.holdReason === 'send-unconfirmed') t.holdReason = '';
       // The composer contains source Markdown, while the user bubble renders
       // Markdown as plain text. Anchor the actual submitted DOM user turn
       // rather than requiring its displayed text to hash to the source prompt.
@@ -2153,6 +2154,19 @@
     paintUI(true);
   }
 
+  function setAutomationEnabled(enabled, reason = 'manual') {
+    const next = !!enabled;
+    if (next !== S.enabled) S.automationEpoch++;
+    S.enabled = next;
+    store.set('enabled', next);
+    if (!next) {
+      cancelRecovery('automation-disabled');
+      resetVerification('automation-disabled');
+    }
+    paintUI(true);
+    if (next) scheduleEvaluate('enabled:' + reason, 0);
+  }
+
   function clearBlock(reason = 'manual') {
     if (!S.blockedReason) return;
     log('block-clear', { previous: S.blockedReason, reason });
@@ -2182,8 +2196,9 @@
   }
 
   async function dispatchPrompt(prompt, source, options = {}) {
-    if (!S.enabled || !navigator.onLine || !verifyTabContext() || S.actionInFlight || isPaused()) return false;
+    if (!S.enabled || !navigator.onLine || !verifyTabContext() || S.actionInFlight || isPaused() || S.blockedReason) return false;
     const dispatchRoute = S.route;
+    const dispatchEpoch = S.automationEpoch;
     const input = getComposer();
     const p = promptText(prompt);
     if (!input || !norm(p) || hasComposerAttachments(input)) return false;
@@ -2198,6 +2213,7 @@
     try {
       const action = await waitForSendAction(input, p);
       if (!action || S.route !== dispatchRoute) return false;
+      if (!S.enabled || S.automationEpoch !== dispatchEpoch || isPaused() || S.blockedReason) return false;
       if (!navigator.onLine || !verifyTabContext()) return false;
       if (S.route !== dispatchRoute) return false;
       if (!input.isConnected || norm(composerText(input)) !== norm(p)) return false;
@@ -2283,10 +2299,13 @@
       if (S.route !== dispatchRoute) return false;
       t.sendObserved = false;
       t.dispatchAt = now();
-      saveTxn();
-      if (S.route !== dispatchRoute) return false;
-      action.run();
+      // Journal an attempted send BEFORE the click: a crash or throwing native
+      // handler must never make an ambiguous send look safe to repost.
       t.sendAttempted = true;
+      saveTxn();
+      if (S.route !== dispatchRoute || !S.enabled || S.automationEpoch !== dispatchEpoch ||
+          isPaused() || S.blockedReason) return false;
+      action.run();
       saveTxn();
       log('dispatch', { source, method: action.kind, queueItem: !!options.queueItemId });
       scheduleEvaluate('dispatch', 120);
@@ -2361,6 +2380,7 @@
   async function waitForGenerationStop() {
     const deadline = now() + CFG.stopSettleTimeoutMs;
     while (now() < deadline) {
+      if (!S.enabled) return false;
       if (postStopControlSettled()) return true;
       await sleep(250);
     }
@@ -2368,7 +2388,7 @@
   }
 
   async function stopThenContinue(reason = 'recovery', options = {}) {
-    if (!verifyTabContext()) return false;
+    if (!S.enabled || !verifyTabContext()) return false;
     const t = S.txn;
     if (!t || !t.userTurnConfirmed || t.manualStopped || isPaused() || S.blockedReason) return false;
     if (latestMarker(getMessages(true))) return false;
@@ -2429,7 +2449,7 @@
       if (stop && visible(stop) && !disabled(stop)) {
         S.actionInFlight = true;
         try {
-          if (!verifyTabContext()) return false;
+          if (!S.enabled || !verifyTabContext()) return false;
           const diskTxn = loadTxn(S.route);
           if (!diskTxn || diskTxn.id !== expectedTxnId) { S.txn = diskTxn; return false; }
           S.txn = diskTxn;
@@ -2467,7 +2487,7 @@
 
       // Ten-second grace: terminal markers, fresh output, offline state, or a
       // newly stronger error class all veto the literal continuation.
-      if (S.recovery !== recovery) return false;
+      if (!S.enabled || S.recovery !== recovery) return false;
       if (!S.txn || S.txn.id !== expectedTxnId || S.txn.manualStopped) return false;
       if (!navigator.onLine) {
         scheduleEvaluate(`recovery-offline:${reason}`, 1_000);
@@ -2994,49 +3014,31 @@
 
   async function recoverUnconfirmedSend(msgs, err) {
     const t = S.txn;
-    if (!t || t.userTurnConfirmed) return false;
+    if (!S.enabled || !t || t.userTurnConfirmed) return false;
     const elapsed = now() - Number(t.subturnAt || t.createdAt || 0);
     if (elapsed < CFG.sendConfirmMs) return false;
 
-    // confirmTxn accepts a visibly landed prompt, so a confirmed turn is never
-    // reloaded or resent.
     confirmTxn(msgs);
     if (t.userTurnConfirmed) return false;
 
-    // If a request was observed, reconcile by one controlled reload before ever
-    // deciding it was unsent. No blind duplicate sends.
-    if ((t.sendAttempted || t.sendObserved) && !t.reconciledAt) {
-      return reloadForRecovery('ambiguous-send');
+    // Missing or transformed DOM evidence is not proof of non-delivery. A
+    // reload cannot make that proof either, and reposting can duplicate an
+    // already running request. Preserve the journal and queue for inspection.
+    if (t.holdReason !== 'send-unconfirmed') {
+      t.holdReason = 'send-unconfirmed';
+      saveTxn();
+      log('send-held-ambiguous', {
+        attempted: !!t.sendAttempted, observed: !!t.sendObserved, error: err?.id || '',
+      });
+      maybeNotify(APP + ': send needs attention',
+        'Delivery is ambiguous. Automatic reload and repost are disabled; inspect this chat before resuming.');
     }
-    if ((t.sendAttempted || t.sendObserved) && t.reconciledAt && now() - t.reconciledAt < CFG.postReloadReconcileMs) return false;
-
-    if (Number(t.resendCount || 0) >= CFG.maxResendAttempts) {
-      if (t.holdReason !== 'send-unconfirmed') {
-        t.holdReason = 'send-unconfirmed';
-        saveTxn();
-        maybeNotify(`${APP}: send needs attention`, 'The last message could not be confirmed after reconciliation. This chat is held without affecting other project chats.');
-      }
-      return false;
-    }
-
-    // At this point there is no user turn, no assistant progress, and either no
-    // observed send or a post-reload reconciliation. One resend is safe enough.
-    if (msgs.assistants.length > Number(t.baselineAssistantCount || 0)) return false;
-    const input = getComposer();
-    if (!input || hasComposerAttachments(input)) return false;
-    if (norm(composerText(input)) && norm(composerText(input)) !== norm(t.currentPrompt)) return false;
-    if (!setComposerText(input, t.currentPrompt)) return false;
-    t.resendCount = Number(t.resendCount || 0) + 1;
-    t.sendObserved = false;
-    t.subturnAt = now();
-    t.reconciledAt = 0;
-    saveTxn();
-    return dispatchPrompt(t.currentPrompt, `resend:${err?.id || 'unconfirmed'}`, { newLogicalTask: false });
+    return false;
   }
 
   async function reloadForRecovery(reason) {
     const t = S.txn;
-    if (!t || S.actionInFlight || isPaused()) return false;
+    if (!S.enabled || !t || S.actionInFlight || isPaused()) return false;
     if (Number(t.reloadCount || 0) >= CFG.maxReloadsPerLogicalTask) {
       blockAutomation('reload-safety-cap', 'This task still cannot recover after the maximum controlled reloads. Queue and task state are preserved.');
       return false;
@@ -3069,7 +3071,7 @@
   }
 
   async function reloadWithoutTxn(reason = 'conversation-load') {
-    if (S.actionInFlight || isPaused()) return false;
+    if (!S.enabled || S.actionInFlight || isPaused()) return false;
     const key = `page-reloads:${S.route}`;
     const cutoff = now() - 5 * 60_000;
     const hist = (store.json(key, []) || []).map(Number).filter(x => x > cutoff);
@@ -3123,7 +3125,7 @@
     }
 
     // Until the user turn is confirmed, continuing would risk creating a second
-    // logical request. Reconcile/resend the original send instead.
+    // logical request. Reconcile delivery evidence or hold, never repost it.
     if (!t.userTurnConfirmed) return recoverUnconfirmedSend(msgs, err);
 
     // Once the user turn is confirmed, message-send chrome is stale by definition.
@@ -4092,7 +4094,7 @@
     root.innerHTML = `<button id="cgr-pill" type="button"><span id="cgr-dot"></span><span id="cgr-status">Starting</span></button><div id="cgr-panel" hidden><div class="cgr-head"><strong>${APP}</strong><span>v${VERSION}</span></div><div class="cgr-row"><span>Automation</span><button id="cgr-toggle"></button></div><div class="cgr-note" id="cgr-detail"></div><div class="cgr-actions"><button id="cgr-recover">Continue now</button><button id="cgr-wake">GitHub wake now</button><button id="cgr-clear-queue">Clear pending</button><button id="cgr-clear-state">Clear state</button></div></div>`;
     document.body.appendChild(root);
     root.querySelector('#cgr-pill').addEventListener('click', () => { const p = root.querySelector('#cgr-panel'); p.hidden = !p.hidden; paintUI(true); });
-    root.querySelector('#cgr-toggle').addEventListener('click', () => { S.enabled = !S.enabled; store.set('enabled', S.enabled); if (S.enabled) scheduleEvaluate('enabled', 0); paintUI(true); });
+    root.querySelector('#cgr-toggle').addEventListener('click', () => setAutomationEnabled(!S.enabled, 'panel'));
     root.querySelector('#cgr-recover').addEventListener('click', async () => { clearPause(); clearBlock('panel-continue'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); } const msgs = getMessages(true); S.generating = isGenerating(); if (!S.generating && S.txn?.userTurnConfirmed) await sendLiteralContinue('manual'); scheduleEvaluate('manual-recover', 100); });
     root.querySelector('#cgr-wake').addEventListener('click', () => attemptGithubWake('manual', true));
     root.querySelector('#cgr-clear-queue').addEventListener('click', clearPendingQueue);
@@ -4187,7 +4189,7 @@
       return fn(...args);
     };
     try {
-      GM_registerMenuCommand('Toggle ChatGPT Resilience', inProject(() => { S.enabled = !S.enabled; store.set('enabled', S.enabled); paintUI(true); if (S.enabled) scheduleEvaluate('menu-enable', 0); }));
+      GM_registerMenuCommand('Toggle ChatGPT Resilience', inProject(() => setAutomationEnabled(!S.enabled, 'menu')));
       GM_registerMenuCommand('Continue unfinished task now', inProject(() => { clearPause(); clearBlock('menu'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); sendLiteralContinue('menu'); } }));
       GM_registerMenuCommand('Clear pending queue', inProject(clearPendingQueue));
       GM_registerMenuCommand('GitHub wake now', inProject(() => attemptGithubWake('menu', true)));
