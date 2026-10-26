@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.36
+// @version      1.3.37
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.36
+   * ChatGPT Resilience 1.3.37
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.36';
+  const VERSION = '1.3.37';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -351,86 +351,183 @@
   const TRAILING_PRODUCT_UI_RE = /^(?:sources\b|you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
 
 
-  // Studyshit stage routing uses the existing durable queue, not a second sender.
+  // Studyshit uses a per-stage verification gate BEFORE advancing. ChatGPT
+  // Resilience remains the only durable sender/recovery implementation.
   const STUDY_PROMPT_BASE = 'https://raw.githubusercontent.com/creativeidiot123/studyshit/main/prompts/';
+  const STUDY_VERIFY_PROMPT = '08-verify-stage.txt';
   const STUDY_STAGE_FILES = Object.freeze({
     S01: '01-extract.txt', S02: '02-structure.txt', S03: '03-teach.txt',
     S04: '04-enrich.txt', S05: '05-practice.txt', S06: '06-audit.txt',
-    S07: '07-publish.txt'
+    S07: '07-publish.txt',
   });
+  const STUDY_MAX_VERIFICATION_FAILURES = 3;
+
   function studyTailToken(text) {
     const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
     const idx = clean.lastIndexOf('[[STUDY_');
     if (idx < 0) return null;
     const tail = clean.slice(idx);
-    const m = tail.match(/^\[\[STUDY_(STEP_DONE|STEP_MORE):(S0[1-7])\]\]/) ||
+    const m = tail.match(/^\[\[STUDY_(STEP_DONE|STEP_MORE|VERIFY_PASS|VERIFY_FAIL):(S0[1-7])\]\]/) ||
       tail.match(/^\[\[STUDY_(FINAL_READY|WAIT_FOR_HUMAN)\]\]/);
     if (!m) return null;
     const suffix = tail.slice(m[0].length).trim();
     if (suffix && !TRAILING_PRODUCT_UI_RE.test(suffix)) return null;
-    return { token:m[0], kind:m[1], stage:m[2] || '' };
+    return { token: m[0], kind: m[1], stage: m[2] || '' };
   }
+
   function getStudyTarget(info) {
-    if (!info || !STUDY_STAGE_FILES[info.stage]) return '';
-    if (info.kind === 'STEP_MORE') return info.stage;
-    if (info.kind === 'STEP_DONE') {
+    if (!info) return '';
+    // A completed stage must be VERIFIED, not followed by the next stage.
+    if (info.kind === 'FINAL_READY') return 'V07';
+    if (!STUDY_STAGE_FILES[info.stage]) return '';
+    if (info.kind === 'STEP_MORE' || info.kind === 'VERIFY_FAIL') return info.stage;
+    if (info.kind === 'STEP_DONE') return 'V' + info.stage.slice(1);
+    if (info.kind === 'VERIFY_PASS') {
       const n = Number(info.stage.slice(1)) + 1;
-      return n <= 7 ? 'S' + String(n).padStart(2,'0') : '';
+      return n <= 7 ? 'S' + String(n).padStart(2, '0') : '';
     }
     return '';
   }
-  function fetchStudyStage(stage) {
-    const name = STUDY_STAGE_FILES[stage];
-    if (!name) return Promise.reject(new Error('Unknown study stage'));
+
+  function studyGateKey(route) { return 'study-verification-gate:' + route; }
+  function studyFailureKey(route, stage) { return 'study-verification-fail:' + route + ':' + stage; }
+  function studyAdvanceKey(route) { return 'study-advance:' + route; }
+
+  function studyHandoffIdentity(msgs = getMessages()) {
+    // A repeated identical response in a LATER turn is not the same handoff.
+    return String(msgs.users?.length || 0) + ':' +
+      String(msgs.lastAssistant?.getAttribute?.('data-dil-message-id') || '') + ':' +
+      signature(msgs.lastUserText) + ':' + signature(msgs.lastAssistantText);
+  }
+
+  function studyVerifyUserTurn(msgs, stage) {
+    return String(msgs?.lastUserText || '').includes('[STUDYSHIT AUTO VERIFY ' + stage + ']');
+  }
+
+  function studyNeedsHandoff(msgs = getMessages()) {
+    const info = studyTailToken(msgs.lastAssistantText);
+    const target = getStudyTarget(info);
+    if (!target) return false;
+    const prior = store.get(studyAdvanceKey(S.route), null);
+    return !prior || prior.identity !== studyHandoffIdentity(msgs) ||
+      prior.token !== info.token || prior.target !== target;
+  }
+
+  function fetchStudyStage(target) {
+    const file = target.startsWith('V') ? STUDY_VERIFY_PROMPT : STUDY_STAGE_FILES[target];
+    if (!file) return Promise.reject(new Error('Unknown study target: ' + target));
     if (typeof GM_xmlhttpRequest !== 'function') return Promise.reject(new Error('Tampermonkey GitHub network permission unavailable'));
-    return new Promise((resolve,reject) => GM_xmlhttpRequest({
-      method:'GET', url: STUDY_PROMPT_BASE + name + '?t=' + now(), timeout:30000,
-      onload:r => r.status === 200 && String(r.responseText||'').trim()
-        ? resolve(String(r.responseText)) : reject(new Error('GitHub prompt '+name+' HTTP '+r.status)),
-      onerror:() => reject(new Error('GitHub prompt fetch failed')),
-      ontimeout:() => reject(new Error('GitHub prompt fetch timeout'))
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+      method: 'GET', url: STUDY_PROMPT_BASE + file + '?t=' + now(), timeout: 30_000,
+      onload: r => r.status === 200 && String(r.responseText || '').trim()
+        ? resolve(String(r.responseText)) : reject(new Error('GitHub prompt ' + file + ' HTTP ' + r.status)),
+      onerror: () => reject(new Error('GitHub prompt fetch failed')),
+      ontimeout: () => reject(new Error('GitHub prompt fetch timeout')),
     }));
   }
+
   async function queueNextStudyStage(msgs = getMessages(), force = false) {
     if (!verifyTabContext() || !S.enabled) return false;
     const info = studyTailToken(msgs.lastAssistantText);
-    const target = getStudyTarget(info);
-    if (!target || DC.studyFetching) return false;
+    if (!info) return false;
     const route = S.route;
-    const signatureAtStart = signature(msgs.lastAssistantText);
-    const key = 'study-advance:' + route;
-    const prior = store.get(key,null);
-    if (!force && prior?.token === info.token && prior?.signature === signatureAtStart) return true;
+    const gate = store.get(studyGateKey(route), null);
+    const identity = studyHandoffIdentity(msgs);
+    const target = getStudyTarget(info);
+
+    // Verify results are authoritative ONLY for the stage whose verifier was
+    // actually queued in this project chat. Stray PASS tokens never advance.
+    if (info.kind === 'VERIFY_PASS' || info.kind === 'VERIFY_FAIL') {
+      if (!gate || gate.stage !== info.stage || gate.phase !== 'awaiting-verification' ||
+          !studyVerifyUserTurn(msgs, info.stage)) {
+        log('study-unowned-verification-marker', { kind: info.kind, stage: info.stage });
+        return false;
+      }
+    }
+
+    // Stage 07 is complete ONLY after its own separate verification passes.
+    if (info.kind === 'VERIFY_PASS' && info.stage === 'S07') {
+      if (!gate || gate.stage !== 'S07' || gate.phase !== 'awaiting-verification' ||
+          !studyVerifyUserTurn(msgs, 'S07')) return false;
+      store.del(studyFailureKey(route, 'S07'));
+      store.set(studyGateKey(route), { stage: 'S07', phase: 'verified', identity });
+      log('study-final-verified', { stage: 'S07' });
+      maybeNotify(APP + ': study ready', 'Stage 07 independently verified. Final HTML is ready in GitHub.');
+      return true;
+    }
+
+    if (!target || DC.studyFetching) return false;
+    const key = studyAdvanceKey(route);
+    const prior = store.get(key, null);
+    if (!force && prior?.token === info.token && prior?.identity === identity && prior?.target === target) return true;
+
+    // Repeated failures should NOT cause an endless automated rewrite/recheck loop.
+    if (info.kind === 'VERIFY_FAIL') {
+      const failures = Number(store.get(studyFailureKey(route, info.stage), 0)) + 1;
+      store.set(studyFailureKey(route, info.stage), failures);
+      if (failures >= STUDY_MAX_VERIFICATION_FAILURES) {
+        store.set(studyGateKey(route), { stage: info.stage, phase: 'manual-review', failures });
+        blockAutomation('study-verification-failures',
+          'Stage ' + info.stage + ' failed verification ' + failures + ' times. Inspect verifier findings and fix manually.');
+        return false;
+      }
+    }
+
     DC.studyFetching = true;
     try {
-      const prompt = await fetchStudyStage(target);
+      const content = await fetchStudyStage(target);
       if (!verifyTabContext(route)) return false;
       const latest = getMessages(true);
-      if (signature(latest.lastAssistantText) !== signatureAtStart ||
+      if (studyHandoffIdentity(latest) !== identity ||
           studyTailToken(latest.lastAssistantText)?.token !== info.token) return false;
-      const message = '[STUDYSHIT AUTO STAGE ' + target + ']\n' + prompt;
+
+      let header, details = '';
+      if (target.startsWith('V')) {
+        header = '[STUDYSHIT AUTO VERIFY S' + target.slice(1) + ']';
+        details = 'Verify the JUST-COMPLETED stage S' + target.slice(1) +
+          '. This is one independent read-only review; do not execute the next stage. ' +
+          'Use the original lecture sources when available.\n\n';
+      } else if (info.kind === 'VERIFY_FAIL') {
+        header = '[STUDYSHIT AUTO REPAIR ' + target + ']';
+        details = 'The independent verifier found stage ' + target +
+          ' incomplete or incorrect. Read its preceding findings. Repair this SAME stage before claiming completion again.\n\n';
+      } else {
+        header = '[STUDYSHIT AUTO STAGE ' + target + ']';
+      }
+      const message = header + '\n' + details + content;
       if (!S.queue.some(x => x.text === message)) {
         const item = enqueuePrompt(message);
-        if (!item) throw new Error('Unable to save stage in durable queue');
+        if (!item) throw new Error('Unable to save next study prompt to durable queue');
         const i = S.queue.findIndex(x => x.id === item.id);
         if (i > 0) {
-          S.queue.splice(i,1);
+          S.queue.splice(i, 1);
           S.queue.unshift(item);
           saveQueue();
           renderQueueList();
         }
       }
-      store.set(key,{token:info.token,signature:signatureAtStart,target});
-      log('study-stage-queued',{from:info.stage,kind:info.kind,target});
-      kickQueue('study-next-stage',100);
+
+      // Record verifier ownership after its durable queue item is saved.
+      if (target.startsWith('V')) {
+        const stage = 'S' + target.slice(1);
+        store.set(studyGateKey(route), { stage, phase: 'awaiting-verification', identity });
+      } else if (info.kind === 'VERIFY_PASS') {
+        store.del(studyFailureKey(route, info.stage));
+        store.set(studyGateKey(route), { stage: info.stage, phase: 'verified', identity });
+      } else if (info.kind === 'VERIFY_FAIL') {
+        store.set(studyGateKey(route), { stage: info.stage, phase: 'repairing', identity });
+      }
+      store.set(key, { token: info.token, identity, target });
+      log('study-followup-queued', { kind: info.kind, stage: info.stage, target });
+      kickQueue('study-followup', 100);
       return true;
-    } catch(e) {
-      const reason=String(e?.message||e);
-      log('study-stage-fetch-failed',{reason});
-      maybeNotify(APP+': study pipeline held',reason+'. Retry via Tampermonkey menu.');
+    } catch (e) {
+      const reason = String(e?.message || e);
+      log('study-followup-failed', { reason, target });
+      maybeNotify(APP + ': study held', reason + '. Use "Retry study next stage" in Tampermonkey.');
       return false;
     } finally {
-      DC.studyFetching=false;
+      DC.studyFetching = false;
     }
   }
 
@@ -2375,6 +2472,7 @@
 
   function queueReleaseBlockReason(msgs = getMessages()) {
     if (!assistantIsCurrentTail(msgs) || latestMarker(msgs) !== 'done') return 'waiting-for-cgr-done';
+    if (DC.studyFetching || studyNeedsHandoff(msgs)) return 'study-awaiting-checkpoint';
     if (S.error) return `error:${S.error.id || 'unknown'}`;
     if (S.recovery || S.pendingRecoveryReason || S.controlFault) return 'recovery';
     if (S.hib) return `hibernate:${S.hib.phase || 'active'}`;
@@ -2662,10 +2760,8 @@
       S.lastGenerationEndAt = now();
       clearTxn('done-marker');
       const study = studyTailToken(msgs.lastAssistantText);
-      if (study && ['STEP_MORE','STEP_DONE'].includes(study.kind)) {
+      if (study) {
         await queueNextStudyStage(msgs);
-      } else if (study?.kind === 'FINAL_READY') {
-        maybeNotify(`${APP}: study complete`,'The final study HTML is reported ready in GitHub.');
       } else {
         maybeNotify(`${APP}: task done`, 'The current task reached [[CGR_DONE]].');
       }
@@ -2916,7 +3012,7 @@
     if (!S.txn && marker === 'done' && !S.generating &&
         now() - S.lastAssistantProgressAt >= CFG.answerSettleMs) {
       const study = studyTailToken(msgs.lastAssistantText);
-      if (study && ['STEP_MORE','STEP_DONE'].includes(study.kind)) {
+      if (study) {
         await queueNextStudyStage(msgs);
       }
     }
@@ -3825,8 +3921,15 @@
       ['study final', terminalMarker('saved\n[[STUDY_FINAL_READY]]'), 'done'],
       ['study wait', terminalMarker('blocked\n[[STUDY_WAIT_FOR_HUMAN]]'), 'wait-user'],
       ['study trailing prose rejected', terminalMarker('[[STUDY_STEP_DONE:S01]]\nnot saved'), null],
-      ['study target next', getStudyTarget({kind:'STEP_DONE',stage:'S04'}), 'S05'],
-      ['study target repeat', getStudyTarget({kind:'STEP_MORE',stage:'S04'}), 'S04'],
+      ['study stage done queues verification', getStudyTarget({kind:'STEP_DONE',stage:'S04'}), 'V04'],
+      ['study stage repeat', getStudyTarget({kind:'STEP_MORE',stage:'S04'}), 'S04'],
+      ['study verification passes next', getStudyTarget({kind:'VERIFY_PASS',stage:'S04'}), 'S05'],
+      ['study verification fails rework', getStudyTarget({kind:'VERIFY_FAIL',stage:'S04'}), 'S04'],
+      ['study final queues verification', getStudyTarget({kind:'FINAL_READY'}), 'V07'],
+      ['study final pass finishes', getStudyTarget({kind:'VERIFY_PASS',stage:'S07'}), ''],
+      ['study verification PASS marker', terminalMarker('verified\n[[STUDY_VERIFY_PASS:S03]]'), 'done'],
+      ['study verification FAIL marker', terminalMarker('incomplete\n[[STUDY_VERIFY_FAIL:S03]]'), 'done'],
+      ['study verify rejects suffix', terminalMarker('[[STUDY_VERIFY_PASS:S03]]\nnot checked'), null],
       ['hibernate marker', terminalMarker('hello\n[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
       ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
