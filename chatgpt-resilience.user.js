@@ -918,6 +918,8 @@
     lastAssistant: null,
     messagesDirty: true,
     lastMessageRefreshAt: 0,
+    protocolRevision: 0,
+    corridorScan: null,
     rootObserver: null,
     rootNode: null,
     assistantObserver: null,
@@ -1593,6 +1595,9 @@
         for (const node of rec.addedNodes || []) {
           if (!isResilienceUiNode(node) && nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
         }
+        for (const node of rec.removedNodes || []) {
+          if (!isResilienceUiNode(node) && nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
+        }
 
         // Token-level assistant churn already has its own observer. Product state
         // nested there is handled by that observer, but protocol tokens must still
@@ -1634,6 +1639,7 @@
         }
       }
 
+      if (protocolChanged) DC.protocolRevision++;
       if (structureChanged || protocolChanged) DC.messagesDirty = true;
       if (composerChanged) { DC.composer = null; DC.form = null; DC.composerNode = null; }
       if (structureChanged || productStateChanged || composerChanged || protocolChanged) {
@@ -1917,22 +1923,32 @@
   }
 
   function latestMarker(msgs = getMessages()) {
-    // Prefer the known current assistant node when ChatGPT exposes one. Never
-    // accept a stale previous assistant after a newer user turn.
-    if (msgs.lastAssistant && assistantIsCurrentTail(msgs)) {
-      const direct = terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+    // The current assistant's text is the cheap fast path. Do not walk its
+    // descendants unless there is actually a protocol-token candidate.
+    // This matters especially while the assistant is streaming long answers.
+    const assistantText = msgs.lastAssistantText || '';
+    if (msgs.lastAssistant && assistantIsCurrentTail(msgs) &&
+        nodeContainsProtocolToken({ nodeType: Node.TEXT_NODE, nodeValue: assistantText })) {
+      const direct = terminalMarker(assistantText, msgs.lastAssistant);
       if (direct) return direct;
       const turn = tailTurnRoot();
       if (turn && turn !== msgs.lastAssistant) {
-        const fromTurn = terminalMarker(msgs.lastAssistantText, turn);
+        const fromTurn = terminalMarker(assistantText, turn);
         if (fromTurn) return fromTurn;
       }
     }
 
-    // Protocol ownership must survive ChatGPT wrapper changes. An exact visible
-    // token in the latest-user -> composer corridor belongs to the current turn
-    // even when ChatGPT changes or omits the assistant wrapper.
-    return corridorProtocolMarker(msgs);
+    // Still support missing/changed assistant wrappers, but avoid a full-page
+    // corridor walk on every watchdog tick and every streaming token. New
+    // protocol tokens invalidate the cache through the root MutationObserver.
+    const key = S.route + ':' + signature(msgs.lastUserText) + ':' + DC.protocolRevision;
+    const cached = DC.corridorScan;
+    if (cached && cached.key === key && cached.user === msgs.lastUser &&
+        cached.assistant === msgs.lastAssistant && cached.value === null) return null;
+
+    const marker = corridorProtocolMarker(msgs);
+    DC.corridorScan = { key, user: msgs.lastUser, assistant: msgs.lastAssistant, value: marker };
+    return marker;
   }
 
   function firstQueueItem(queue = S.queue) {
