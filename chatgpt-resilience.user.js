@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.37
+// @version      1.3.38
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.37
+   * ChatGPT Resilience 1.3.38
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.37';
+  const VERSION = '1.3.38';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -918,6 +918,8 @@
     lastAssistant: null,
     messagesDirty: true,
     lastMessageRefreshAt: 0,
+    protocolRevision: 0,
+    corridorScan: null,
     rootObserver: null,
     rootNode: null,
     assistantObserver: null,
@@ -1586,11 +1588,15 @@
       let protocolChanged = false;
 
       for (const rec of records) {
+        if (isResilienceUiNode(rec.target)) continue;
         if (rec.type === 'characterData' && nodeContainsProtocolToken(rec.target)) {
           protocolChanged = true;
         }
         for (const node of rec.addedNodes || []) {
-          if (nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
+          if (!isResilienceUiNode(node) && nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
+        }
+        for (const node of rec.removedNodes || []) {
+          if (!isResilienceUiNode(node) && nodeContainsProtocolToken(node)) { protocolChanged = true; break; }
         }
 
         // Token-level assistant churn already has its own observer. Product state
@@ -1609,6 +1615,7 @@
         if (mutationProductState(rec.target)) productStateChanged = true;
 
         for (const node of rec.addedNodes || []) {
+          if (isResilienceUiNode(node)) continue;
           if (mutationProductState(node)) productStateChanged = true;
           if (node.nodeType !== 1) continue;
           const el = node;
@@ -1617,6 +1624,7 @@
         }
 
         for (const node of rec.removedNodes || []) {
+          if (isResilienceUiNode(node)) continue;
           if (node.nodeType !== 1) continue;
           if (DC.longThinkingNode &&
               (node === DC.longThinkingNode || node.contains?.(DC.longThinkingNode))) {
@@ -1631,6 +1639,7 @@
         }
       }
 
+      if (protocolChanged) DC.protocolRevision++;
       if (structureChanged || protocolChanged) DC.messagesDirty = true;
       if (composerChanged) { DC.composer = null; DC.form = null; DC.composerNode = null; }
       if (structureChanged || productStateChanged || composerChanged || protocolChanged) {
@@ -1643,6 +1652,13 @@
       }
     });
     try { DC.rootObserver.observe(root, { childList: true, subtree: true, characterData: true }); } catch (_) {}
+  }
+
+  // Own UI is mounted outside React's composer, but also guard against
+  // stale nodes during route transitions or a future layout refactor.
+  function isResilienceUiNode(node) {
+    const el = node?.nodeType === 1 ? node : node?.parentElement;
+    return !!el?.closest?.('#cgr-root, #cgr-queue-tray, #cgr-queue-button');
   }
 
   function installComposerObserver() {
@@ -1658,12 +1674,12 @@
       if (!S.projectActive || !isProjectUrl()) return;
       let relevant = false;
       for (const rec of records) {
-        // Typing in ProseMirror/contenteditable can produce childList mutations.
-        // The input hook already owns draft updates, so ignore those hot-path
-        // mutations instead of scheduling a full state evaluation per keystroke.
+        // Ignore native editor typing (owned by the input hook), and never
+        // schedule evaluation in response to our own queue/status UI.
         if (input && (rec.target === input || input.contains?.(rec.target))) continue;
-        const targetEl = rec.target?.nodeType === 1 ? rec.target : rec.target?.parentElement;
-        if (targetEl?.closest?.('#cgr-queue-tray')) continue; // our own queue UI churn
+        if (isResilienceUiNode(rec.target)) continue;
+        const changed = [...(rec.addedNodes || []), ...(rec.removedNodes || [])];
+        if (changed.length && changed.every(isResilienceUiNode)) continue;
         relevant = true;
         break;
       }
@@ -1681,6 +1697,8 @@
       });
     } catch (_) {}
   }
+
+  
 
   // ---------- tab-local ownership -----------------------------------------------------
   function verifyTabContext(expectedRoute = S.route) {
@@ -1905,22 +1923,32 @@
   }
 
   function latestMarker(msgs = getMessages()) {
-    // Prefer the known current assistant node when ChatGPT exposes one. Never
-    // accept a stale previous assistant after a newer user turn.
-    if (msgs.lastAssistant && assistantIsCurrentTail(msgs)) {
-      const direct = terminalMarker(msgs.lastAssistantText, msgs.lastAssistant);
+    // The current assistant's text is the cheap fast path. Do not walk its
+    // descendants unless there is actually a protocol-token candidate.
+    // This matters especially while the assistant is streaming long answers.
+    const assistantText = msgs.lastAssistantText || '';
+    if (msgs.lastAssistant && assistantIsCurrentTail(msgs) &&
+        nodeContainsProtocolToken({ nodeType: Node.TEXT_NODE, nodeValue: assistantText })) {
+      const direct = terminalMarker(assistantText, msgs.lastAssistant);
       if (direct) return direct;
       const turn = tailTurnRoot();
       if (turn && turn !== msgs.lastAssistant) {
-        const fromTurn = terminalMarker(msgs.lastAssistantText, turn);
+        const fromTurn = terminalMarker(assistantText, turn);
         if (fromTurn) return fromTurn;
       }
     }
 
-    // Protocol ownership must survive ChatGPT wrapper changes. An exact visible
-    // token in the latest-user -> composer corridor belongs to the current turn
-    // even when ChatGPT changes or omits the assistant wrapper.
-    return corridorProtocolMarker(msgs);
+    // Still support missing/changed assistant wrappers, but avoid a full-page
+    // corridor walk on every watchdog tick and every streaming token. New
+    // protocol tokens invalidate the cache through the root MutationObserver.
+    const key = S.route + ':' + signature(msgs.lastUserText) + ':' + DC.protocolRevision;
+    const cached = DC.corridorScan;
+    if (cached && cached.key === key && cached.user === msgs.lastUser &&
+        cached.assistant === msgs.lastAssistant && cached.value === null) return null;
+
+    const marker = corridorProtocolMarker(msgs);
+    DC.corridorScan = { key, user: msgs.lastUser, assistant: msgs.lastAssistant, value: marker };
+    return marker;
   }
 
   function firstQueueItem(queue = S.queue) {
@@ -3248,6 +3276,8 @@
   }
 
   function removeRuntimeUi() {
+    if (queueUiFrame) cancelAnimationFrame(queueUiFrame);
+    queueUiFrame = 0;
     document.getElementById('cgr-root')?.remove();
     document.getElementById('cgr-queue-tray')?.remove();
     document.getElementById('cgr-queue-button')?.remove();
@@ -3299,6 +3329,7 @@
     DC.composer = null;
     DC.form = null;
     refreshMessageCache(true);
+    installNetworkObserver();
     installRootObserver();
     installComposerObserver();
     rebindAssistantObserver();
@@ -3419,8 +3450,8 @@
     try {
       if (!UW.__CGR1_FETCH_PATCHED__ && typeof UW.fetch === 'function') {
         UW.__CGR1_FETCH_PATCHED__ = true;
-        const orig = UW.fetch.bind(UW);
-        UW.fetch = async function (input, init = {}) {
+        const orig = UW.fetch;
+        UW.fetch = async function (input, init) {
           const url = typeof input === 'string' ? input : input?.url || '';
           const method = init?.method || input?.method || 'GET';
           const candidate = isConversationRequest(url, method);
@@ -3451,7 +3482,7 @@
             Number(S.txn?.dispatchAt || S.txn?.subturnAt || 0) === ownerDispatchAt &&
             String(S.txn?.currentPromptHash || '') === ownerPromptHash;
           try {
-            const res = await orig(input, init);
+            const res = await orig.apply(this, arguments);
             if (owned()) {
               S.lastNetworkAt = now();
               S.lastNetworkFailureAt = 0;
@@ -3694,25 +3725,70 @@
   }
 
   // ---------- UI ----------------------------------------------------------------------
+  // Queue controls live in document.body, NOT as children of ChatGPT's
+  // React-managed composer. Inserting siblings into React's form can break
+  // reconciliation when the composer is remounted.
+  let queueUiFrame = 0;
+
+  function positionQueueUi() {
+    if (!S.projectActive || !isProjectUrl()) return;
+    const form = composerForm(getComposer());
+    const button = document.getElementById('cgr-queue-button');
+    const tray = document.getElementById('cgr-queue-tray');
+    if (!form || (!button && !tray)) return;
+    const rect = form.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+
+    if (button) {
+      const width = button.getBoundingClientRect().width || 88;
+      const rightRoom = vw - rect.right;
+      const placeBeside = rightRoom >= width + 16;
+      const left = placeBeside ? rect.right + 8 :
+        Math.max(8, Math.min(vw - width - 8, rect.right - width));
+      const top = placeBeside ? Math.max(8, Math.min(vh - 38, rect.bottom - 36)) :
+        Math.max(8, rect.top - 38);
+      button.style.left = Math.round(left) + 'px';
+      button.style.top = Math.round(top) + 'px';
+    }
+
+    if (tray) {
+      // Keep the list above the composer without changing ChatGPT's layout.
+      const width = Math.min(Math.max(1, rect.width), vw - 16);
+      const left = Math.max(8, Math.min(vw - width - 8, rect.left));
+      tray.style.left = Math.round(left) + 'px';
+      tray.style.width = Math.round(width) + 'px';
+      tray.style.bottom = Math.max(8, Math.round(vh - rect.top + 8)) + 'px';
+    }
+  }
+
+  function scheduleQueueUiLayout() {
+    if (!S.projectActive || !isProjectUrl() || queueUiFrame) return;
+    queueUiFrame = requestAnimationFrame(() => {
+      queueUiFrame = 0;
+      positionQueueUi();
+    });
+  }
+
   function ensureQueueTray() {
-    const input = getComposer();
-    const form = composerForm(input);
-    const host = form?.parentElement;
-    if (!input || !form || !host) return null;
+    if (!document.body || !getComposer()) return null;
     let tray = document.getElementById('cgr-queue-tray');
     if (!tray) {
       tray = document.createElement('section');
       tray.id = 'cgr-queue-tray';
       tray.setAttribute('aria-label', 'Queued follow-up messages');
       tray.innerHTML = `<div class="cgr-queue-tray-head"><div class="cgr-queue-tray-title"><span>Queued</span><span id="cgr-queue-tray-count"></span></div></div><div id="cgr-queue-list" class="cgr-queue-list" role="list"></div>`;
-    }
-    if (tray.parentElement !== host || tray.nextElementSibling !== form) {
-      try { host.insertBefore(tray, form); } catch (_) { try { host.prepend(tray); } catch (_) {} }
+      document.body.appendChild(tray);
+      scheduleQueueUiLayout();
     }
     DC.queueTray = tray;
-    tray.hidden = !queueCount();
+    const hidden = !queueCount();
+    if (tray.hidden !== hidden) tray.hidden = hidden;
     return tray;
   }
+
+  
 
   function animateQueueCardOut(row, done) {
     if (!row?.animate) { done(); return; }
@@ -3728,8 +3804,12 @@
     if (!tray) return;
     const list = tray.querySelector('#cgr-queue-list');
     const count = tray.querySelector('#cgr-queue-tray-count');
-    if (count) count.textContent = queueCount() ? String(queueCount()) : '';
-    tray.hidden = !queueCount();
+    if (count) {
+      const nextText = queueCount() ? String(queueCount()) : '';
+      if (count.textContent !== nextText) count.textContent = nextText;
+    }
+    if (tray.hidden !== !queueCount()) tray.hidden = !queueCount();
+    scheduleQueueUiLayout();
     if (!list || !queueCount()) { if (list) list.textContent = ''; return; }
     const fp = S.queue.map((x, i) => `${i}:${x.id}:${x.hash}:${x.editedAt}`).join('|') + `|edit:${S.queueEditingId}|active:${!!S.txn || S.generating}|hib:${S.hib?.phase || ''}|sysPause:${isPaused()}|block:${S.blockedReason}|error:${S.error?.id || ''}|action:${S.actionInFlight}|online:${navigator.onLine}`;
     if (fp === DC.queueFingerprint && list.childNodes.length) return;
@@ -3768,26 +3848,30 @@
   function ensureQueueButton() {
     if (!S.projectActive || !isProjectUrl()) { document.getElementById('cgr-queue-button')?.remove(); return; }
     const input = getComposer();
-    if (!input) return;
+    if (!input || !document.body) return;
     let btn = document.getElementById('cgr-queue-button');
-    if (btn?.isConnected) {
-      const badge = btn.querySelector('b');
-      if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
-      btn.disabled = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
-      return;
+    if (!btn?.isConnected) {
+      btn = document.createElement('button');
+      btn.id = 'cgr-queue-button';
+      btn.type = 'button';
+      btn.setAttribute('aria-label', 'Queue follow-up');
+      btn.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 5.5h9M4 10h9M4 14.5h6.5"/><path d="m14 12.5 2 2 2-2"/></svg><span>Queue</span><b></b>';
+      btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); if (S.queueEditingId) commitQueueEdit(); else queueCurrentComposer(); });
+      document.body.appendChild(btn);
     }
-    const send = findSafeSendButton(input);
-    const form = composerForm(input);
-    const parent = send?.parentElement || form;
-    if (!parent) return;
-    btn = document.createElement('button');
-    btn.id = 'cgr-queue-button'; btn.type = 'button'; btn.setAttribute('aria-label', 'Queue follow-up');
-    btn.innerHTML = '<svg viewBox="0 0 20 20"><path d="M4 5.5h9M4 10h9M4 14.5h6.5"/><path d="m14 12.5 2 2 2-2"/></svg><span>Queue</span><b></b>';
-    btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); if (S.queueEditingId) commitQueueEdit(); else queueCurrentComposer(); });
-    try { if (send && send.parentElement === parent) parent.insertBefore(btn, send); else parent.appendChild(btn); } catch (_) {}
-    const badge = btn.querySelector('b'); if (badge) { badge.textContent = queueCount() ? String(queueCount()) : ''; badge.hidden = !queueCount(); }
-    btn.disabled = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
+    const badge = btn.querySelector('b');
+    if (badge) {
+      const count = queueCount();
+      const nextText = count ? String(count) : '';
+      if (badge.textContent !== nextText) badge.textContent = nextText;
+      if (badge.hidden !== !count) badge.hidden = !count;
+    }
+    const shouldDisable = S.actionInFlight || !norm(composerText(input)) || hasComposerAttachments(input);
+    if (btn.disabled !== shouldDisable) btn.disabled = shouldDisable;
+    scheduleQueueUiLayout();
   }
+
+  
 
   function statusText() {
     if (!S.enabled) return ['Off', 'muted'];
@@ -3876,6 +3960,9 @@
       #cgr-panel{position:absolute;right:0;bottom:42px;width:285px;padding:12px;border:1px solid color-mix(in srgb,CanvasText 16%,transparent);border-radius:14px;background:color-mix(in srgb,Canvas 96%,transparent);box-shadow:0 14px 50px rgba(0,0,0,.25);backdrop-filter:blur(16px)}#cgr-panel[hidden]{display:none}.cgr-head,.cgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px}.cgr-head{margin-bottom:10px}.cgr-head span{opacity:.55;font-size:10px}.cgr-row{padding:7px 0;border-top:1px solid color-mix(in srgb,CanvasText 9%,transparent)}.cgr-row button,.cgr-actions button{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:8px;background:color-mix(in srgb,CanvasText 7%,transparent);color:CanvasText;padding:5px 8px;cursor:pointer}.cgr-note{margin-top:8px;padding:8px;border-radius:8px;background:color-mix(in srgb,CanvasText 5%,transparent);opacity:.75;font-size:11px}.cgr-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:9px}
       #cgr-queue-tray{width:100%;box-sizing:border-box;margin:0 0 8px;padding:6px;border:1px solid color-mix(in srgb,CanvasText 12%,transparent);border-radius:18px;background:color-mix(in srgb,Canvas 86%,transparent);box-shadow:0 6px 22px rgba(0,0,0,.08);backdrop-filter:blur(18px);animation:cgrTrayIn .16s cubic-bezier(.2,.8,.2,1)}#cgr-queue-tray[hidden]{display:none!important}.cgr-queue-tray-head{height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 5px 3px 8px}.cgr-queue-tray-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;opacity:.72}.cgr-queue-tray-title #cgr-queue-tray-count{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:color-mix(in srgb,CanvasText 9%,transparent);font-size:9px}.cgr-queue-list{display:flex;flex-direction:column;gap:5px;max-height:min(30dvh,280px);overflow-y:auto;scrollbar-width:thin;scrollbar-gutter:stable;padding:1px}.cgr-queue-item{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;min-height:48px;padding:7px 8px 7px 5px;border:1px solid color-mix(in srgb,CanvasText 9%,transparent);border-radius:13px;background:color-mix(in srgb,CanvasText 4.5%,Canvas);transition:background .13s ease,border-color .13s ease,transform .13s ease,opacity .13s ease;animation:cgrQueueCardIn .17s cubic-bezier(.2,.8,.2,1)}.cgr-queue-item.is-dragging{opacity:.45}.cgr-queue-grip{width:18px;height:28px;border:0;background:transparent;padding:6px 4px;display:grid;grid-template-columns:repeat(2,3px);gap:3px;align-content:center;justify-content:center;opacity:.28;cursor:grab;color:CanvasText}.cgr-queue-grip span{width:3px;height:3px;border-radius:50%;background:currentColor}.cgr-queue-body{min-width:0}.cgr-queue-text{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cgr-queue-meta{margin-top:2px;font-size:9.5px;opacity:.46}.cgr-queue-actions-inline{display:flex;align-items:center;gap:3px}.cgr-queue-action,.cgr-queue-icon-action{border:0;color:CanvasText;background:transparent;cursor:pointer}.cgr-queue-action{height:28px;padding:0 9px;border-radius:9px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;opacity:.48}.cgr-queue-icon-action:hover{opacity:.9;background:color-mix(in srgb,CanvasText 8%,transparent)}.cgr-queue-icon-action svg{width:15px;height:15px;fill:currentColor;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}.cgr-queue-remove svg{fill:none}
       #cgr-queue-button{margin-inline:3px;border:0;border-radius:999px;background:transparent;color:CanvasText;min-height:32px;padding:0 8px;display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:560;cursor:pointer;white-space:nowrap;opacity:.62}#cgr-queue-button:hover:not(:disabled){background:color-mix(in srgb,CanvasText 8%,transparent);opacity:.92}#cgr-queue-button:disabled{opacity:.28}#cgr-queue-button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.5}#cgr-queue-button b{min-width:16px;height:16px;padding:0 4px;border-radius:999px;display:inline-grid;place-items:center;background:color-mix(in srgb,CanvasText 10%,transparent);font-size:9px}
+      /* Our controls are fixed overlays, outside the React-managed form. */
+      #cgr-queue-button{position:fixed;z-index:2147483500;left:0;top:0;margin:0;border:1px solid color-mix(in srgb,CanvasText 14%,transparent);background:color-mix(in srgb,Canvas 96%,transparent);box-shadow:0 4px 16px rgba(0,0,0,.12);backdrop-filter:blur(12px)}
+      #cgr-queue-tray{position:fixed;z-index:2147483500;left:0;bottom:0;width:auto;max-width:calc(100vw - 16px);margin:0}
       @keyframes cgrTrayIn{from{opacity:0;transform:translateY(5px) scale(.995)}to{opacity:1;transform:none}}@keyframes cgrQueueCardIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}@media(prefers-reduced-motion:reduce){#cgr-queue-tray,.cgr-queue-item{animation:none!important}.cgr-queue-item{transition:none!important}}
     `);
   }
@@ -4068,6 +4155,8 @@
       }
     });
     window.addEventListener('focus', () => { if (S.projectActive && isProjectUrl()) scheduleEvaluate('focus', 100); });
+    window.addEventListener('resize', scheduleQueueUiLayout, { passive: true });
+    window.addEventListener('scroll', scheduleQueueUiLayout, { passive: true, capture: true });
     window.addEventListener('beforeunload', flushDraftSave);
   }
 
@@ -4112,7 +4201,6 @@
     });
   } catch (_) {}
 
-  installNetworkObserver();
   installRouteHooks();
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
