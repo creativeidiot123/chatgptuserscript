@@ -37,7 +37,7 @@ function harness(stage = 'S03', verdict = 'PASS', continued = true) {
   const events = [];
   const prompt = `[STUDYSHIT AUTO VERIFY ${stage}]\nReview the completed stage`;
   const messages = {
-    users: [{}, {}, {}], lastUserText: continued ? 'continue' : prompt,
+    users: [{}, {}, {}], assistants: [{}, {}, {}], lastUserText: continued ? 'continue' : prompt,
     lastAssistantText: `Checked saved chapter\n[[STUDY_VERIFY_${verdict}:${stage}]]`,
     lastAssistant: { getAttribute: () => 'answer-3' },
   };
@@ -54,6 +54,7 @@ function harness(stage = 'S03', verdict = 'PASS', continued = true) {
     },
     now: () => 1_000,
     norm: s => String(s || '').replace(/\s+/g, ' ').trim(),
+    promptText: s => String(s || '').replace(/\r\n?/g, '\n').trim(),
     verifyTabContext: () => true,
     getMessages: () => messages,
     log: (event, meta) => events.push({ event, ...meta }),
@@ -71,10 +72,12 @@ function harness(stage = 'S03', verdict = 'PASS', continued = true) {
     reconcileQueueClaim: () => {}, resetVerification: () => {},
     clearTransientNetworkError: () => {},
     clearTxn: () => { context.S.txn = null; },
+    setDraft: () => {}, saveTxn: () => {},
   });
   vm.runInContext(section('  function fnv1a(', '  function isProjectUrl('), context);
   vm.runInContext(section('  const STUDY_PROMPT_BASE', '  function protocolMarkerFromExactText('), context);
   vm.runInContext(section('  function userTurnBelongsToTxn(', '  function markerBelongsToTxn('), context);
+  vm.runInContext(section('  function beginSubturn(', '  function confirmTxn('), context);
   vm.runInContext(section('  async function completeLogicalTask(', '  async function recoverUnconfirmedSend('), context);
   let downloads = 0;
   context.fetchStudyStage = async target => { downloads++; return `Prompt for ${target}`; };
@@ -136,6 +139,16 @@ test('unconfirmed or mismatched recovery turns do not own verification', async (
     await h.context.completeLogicalTask('done', h.messages);
     assert.equal(h.context.S.queue.length, 0);
   }
+});
+
+test('a human follow-up then recovery cannot inherit the original verifier', async () => {
+  const h = harness();
+  h.context.beginSubturn('Explain an unrelated topic', 'human-send');
+  h.context.beginSubturn('continue', 'recovery');
+  h.context.S.txn.userTurnConfirmed = true;
+  h.context.S.txn.confirmedUserSig = h.context.signature('continue');
+  await h.context.completeLogicalTask('done', h.messages);
+  assert.equal(h.context.S.queue.length, 0);
 });
 
 test('stage mismatch cannot consume verifier evidence', async () => {

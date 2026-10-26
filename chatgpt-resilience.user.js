@@ -407,7 +407,7 @@
     // Recovery changes the latest user bubble to literal "continue" while the
     // transaction still owns the original verifier prompt. Require the exact
     // confirmed recovery turn; an unrelated human follow-up cannot inherit it.
-    return !!(txn && txn.route === S.route &&
+    return !!(txn && txn.route === S.route && !txn.studyVerificationDetached &&
       norm(txn.currentPrompt) === PROTOCOL.CONTINUE &&
       norm(msgs?.lastUserText) === PROTOCOL.CONTINUE &&
       String(txn.rootPrompt || '').trimStart().startsWith(prefix) &&
@@ -1883,6 +1883,11 @@
     if (!t) return armNewTxn(prompt, source);
     const msgs = getMessages(true);
     const p = promptText(prompt);
+    // A substantive human follow-up changes the work under review. Later
+    // recovery must not revive ownership from the original verifier prompt.
+    if (norm(p) !== PROTOCOL.CONTINUE && norm(p) !== norm(t.rootPrompt)) {
+      t.studyVerificationDetached = true;
+    }
     t.currentPrompt = p;
     t.currentPromptHash = fnv1a(norm(p));
     t.source = source;
