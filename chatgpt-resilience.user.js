@@ -391,6 +391,7 @@
 
   function studyGateKey(route) { return 'study-verification-gate:' + route; }
   function studyFailureKey(route, stage) { return 'study-verification-fail:' + route + ':' + stage; }
+  function studyFailureIdentityKey(route, stage) { return 'study-verification-fail-identity:' + route + ':' + stage; }
   function studyAdvanceKey(route) { return 'study-advance:' + route; }
 
   function studyHandoffIdentity(msgs = getMessages()) {
@@ -453,7 +454,14 @@
     // Verify results are authoritative ONLY for the stage whose verifier was
     // actually queued in this project chat. Stray PASS tokens never advance.
     if (info.kind === 'VERIFY_PASS' || info.kind === 'VERIFY_FAIL') {
-      if (!gate || gate.stage !== info.stage || gate.phase !== 'awaiting-verification' ||
+      const previous = store.get(studyAdvanceKey(route), null);
+      const isFirstHandling = gate?.phase === 'awaiting-verification';
+      const isSafeReplay = (
+        ((info.kind === 'VERIFY_FAIL' && gate?.phase === 'repairing') ||
+         (info.kind === 'VERIFY_PASS' && gate?.phase === 'verified')) &&
+        previous?.token === info.token && previous?.identity === identity
+      );
+      if (!gate || gate.stage !== info.stage || (!isFirstHandling && !isSafeReplay) ||
           !studyVerifyUserTurn(msgs, info.stage)) {
         log('study-unowned-verification-marker', { kind: info.kind, stage: info.stage });
         return false;
@@ -465,6 +473,7 @@
       if (!gate || gate.stage !== 'S07' || gate.phase !== 'awaiting-verification' ||
           !studyVerifyUserTurn(msgs, 'S07')) return false;
       store.del(studyFailureKey(route, 'S07'));
+      store.del(studyFailureIdentityKey(route, 'S07'));
       store.set(studyGateKey(route), { stage: 'S07', phase: 'verified', identity });
       log('study-final-verified', { stage: 'S07' });
       maybeNotify(APP + ': study ready', 'Stage 07 independently verified. Final HTML is ready in GitHub.');
@@ -479,8 +488,11 @@
 
     // Repeated failures should NOT cause an endless automated rewrite/recheck loop.
     if (info.kind === 'VERIFY_FAIL') {
-      const failures = Number(store.get(studyFailureKey(route, info.stage), 0)) + 1;
+      const counted = store.get(studyFailureIdentityKey(route, info.stage), '');
+      const failures = Number(store.get(studyFailureKey(route, info.stage), 0)) +
+        (counted === identity ? 0 : 1);
       store.set(studyFailureKey(route, info.stage), failures);
+      store.set(studyFailureIdentityKey(route, info.stage), identity);
       if (failures >= STUDY_MAX_VERIFICATION_FAILURES) {
         store.set(studyGateKey(route), { stage: info.stage, phase: 'manual-review', failures });
         blockAutomation('study-verification-failures',
@@ -529,6 +541,7 @@
         store.set(studyGateKey(route), { stage, phase: 'awaiting-verification', identity });
       } else if (info.kind === 'VERIFY_PASS') {
         store.del(studyFailureKey(route, info.stage));
+        store.del(studyFailureIdentityKey(route, info.stage));
         store.set(studyGateKey(route), { stage: info.stage, phase: 'verified', identity });
       } else if (info.kind === 'VERIFY_FAIL') {
         store.set(studyGateKey(route), { stage: info.stage, phase: 'repairing', identity });
