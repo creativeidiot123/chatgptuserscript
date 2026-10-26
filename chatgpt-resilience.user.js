@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.40
+// @version      1.3.41
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.40
+   * ChatGPT Resilience 1.3.41
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.40';
+  const VERSION = '1.3.41';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -396,14 +396,18 @@
 
   function studyHandoffIdentity(msgs = getMessages()) {
     // A repeated identical response in a LATER turn is not the same handoff.
-    return String(msgs.users?.length || 0) + ':' +
-      String(msgs.lastAssistant?.getAttribute?.('data-dil-message-id') || '') + ':' +
+    // The assistant message id is unique per turn. The rendered user count is
+    // only a legacy fallback: ChatGPT mounts recent turns lazily, so scrolling
+    // changes it without the conversation changing.
+    const dilId = String(msgs.lastAssistant?.getAttribute?.('data-dil-message-id') || '');
+    return (dilId || String(msgs.users?.length || 0)) + ':' +
       signature(msgs.lastUserText) + ':' + signature(msgs.lastAssistantText);
   }
 
   function studyVerifyUserTurn(msgs, stage, txn = S.txn) {
     const prefix = '[STUDYSHIT AUTO VERIFY ' + stage + ']';
     if (String(msgs?.lastUserText || '').trimStart().startsWith(prefix)) return true;
+    if (studyDomVerifierStage(msgs) === stage) return true;
     // Recovery changes the latest user bubble to literal "continue" while the
     // transaction still owns the original verifier prompt. Require the exact
     // confirmed recovery turn; an unrelated human follow-up cannot inherit it.
@@ -412,6 +416,36 @@
       norm(msgs?.lastUserText) === PROTOCOL.CONTINUE &&
       String(txn.rootPrompt || '').trimStart().startsWith(prefix) &&
       userTurnBelongsToTxn(msgs, txn));
+  }
+
+  // Stage of the rendered auto-verify prompt this verdict answers, or ''.
+  // Skips literal "continue" recovery bubbles; any other human turn ends the
+  // search, so an unrelated follow-up can never inherit verifier ownership.
+  function studyDomVerifierStage(msgs) {
+    const texts = [String(msgs?.lastUserText || '')];
+    const users = Array.isArray(msgs?.users) ? msgs.users : [];
+    for (let i = users.length - 2; i >= 0; i--) texts.push(String(users[i]?.textContent || ''));
+    for (const raw of texts) {
+      const text = raw.replace(/[​-‍﻿]/g, '').trimStart();
+      if (norm(text) === PROTOCOL.CONTINUE) continue;
+      const m = text.match(/^\[STUDYSHIT AUTO VERIFY (S0[1-7])\]/);
+      return m ? m[1] : '';
+    }
+    return '';
+  }
+
+  // Gate state is tab-local. Opening the chat in a new tab or another browser
+  // loses it, which used to strand a genuine verdict as "unowned" forever.
+  // Re-adopt the gate only from rendered conversation evidence.
+  function adoptStudyGateFromDom(msgs, info) {
+    const route = S.route;
+    const gate = store.get(studyGateKey(route), null);
+    if (gate && gate.stage === info.stage) return gate;
+    if (studyDomVerifierStage(msgs) !== info.stage) return gate;
+    const adopted = { stage: info.stage, phase: 'awaiting-verification', identity: 'dom-adopted' };
+    store.set(studyGateKey(route), adopted);
+    log('study-gate-adopted', { stage: info.stage, previousStage: gate?.stage || '' });
+    return adopted;
   }
 
   function rememberStudyVerificationResult(msgs, txn = S.txn) {
@@ -431,6 +465,39 @@
     if (target.startsWith('V')) return '[STUDYSHIT AUTO VERIFY S' + target.slice(1) + ']';
     if (info.kind === 'VERIFY_FAIL') return '[STUDYSHIT AUTO REPAIR ' + target + ']';
     return '[STUDYSHIT AUTO STAGE ' + target + ']';
+  }
+
+  const STUDY_HEADER_RE = /^\[STUDYSHIT AUTO (?:STAGE|VERIFY|REPAIR) S0[1-7]\]/;
+
+  // Header the current study tail asks for next, or '' when it asks for none.
+  function studyExpectedHeader(msgs) {
+    const info = assistantIsCurrentTail(msgs) ? studyTailToken(msgs.lastAssistantText) : null;
+    return studyQueuePrefix(info, getStudyTarget(info));
+  }
+
+  // An auto prompt is only valid as the answer to the tail marker that asked
+  // for it. Anything else is a leftover that would resend old work.
+  function staleStudyPrompt(text, msgs) {
+    const header = String(text || '').trimStart().match(STUDY_HEADER_RE)?.[0];
+    return !!header && header !== studyExpectedHeader(msgs);
+  }
+
+  // ChatGPT persists unsent composer drafts per conversation and restores them
+  // in a new tab or after reload. A restored auto prompt that the conversation
+  // has moved past must not be sent again; it also blocks the queue pump.
+  function clearStaleStudyDraft(msgs) {
+    if (S.txn || S.actionInFlight || S.queueProcessing || S.queueEditingId || validSendIntent()) return false;
+    if (now() - Number(S.lastHumanComposerInputAt || 0) < 120_000) return false;
+    const input = getComposer();
+    const draft = promptText(composerText(input));
+    if (!input || !STUDY_HEADER_RE.test(draft) || hasComposerAttachments(input)) return false;
+    const head = firstQueueItem();
+    if (head && norm(head.text) === norm(draft)) return false;
+    if (!staleStudyPrompt(draft, msgs) && !head) return false;
+    clearComposer(input);
+    clearDraft(S.route);
+    log('study-stale-draft-cleared', { header: draft.match(STUDY_HEADER_RE)[0] });
+    return true;
   }
 
   function studyPendingQueueHas(info, target) {
@@ -468,7 +535,8 @@
     const info = studyTailToken(msgs.lastAssistantText);
     if (!info) return false;
     const route = S.route;
-    const gate = store.get(studyGateKey(route), null);
+    const isVerdict = info.kind === 'VERIFY_PASS' || info.kind === 'VERIFY_FAIL';
+    const gate = isVerdict ? adoptStudyGateFromDom(msgs, info) : store.get(studyGateKey(route), null);
     const identity = studyHandoffIdentity(msgs);
     const target = getStudyTarget(info);
 
@@ -917,6 +985,7 @@
     lastGenerationEvidenceAt: 0,
     lastAssistantSig: '',
     lastUserSig: '',
+    lastHumanComposerInputAt: 0,
     longThinkingSeenAt: 0,
     longThinkingLastSeenAt: 0,
     connectionInterruptedSeenAt: 0,
@@ -1916,13 +1985,36 @@
     return t;
   }
 
+  // The user bubble renders the submitted Markdown, so its text rarely hashes
+  // like the source prompt. Compare letters and digits only.
+  const looseText = s => String(s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+
+  function userTextMatchesPrompt(userText, prompt) {
+    const u = looseText(userText), p = looseText(prompt);
+    if (!u || !p) return false;
+    if (u === p) return true;
+    const n = Math.min(300, p.length);
+    return n >= 24 && u.slice(0, n) === p.slice(0, n);
+  }
+
+  // A matching bubble only proves the prompt landed once the turn has moved
+  // past the dispatch baseline. Stage prompts repeat verbatim (one topic per
+  // run), so the previous identical bubble must not confirm the next send.
+  function promptLanded(msgs, t) {
+    if (!userTextMatchesPrompt(msgs.lastUserText, t.currentPrompt)) return false;
+    return !assistantIsCurrentTail(msgs) ||
+      signature(msgs.lastAssistantText) !== String(t.baselineAssistantSig || '');
+  }
+
   function confirmTxn(msgs) {
     const t = S.txn;
     if (!t || t.route !== S.route) return;
     const lastUserHash = fnv1a(norm(msgs.lastUserText));
     const lastUserChanged = signature(msgs.lastUserText) !== String(t.baselineUserSig || '');
+    // ChatGPT only mounts recent turns, so the rendered user count can stay flat.
     const countAdvanced = msgs.users.length > Number(t.baselineUserCount || 0) && lastUserChanged;
-    const hashMatches = !!msgs.lastUserText && lastUserHash === t.currentPromptHash;
+    const hashMatches = !!msgs.lastUserText &&
+      ((lastUserHash === t.currentPromptHash && lastUserChanged) || promptLanded(msgs, t));
     if (!t.userTurnConfirmed && (hashMatches || countAdvanced)) {
       t.userTurnConfirmed = true;
       t.confirmedAt = now();
@@ -2617,7 +2709,10 @@
     }
 
     const input = getComposer();
-    if (!input || norm(composerText(input)) || hasComposerAttachments(input)) return false;
+    // A draft identical to the head item is that item already staged (for
+    // example restored by ChatGPT after a reload); dispatch reuses it.
+    const staged = norm(composerText(input));
+    if (!input || (staged && staged !== norm(firstQueueItem()?.text)) || hasComposerAttachments(input)) return false;
 
     S.queueProcessing = true;
     try {
@@ -2653,6 +2748,13 @@
       if (!freshItem) {
         S.queueHoldReason = '';
         renderQueueList();
+        return false;
+      }
+
+      if (staleStudyPrompt(freshItem.text, freshMsgs)) {
+        removeQueueItem(freshItem.id, 'study-stale');
+        log('study-stale-queue-item-dropped', { header: freshItem.text.match(STUDY_HEADER_RE)?.[0] || '' });
+        kickQueue('study-stale', 50);
         return false;
       }
 
@@ -2896,11 +2998,10 @@
     const elapsed = now() - Number(t.subturnAt || t.createdAt || 0);
     if (elapsed < CFG.sendConfirmMs) return false;
 
-    const lastUserHash = fnv1a(norm(msgs.lastUserText));
-    const lastUserChanged = signature(msgs.lastUserText) !== String(t.baselineUserSig || '');
-    if (lastUserHash === t.currentPromptHash || (msgs.users.length > Number(t.baselineUserCount || 0) && lastUserChanged)) {
-      confirmTxn(msgs); return false;
-    }
+    // confirmTxn accepts a visibly landed prompt, so a confirmed turn is never
+    // reloaded or resent.
+    confirmTxn(msgs);
+    if (t.userTurnConfirmed) return false;
 
     // If a request was observed, reconcile by one controlled reload before ever
     // deciding it was unsent. No blind duplicate sends.
@@ -3333,6 +3434,7 @@
 
     // No active journal. Hibernation has priority over ordinary queued work.
     if (S.hib?.phase === 'sleeping' && now() >= Number(S.hib.wakeAt || 0)) await attemptGithubWake('due');
+    if (!S.txn && !S.hib) clearStaleStudyDraft(msgs);
     if (!S.txn && !S.hib && S.queue.length) await processQueue();
     paintUI();
     scheduleWatchdog();
@@ -3679,6 +3781,7 @@
     document.addEventListener('input', e => {
       if (!S.projectActive || !isProjectUrl()) return;
       if (isComposerTarget(e.target)) {
+        if (e.isTrusted) S.lastHumanComposerInputAt = now();
         if (S.queueEditingId) {
           cancelPendingDraft(S.route);
           ensureQueueButton();

@@ -66,6 +66,7 @@ function harness(stage = 'S03', verdict = 'PASS', continued = true) {
       return item;
     },
     saveQueue: () => {}, renderQueueList: () => {}, kickQueue: () => {},
+    assistantIsCurrentTail: () => context.tailIsCurrent !== false,
     loadTxn: () => context.S.txn,
     loadQueue: () => context.S.queue,
     loadHibernation: () => null,
@@ -200,7 +201,8 @@ test('repeated FAIL handling counts once and third distinct failure blocks', asy
   assert.equal(h.context.S.queue.length, 1);
   for (let failure = 2; failure <= 3; failure++) {
     h.context.S.queue = [];
-    h.messages.users.push({});
+    // Each verifier verdict is a new assistant message with its own id.
+    h.messages.lastAssistant = { getAttribute: () => `answer-fail-${failure}` };
     h.context.store.set(h.context.studyGateKey(h.context.S.route), { stage: 'S03', phase: 'awaiting-verification' });
     h.context.S.txn = {
       id: `txn-${failure}`, route: h.context.S.route,
@@ -211,4 +213,88 @@ test('repeated FAIL handling counts once and third distinct failure blocks', asy
   }
   assert.equal(h.context.S.blockedReason, 'study-verification-failures');
   assert.equal(h.context.S.queue.length, 0);
+});
+
+// A chat opened in a new tab or another browser starts with empty tab-local
+// state. The rendered auto-verify prompt is then the only ownership evidence.
+function freshTab(stage = 'S02', verdict = 'PASS', userTexts = null) {
+  const h = harness(stage, verdict, false);
+  h.data.clear();
+  h.context.S.txn = null;
+  if (userTexts) {
+    h.messages.users = userTexts.map(textContent => ({ textContent }));
+    h.messages.lastUserText = userTexts.at(-1);
+  }
+  return h;
+}
+
+test('a fresh tab adopts the verifier gate from the rendered verify prompt', async () => {
+  const h = freshTab();
+  await h.context.queueNextStudyStage(h.messages);
+  assert.equal(h.context.S.queue.length, 1);
+  assert.match(h.context.S.queue[0].text, /^\[STUDYSHIT AUTO STAGE S03\]/);
+  assert.equal(h.events[0].event, 'study-gate-adopted');
+  await h.context.queueNextStudyStage(h.messages);
+  assert.equal(h.context.S.queue.length, 1);
+  assert.equal(h.downloads(), 1);
+});
+
+test('a fresh tab adopts ownership through literal continue recovery turns', async () => {
+  const h = freshTab('S02', 'PASS', ['[STUDYSHIT AUTO VERIFY S02]\nReview', 'continue', 'continue']);
+  await h.context.queueNextStudyStage(h.messages);
+  assert.equal(h.context.S.queue.length, 1);
+  assert.match(h.context.S.queue[0].text, /^\[STUDYSHIT AUTO STAGE S03\]/);
+});
+
+test('a fresh tab FAIL queues repair of the same stage', async () => {
+  const h = freshTab('S02', 'FAIL');
+  await h.context.queueNextStudyStage(h.messages);
+  assert.match(h.context.S.queue[0].text, /^\[STUDYSHIT AUTO REPAIR S02\]/);
+  assert.equal(h.context.store.get(h.context.studyFailureKey(h.context.S.route, 'S02')), 1);
+});
+
+test('a human turn between the verify prompt and continue blocks adoption', async () => {
+  const h = freshTab('S02', 'PASS', ['[STUDYSHIT AUTO VERIFY S02]\nReview', 'Explain duration', 'continue']);
+  await h.context.queueNextStudyStage(h.messages);
+  assert.equal(h.context.S.queue.length, 0);
+});
+
+test('DOM evidence for another stage cannot adopt a verdict', async () => {
+  const h = freshTab('S02', 'PASS', ['[STUDYSHIT AUTO VERIFY S01]\nReview']);
+  await h.context.queueNextStudyStage(h.messages);
+  assert.equal(h.context.S.queue.length, 0);
+});
+
+test('DOM evidence never overrides a same-stage manual-review stop', async () => {
+  const h = freshTab('S03', 'PASS');
+  h.context.store.set(h.context.studyGateKey(h.context.S.route), { stage: 'S03', phase: 'manual-review', failures: 3 });
+  await h.context.queueNextStudyStage(h.messages);
+  assert.equal(h.context.S.queue.length, 0);
+});
+
+test('only the auto prompt the tail asks for is current', () => {
+  const h = freshTab();
+  const msgs = { ...h.messages, lastAssistantText: 'ok\n[[STUDY_VERIFY_PASS:S02]]' };
+  assert.equal(h.context.staleStudyPrompt('[STUDYSHIT AUTO VERIFY S02]\nVerify', msgs), true);
+  assert.equal(h.context.staleStudyPrompt('[STUDYSHIT AUTO STAGE S03]\nTeach', msgs), false);
+  assert.equal(h.context.staleStudyPrompt('A normal queued question', msgs), false);
+  const done = { ...msgs, lastAssistantText: 'ok\n[[STUDY_VERIFY_PASS:S07]]' };
+  assert.equal(h.context.staleStudyPrompt('[STUDYSHIT AUTO STAGE S03]\nTeach', done), true);
+});
+
+test('a sent prompt is recognised from its rendered Markdown bubble', () => {
+  const h = harness();
+  const prompt = '[STUDYSHIT AUTO STAGE S03]\n**Load** current `state.json` and study.html from GitHub.';
+  const rendered = '[STUDYSHIT AUTO STAGE S03] Load current state.json and study.html from GitHub.';
+  const t = { currentPrompt: prompt, baselineAssistantSig: h.context.signature('old answer') };
+  // Previous identical stage prompt is still the tail: not landed yet.
+  h.context.tailIsCurrent = true;
+  assert.equal(h.context.promptLanded({ lastUserText: rendered, lastAssistantText: 'old answer' }, t), false);
+  // The new user turn now follows the old answer.
+  h.context.tailIsCurrent = false;
+  assert.equal(h.context.promptLanded({ lastUserText: rendered, lastAssistantText: 'old answer' }, t), true);
+  // Or a new answer has started under it.
+  h.context.tailIsCurrent = true;
+  assert.equal(h.context.promptLanded({ lastUserText: rendered, lastAssistantText: 'new answer' }, t), true);
+  assert.equal(h.context.promptLanded({ lastUserText: 'Something else entirely here', lastAssistantText: 'new' }, t), false);
 });
