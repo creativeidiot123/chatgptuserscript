@@ -62,6 +62,16 @@ Stage and verification prompts (including `08-verify-stage.txt`) load at complet
 
 **Recovery:** Tampermonkey menu → **Retry study next stage** if the remote stage/verification prompt fails to download. The guard fails closed if a pending verifier is removed from the queue; it will not silently send unrelated queued work instead. The browser session/tab must remain open; this is client-side automation, not a hosted unattended worker. Attachments are not re-uploaded by the userscript. Saving HTML to GitHub still depends on the ChatGPT model's connected GitHub access and verified writes.
 
+## New tab / browser handoff (v1.3.41+)
+
+Moving the study chat to a new tab or another browser no longer strands the pipeline at **Study handoff pending**:
+
+- A `[[STUDY_VERIFY_PASS:Sxx]]` / `[[STUDY_VERIFY_FAIL:Sxx]]` verdict is accepted without tab-local gate state when the rendered conversation proves it answers a `[STUDYSHIT AUTO VERIFY Sxx]` prompt for the same stage (literal `continue` recovery turns in between are allowed; any other human turn is not). A same-stage manual-review stop is never overridden.
+- A send is confirmed from the rendered user bubble even when ChatGPT renders the prompt as Markdown or keeps only recent turns mounted. This stops the reload → resend loop that posted the same prompt twice.
+- An auto prompt that ChatGPT restores into the composer after the conversation has moved past it is cleared instead of being sent again, and stale queued auto prompts are dropped before dispatch.
+
+Run only **one** tab with the userscript on a given study chat.
+
 ## Recovery diagnostics (v1.3.40+)
 
 The common **Something went wrong** product error is recognized alongside **Something seems to have gone wrong**, including the standard help-center suffix when the error card is appended to a long response. These use the existing guarded Stop → settle → wait → continue path.
