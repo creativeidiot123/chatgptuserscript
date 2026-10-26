@@ -61,3 +61,28 @@ Stage and verification prompts (including `08-verify-stage.txt`) load at complet
 **Bootstrap:** Upload a lecture PPT in a new ChatGPT Study Project conversation. The Study Project's instructions (stored in [studyshit/PROJECT-INSTRUCTIONS.txt](https://github.com/creativeidiot123/studyshit/blob/main/PROJECT-INSTRUCTIONS.txt)) load/execute Stage 01. Once Stage 01 commits and emits its marker, the userscript takes over the next stages.
 
 **Recovery:** Tampermonkey menu → **Retry study next stage** if the remote stage/verification prompt fails to download. The guard fails closed if a pending verifier is removed from the queue; it will not silently send unrelated queued work instead. The browser session/tab must remain open; this is client-side automation, not a hosted unattended worker. Attachments are not re-uploaded by the userscript. Saving HTML to GitHub still depends on the ChatGPT model's connected GitHub access and verified writes.
+
+## Recovery diagnostics (v1.3.40+)
+
+The common **Something went wrong** product error is recognized alongside **Something seems to have gone wrong**, including the standard help-center suffix when the error card is appended to a long response. These use the existing guarded Stop → settle → wait → continue path.
+
+Verification ownership survives Stop → wait → `continue`. An owned verification result is recorded before its transaction is cleared, so retrying a failed next-prompt download after a reload does not strand the pipeline. PASS and FAIL still require a matching pending gate; unrelated or quoted markers never authorize advancement. The status pill reports **Study handoff pending** rather than Healthy while progression is unresolved.
+
+State is session-local. Moving a chat to another tab or browser does not transfer verification ownership, the queue or the active transaction. In that situation, re-check the last completed stage in the existing conversation and produce a fresh completion claim to establish a new verification gate; do not treat an orphan PASS token as permission to advance.
+
+For a stopped run, open the active ChatGPT tab's **Web Console** (Firefox: Ctrl+Shift+K; Chromium: Ctrl+Shift+J), not Firefox's browser-wide Browser Console. Run:
+
+```js
+JSON.stringify({version: window.ChatGPTResilience?.version, state: window.ChatGPTResilience?.state()}, null, 2)
+```
+
+The snapshot includes recent runtime events and the study gate/handoff. Inspect it for private content before sharing; error snippets or route identifiers may be present. If the API is unavailable, report that exact result and the version shown by clicking the status pill. General favicon/browser-console warnings alone do not identify a userscript failure.
+
+Run the recovery regression suite with Node.js:
+
+```text
+node --test tests/study-recovery.test.cjs
+node --check chatgpt-resilience.user.js
+```
+
+These tests exercise the actual study transition functions with a mocked browser boundary. They cover recovered PASS/FAIL/final verification, duplicate handling, failed prompt download and reload, unrelated turns, and the three-failure stop. They do not replace live browser validation of DOM detection and native Stop/Send.

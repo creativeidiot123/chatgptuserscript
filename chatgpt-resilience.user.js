@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.39
+// @version      1.3.40
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.39
+   * ChatGPT Resilience 1.3.40
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.39';
+  const VERSION = '1.3.40';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -190,7 +190,7 @@
   ].join(',');
 
 
-  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong(?:\.|!|$| while generating| if this issue persists)|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection interrupted(?:\.\s*waiting for the complete answer)?|connection (?:reset|closed|lost|failed|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
+  const ASSISTANT_ERROR_TAIL_RE = /(?:there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:(?:seems to have )?gone|went) wrong(?:[.!]?\s*if this issue persists[,:]?\s*please contact us through our help center[.!]?)?(?:\.|!|$| while generating)|hmm[.!…]*\s*something (?:(?:seems to have )?gone|went) wrong|error in (?:the )?message stream|stream (?:failed|interrupted|closed unexpectedly)|thinking failed|stopped thinking|reasoning stopped|a network error occurred|networkerror when attempting to fetch resource|failed to fetch|fetch failed|error occurred while connecting to the websocket|connection interrupted(?:\.\s*waiting for the complete answer)?|connection (?:reset|closed|lost|failed|terminated)|upstream connect error|disconnect\/reset before headers|conversation not found|(?:unable|failed) to load (?:this )?(?:conversation|chat)|(?:request|message[- ]delivery|response|connection)?\s*timed? out|failed to get (?:a )?response|response (?:interrupted|failed)|too many requests|usage limit|service unavailable|server error|internal server error|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|overloaded|model (?:is )?(?:currently |temporarily )?unavailable|image generation failed|file upload (?:failed|error)|download failed|file not found|content policy)(?:[.!]|\s|try again|please try again|please start a new (?:chat|conversation))*$/i;
   const ERROR_RULES = [
     { id: 'anti-abuse', kind: 'hard', re: /unusual activity|suspicious activity|verify (?:that )?you are human|captcha|cloudflare challenge|automated traffic|security check|you have been blocked/i },
     { id: 'auth', kind: 'hard', re: /session (?:has )?expired|please (?:log|sign) in|authentication (?:failed|required)|unauthorized|not authenticated/i },
@@ -204,7 +204,7 @@
     { id: 'timeout', kind: 'continue', re: /timed? out|time[- ]?out|took too long|taking too long|response took too long|request took too long|connection timed out|message[- ]delivery (?:timed? out|timeout)|gateway time[- ]?out|err_timed_out|too late/i },
     { id: 'message-stream', kind: 'continue', re: /error in (?:the )?message stream|message stream (?:error|failed|failure)|stream (?:error|failed|failure|interrupted|closed unexpectedly)|incomplete chunked encoding|premature eof/i },
     { id: 'thinking-failed', kind: 'continue', re: /thinking failed|reasoning failed|failed while thinking|stopped thinking|reasoning stopped|stopped reasoning/i },
-    { id: 'generation', kind: 'continue', re: /there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:seems to have )?gone wrong|hmm[.!…]*\s*something (?:seems to have )?gone wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)|failed to get (?:a )?response|response (?:interrupted|failed)|generation interrupted|we encountered an error/i },
+    { id: 'generation', kind: 'continue', re: /there was an error generating a response|an error occurred (?:while|during) (?:generating|streaming|processing)|something (?:(?:seems to have )?gone|went) wrong|hmm[.!…]*\s*something (?:(?:seems to have )?gone|went) wrong|error generating (?:the )?response|experienced an error|failed to generate (?:the )?(?:response|answer)|failed to get (?:a )?response|response (?:interrupted|failed)|generation interrupted|we encountered an error/i },
     { id: 'server', kind: 'continue', re: /server error|internal server error|service unavailable|temporarily unavailable|overloaded|bad gateway|gateway time[- ]?out|web server is down|origin is unreachable|upstream error|unknown error|model (?:is )?(?:currently |temporarily )?unavailable|model capacity/i },
     { id: 'image-generation', kind: 'continue', re: /image generation failed|failed to generate (?:the )?image|couldn(?:'|’)t generate (?:the )?image/i },
     { id: 'message-send', kind: 'send', re: /message (?:failed|couldn(?:'|’)t|could not) (?:to )?send|failed to send (?:the )?message|unable to send (?:the )?message|error sending (?:the )?message/i },
@@ -401,8 +401,29 @@
       signature(msgs.lastUserText) + ':' + signature(msgs.lastAssistantText);
   }
 
-  function studyVerifyUserTurn(msgs, stage) {
-    return String(msgs?.lastUserText || '').includes('[STUDYSHIT AUTO VERIFY ' + stage + ']');
+  function studyVerifyUserTurn(msgs, stage, txn = S.txn) {
+    const prefix = '[STUDYSHIT AUTO VERIFY ' + stage + ']';
+    if (String(msgs?.lastUserText || '').trimStart().startsWith(prefix)) return true;
+    // Recovery changes the latest user bubble to literal "continue" while the
+    // transaction still owns the original verifier prompt. Require the exact
+    // confirmed recovery turn; an unrelated human follow-up cannot inherit it.
+    return !!(txn && txn.route === S.route &&
+      norm(txn.currentPrompt) === PROTOCOL.CONTINUE &&
+      norm(msgs?.lastUserText) === PROTOCOL.CONTINUE &&
+      String(txn.rootPrompt || '').trimStart().startsWith(prefix) &&
+      userTurnBelongsToTxn(msgs, txn));
+  }
+
+  function rememberStudyVerificationResult(msgs, txn = S.txn) {
+    const info = studyTailToken(msgs?.lastAssistantText);
+    if (!info || !['VERIFY_PASS', 'VERIFY_FAIL'].includes(info.kind)) return;
+    const key = studyGateKey(S.route);
+    const gate = store.get(key, null);
+    if (!gate || gate.stage !== info.stage || gate.phase !== 'awaiting-verification' ||
+        !studyVerifyUserTurn(msgs, info.stage, txn)) return;
+    // Journal ownership BEFORE clearing the completed transaction. A failed
+    // prompt download or reload must not strand this exact resumed result.
+    store.set(key, { ...gate, resultIdentity: studyHandoffIdentity(msgs) });
   }
 
   function studyQueuePrefix(info, target) {
@@ -462,19 +483,20 @@
         previous?.token === info.token && previous?.identity === identity
       );
       if (!gate || gate.stage !== info.stage || (!isFirstHandling && !isSafeReplay) ||
-          !studyVerifyUserTurn(msgs, info.stage)) {
+           !(studyVerifyUserTurn(msgs, info.stage) || gate.resultIdentity === identity)) {
         log('study-unowned-verification-marker', { kind: info.kind, stage: info.stage });
         return false;
       }
+      rememberStudyVerificationResult(msgs);
     }
 
     // Stage 07 is complete ONLY after its own separate verification passes.
     if (info.kind === 'VERIFY_PASS' && info.stage === 'S07') {
       if (!gate || gate.stage !== 'S07' || gate.phase !== 'awaiting-verification' ||
-          !studyVerifyUserTurn(msgs, 'S07')) return false;
+           !(studyVerifyUserTurn(msgs, 'S07') || gate.resultIdentity === identity)) return false;
       store.del(studyFailureKey(route, 'S07'));
       store.del(studyFailureIdentityKey(route, 'S07'));
-      store.set(studyGateKey(route), { stage: 'S07', phase: 'verified', identity });
+      store.set(studyGateKey(route), { stage: 'S07', phase: 'verified', identity, resultIdentity: identity });
       log('study-final-verified', { stage: 'S07' });
       maybeNotify(APP + ': study ready', 'Stage 07 independently verified. Final HTML is ready in GitHub.');
       return true;
@@ -542,9 +564,9 @@
       } else if (info.kind === 'VERIFY_PASS') {
         store.del(studyFailureKey(route, info.stage));
         store.del(studyFailureIdentityKey(route, info.stage));
-        store.set(studyGateKey(route), { stage: info.stage, phase: 'verified', identity });
+        store.set(studyGateKey(route), { stage: info.stage, phase: 'verified', identity, resultIdentity: identity });
       } else if (info.kind === 'VERIFY_FAIL') {
-        store.set(studyGateKey(route), { stage: info.stage, phase: 'repairing', identity });
+        store.set(studyGateKey(route), { stage: info.stage, phase: 'repairing', identity, resultIdentity: identity });
       }
       store.set(key, { token: info.token, identity, target });
       log('study-followup-queued', { kind: info.kind, stage: info.stage, target });
@@ -2850,6 +2872,7 @@
     if (marker === 'done') {
       if (S.hib) clearHibernation('done-marker');
       S.lastGenerationEndAt = now();
+      rememberStudyVerificationResult(msgs, S.txn);
       clearTxn('done-marker');
       const study = studyTailToken(msgs.lastAssistantText);
       if (study) {
@@ -3950,6 +3973,7 @@
     if (tailMarker === 'wait-user') return ['Wait-user marker detected', 'warn'];
     if (!assistantIsCurrentTail(tailMsgs) && !tailMarker) return ['Untracked unfinished turn', 'warn'];
     if (tailMarker !== 'done') return ['Untracked unfinished turn', 'warn'];
+    if (studyNeedsHandoff(tailMsgs)) return ['Study handoff pending', 'warn'];
     return ['Healthy', 'ok'];
   }
 
@@ -4114,6 +4138,9 @@
       ['stream error continues', classifyError('Error in message stream')?.kind, 'continue'],
       ['KeepChatGPT NetworkError continues', classifyError('NetworkError when attempting to fetch resource.')?.kind, 'continue'],
       ['KeepChatGPT something-wrong continues', classifyError('Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
+      ['bare something-went-wrong product card', classifyProductText('Something went wrong.')?.kind, 'continue'],
+      ['something-went-wrong tail in a long turn', classifyRenderedTailError('ordinary output '.repeat(150) + 'Something went wrong. If this issue persists please contact us through our help center.')?.kind, 'continue'],
+      ['something-seems-to-have-gone-wrong remains supported', classifyRenderedTailError('Something seems to have gone wrong. Please try again.')?.kind, 'continue'],
       ['connection interrupted continues', classifyProductText('Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
       ['long assistant tail still finds interrupted card', classifyRenderedTailError('normal assistant prose '.repeat(120) + ' Connection interrupted. Waiting for the complete answer')?.id, 'connection-interrupted'],
       ['bare connection interrupted tail still finds card', classifyRenderedTailError('normal assistant prose '.repeat(120) + ' Connection interrupted')?.id, 'connection-interrupted'],
@@ -4245,6 +4272,8 @@
         pausedUntil: S.pausedUntil,
         pausedReason: S.pausedReason,
         blockedReason: S.blockedReason,
+        studyGate: store.get(studyGateKey(S.route), null),
+        studyHandoff: store.get(studyAdvanceKey(S.route), null),
         composer: { ...S.composerControl },
         txn: S.txn ? { ...S.txn, rootPrompt: `[${S.txn.rootPrompt?.length || 0} chars]`, currentPrompt: `[${S.txn.currentPrompt?.length || 0} chars]` } : null,
         queue: S.queue.map(x => ({ ...x, text: `[${x.text.length} chars]` })),
