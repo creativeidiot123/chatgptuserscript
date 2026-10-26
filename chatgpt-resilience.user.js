@@ -404,13 +404,28 @@
     return String(msgs?.lastUserText || '').includes('[STUDYSHIT AUTO VERIFY ' + stage + ']');
   }
 
+  function studyQueuePrefix(info, target) {
+    if (!info || !target) return '';
+    if (target.startsWith('V')) return '[STUDYSHIT AUTO VERIFY S' + target.slice(1) + ']';
+    if (info.kind === 'VERIFY_FAIL') return '[STUDYSHIT AUTO REPAIR ' + target + ']';
+    return '[STUDYSHIT AUTO STAGE ' + target + ']';
+  }
+
+  function studyPendingQueueHas(info, target) {
+    const prefix = studyQueuePrefix(info, target);
+    return !!prefix && S.queue.some(item => String(item.text || '').startsWith(prefix));
+  }
+
   function studyNeedsHandoff(msgs = getMessages()) {
     const info = studyTailToken(msgs.lastAssistantText);
     const target = getStudyTarget(info);
     if (!target) return false;
     const prior = store.get(studyAdvanceKey(S.route), null);
+    // A human removing the verifier/repair from the queue must NOT let a
+    // different queued message bypass the stage gate.
     return !prior || prior.identity !== studyHandoffIdentity(msgs) ||
-      prior.token !== info.token || prior.target !== target;
+      prior.token !== info.token || prior.target !== target ||
+      !studyPendingQueueHas(info, target);
   }
 
   function fetchStudyStage(target) {
@@ -459,7 +474,8 @@
     if (!target || DC.studyFetching) return false;
     const key = studyAdvanceKey(route);
     const prior = store.get(key, null);
-    if (!force && prior?.token === info.token && prior?.identity === identity && prior?.target === target) return true;
+    if (!force && prior?.token === info.token && prior?.identity === identity && prior?.target === target &&
+        studyPendingQueueHas(info, target)) return true;
 
     // Repeated failures should NOT cause an endless automated rewrite/recheck loop.
     if (info.kind === 'VERIFY_FAIL') {
