@@ -72,6 +72,16 @@ Moving the study chat to a new tab or another browser no longer strands the pipe
 
 Run only **one** tab with the userscript on a given study chat.
 
+## No blind reposts (v1.3.42+)
+
+An unconfirmed send is held for inspection after the confirmation window. Missing, collapsed or virtualized DOM messages are not proof that a request failed to reach ChatGPT. The userscript no longer reloads the page or reposts the original prompt to resolve that ambiguity. Confirmed interrupted turns still use the existing guarded Stop → wait → literal `continue` recovery.
+
+Switching Automation **Off** cancels pending recovery. Native Send rechecks the enabled, paused and blocked states after composer staging; switching Off and back On invalidates a send that was already being staged. The journal records a send attempt before the native click. A previously held transaction can clear its `send-unconfirmed` hold once its landed user turn is recognized.
+
+After a duplicate-send incident, leave Automation Off, inspect the current conversation and queue, and reconcile the already-landed turn before resuming. Do not clear state or manually repost a stage merely because its send could not be confirmed.
+
+Run both suites with `node --test tests/*.test.cjs`. Native browser validation is still required after installing the update.
+
 ## Recovery diagnostics (v1.3.40+)
 
 The common **Something went wrong** product error is recognized alongside **Something seems to have gone wrong**, including the standard help-center suffix when the error card is appended to a long response. These use the existing guarded Stop → settle → wait → continue path.
