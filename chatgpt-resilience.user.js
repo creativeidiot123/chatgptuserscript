@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.35
+// @version      1.3.36
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -14,6 +14,8 @@
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // @grant        unsafeWindow
 // ==/UserScript==
 
@@ -21,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.35
+   * ChatGPT Resilience 1.3.36
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -57,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.35';
+  const VERSION = '1.3.36';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -348,12 +350,97 @@
   const MAX_LENGTH_UI_RE = /(?:you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
   const TRAILING_PRODUCT_UI_RE = /^(?:sources\b|you(?:'|’)ve reached the maximum length for this conversation|maximum length for this conversation|keep talking by starting a new chat|start new chat)/i;
 
+
+  // Studyshit stage routing uses the existing durable queue, not a second sender.
+  const STUDY_PROMPT_BASE = 'https://raw.githubusercontent.com/creativeidiot123/studyshit/main/prompts/';
+  const STUDY_STAGE_FILES = Object.freeze({
+    S01: '01-extract.txt', S02: '02-structure.txt', S03: '03-teach.txt',
+    S04: '04-enrich.txt', S05: '05-practice.txt', S06: '06-audit.txt',
+    S07: '07-publish.txt'
+  });
+  function studyTailToken(text) {
+    const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
+    const idx = clean.lastIndexOf('[[STUDY_');
+    if (idx < 0) return null;
+    const tail = clean.slice(idx);
+    const m = tail.match(/^\[\[STUDY_(STEP_DONE|STEP_MORE):(S0[1-7])\]\]/) ||
+      tail.match(/^\[\[STUDY_(FINAL_READY|WAIT_FOR_HUMAN)\]\]/);
+    if (!m) return null;
+    const suffix = tail.slice(m[0].length).trim();
+    if (suffix && !TRAILING_PRODUCT_UI_RE.test(suffix)) return null;
+    return { token:m[0], kind:m[1], stage:m[2] || '' };
+  }
+  function getStudyTarget(info) {
+    if (!info || !STUDY_STAGE_FILES[info.stage]) return '';
+    if (info.kind === 'STEP_MORE') return info.stage;
+    if (info.kind === 'STEP_DONE') {
+      const n = Number(info.stage.slice(1)) + 1;
+      return n <= 7 ? 'S' + String(n).padStart(2,'0') : '';
+    }
+    return '';
+  }
+  function fetchStudyStage(stage) {
+    const name = STUDY_STAGE_FILES[stage];
+    if (!name) return Promise.reject(new Error('Unknown study stage'));
+    if (typeof GM_xmlhttpRequest !== 'function') return Promise.reject(new Error('Tampermonkey GitHub network permission unavailable'));
+    return new Promise((resolve,reject) => GM_xmlhttpRequest({
+      method:'GET', url: STUDY_PROMPT_BASE + name + '?t=' + now(), timeout:30000,
+      onload:r => r.status === 200 && String(r.responseText||'').trim()
+        ? resolve(String(r.responseText)) : reject(new Error('GitHub prompt '+name+' HTTP '+r.status)),
+      onerror:() => reject(new Error('GitHub prompt fetch failed')),
+      ontimeout:() => reject(new Error('GitHub prompt fetch timeout'))
+    }));
+  }
+  async function queueNextStudyStage(msgs = getMessages(), force = false) {
+    if (!verifyTabContext() || !S.enabled) return false;
+    const info = studyTailToken(msgs.lastAssistantText);
+    const target = getStudyTarget(info);
+    if (!target || DC.studyFetching) return false;
+    const route = S.route;
+    const signatureAtStart = signature(msgs.lastAssistantText);
+    const key = 'study-advance:' + route;
+    const prior = store.get(key,null);
+    if (!force && prior?.token === info.token && prior?.signature === signatureAtStart) return true;
+    DC.studyFetching = true;
+    try {
+      const prompt = await fetchStudyStage(target);
+      if (!verifyTabContext(route)) return false;
+      const latest = getMessages(true);
+      if (signature(latest.lastAssistantText) !== signatureAtStart ||
+          studyTailToken(latest.lastAssistantText)?.token !== info.token) return false;
+      const message = '[STUDYSHIT AUTO STAGE ' + target + ']\n' + prompt;
+      if (!S.queue.some(x => x.text === message)) {
+        const item = enqueuePrompt(message);
+        if (!item) throw new Error('Unable to save stage in durable queue');
+        const i = S.queue.findIndex(x => x.id === item.id);
+        if (i > 0) {
+          S.queue.splice(i,1);
+          S.queue.unshift(item);
+          saveQueue();
+          renderQueueList();
+        }
+      }
+      store.set(key,{token:info.token,signature:signatureAtStart,target});
+      log('study-stage-queued',{from:info.stage,kind:info.kind,target});
+      kickQueue('study-next-stage',100);
+      return true;
+    } catch(e) {
+      const reason=String(e?.message||e);
+      log('study-stage-fetch-failed',{reason});
+      maybeNotify(APP+': study pipeline held',reason+'. Retry via Tampermonkey menu.');
+      return false;
+    } finally {
+      DC.studyFetching=false;
+    }
+  }
+
   function protocolMarkerFromExactText(text) {
     const value = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     if (value === PROTOCOL.DONE) return 'done';
     if (value === PROTOCOL.HIBERNATE) return 'hibernate';
     if (value === PROTOCOL.WAIT_USER) return 'wait-user';
-    return null;
+    const study = studyTailToken(value);
+    return study ? (study.kind === 'WAIT_FOR_HUMAN' ? 'wait-user' : 'done') : null;
   }
 
   function isCurrentTurnCorridorElement(el, msgs = getMessages()) {
@@ -405,12 +492,14 @@
     const text = String(node.nodeType === Node.TEXT_NODE ? node.nodeValue : node.textContent || '');
     return text.includes(PROTOCOL.DONE) ||
       text.includes(PROTOCOL.HIBERNATE) ||
-      text.includes(PROTOCOL.WAIT_USER);
+      text.includes(PROTOCOL.WAIT_USER) || text.includes('[[STUDY_');
   }
 
   function markerFromProtocolText(text) {
     const clean = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trimEnd();
     if (!clean) return null;
+    const study = studyTailToken(clean);
+    if (study) return study.kind === 'WAIT_FOR_HUMAN' ? 'wait-user' : 'done';
     const tokens = [
       [PROTOCOL.DONE, 'done'],
       [PROTOCOL.HIBERNATE, 'hibernate'],
@@ -449,7 +538,7 @@
         if (!visible(el)) continue;
         if (el.closest?.('pre,code,blockquote') || el.querySelector?.('pre,code,blockquote')) continue;
         const value = String(el.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-        const marker = tokenMap.get(value);
+        const marker = tokenMap.get(value) || protocolMarkerFromExactText(value);
         if (marker) return marker;
       }
 
@@ -462,7 +551,7 @@
         const parent = tn.parentElement;
         if (!parent || !visible(parent) || parent.closest?.('pre,code,blockquote')) continue;
         const value = String(tn.nodeValue || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-        const marker = tokenMap.get(value);
+        const marker = tokenMap.get(value) || protocolMarkerFromExactText(value);
         if (marker) return marker;
       }
     } catch (_) {}
@@ -2572,7 +2661,14 @@
       if (S.hib) clearHibernation('done-marker');
       S.lastGenerationEndAt = now();
       clearTxn('done-marker');
-      maybeNotify(`${APP}: task done`, 'The current task reached [[CGR_DONE]].');
+      const study = studyTailToken(msgs.lastAssistantText);
+      if (study && ['STEP_MORE','STEP_DONE'].includes(study.kind)) {
+        await queueNextStudyStage(msgs);
+      } else if (study?.kind === 'FINAL_READY') {
+        maybeNotify(`${APP}: study complete`,'The final study HTML is reported ready in GitHub.');
+      } else {
+        maybeNotify(`${APP}: task done`, 'The current task reached [[CGR_DONE]].');
+      }
       return true;
     }
     return false;
@@ -3705,6 +3801,7 @@
       GM_registerMenuCommand('Continue unfinished task now', inProject(() => { clearPause(); clearBlock('menu'); if (S.txn) { S.txn.manualStopped = false; saveTxn(); sendLiteralContinue('menu'); } }));
       GM_registerMenuCommand('Clear pending queue', inProject(clearPendingQueue));
       GM_registerMenuCommand('GitHub wake now', inProject(() => attemptGithubWake('menu', true)));
+      GM_registerMenuCommand('Retry study next stage', inProject(() => queueNextStudyStage(getMessages(true), true)));
       GM_registerMenuCommand('Clear recovery state', inProject(() => { clearPause(); clearBlock('menu-clear'); clearTxn('menu-clear'); clearHibernation('menu-clear'); paintUI(true); }));
     } catch (_) {}
   }
@@ -3712,6 +3809,13 @@
   function selfTest() {
     const cases = [
       ['done marker', terminalMarker('hello\n[[CGR_DONE]]'), 'done'],
+      ['study done', terminalMarker('saved\n[[STUDY_STEP_DONE:S02]]'), 'done'],
+      ['study more', terminalMarker('saved\n[[STUDY_STEP_MORE:S03]]'), 'done'],
+      ['study final', terminalMarker('saved\n[[STUDY_FINAL_READY]]'), 'done'],
+      ['study wait', terminalMarker('blocked\n[[STUDY_WAIT_FOR_HUMAN]]'), 'wait-user'],
+      ['study trailing prose rejected', terminalMarker('[[STUDY_STEP_DONE:S01]]\nnot saved'), null],
+      ['study target next', getStudyTarget({kind:'STEP_DONE',stage:'S04'}), 'S05'],
+      ['study target repeat', getStudyTarget({kind:'STEP_MORE',stage:'S04'}), 'S04'],
       ['hibernate marker', terminalMarker('hello\n[[CGR_HIBERNATE_GITHUB_10M]]'), 'hibernate'],
       ['wait marker', terminalMarker('hello\n[[CGR_WAIT_USER]]'), 'wait-user'],
       ['marker must be final', terminalMarker('[[CGR_DONE]]\nextra'), null],
