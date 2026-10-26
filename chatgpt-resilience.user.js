@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.38
+// @version      1.3.39
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.38
+   * ChatGPT Resilience 1.3.39
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.38';
+  const VERSION = '1.3.39';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -1899,9 +1899,21 @@
     if (!t.userTurnConfirmed && (hashMatches || countAdvanced)) {
       t.userTurnConfirmed = true;
       t.confirmedAt = now();
+      // The composer contains source Markdown, while the user bubble renders
+      // Markdown as plain text. Anchor the actual submitted DOM user turn
+      // rather than requiring its displayed text to hash to the source prompt.
+      t.confirmedUserSig = signature(msgs.lastUserText);
       clearDraft(S.route);
       saveTxn();
       log('txn-user-confirmed', { source: t.source, evidence: hashMatches ? 'hash' : 'user-count' });
+    }
+    // Migrate journals created by older userscript versions only when the
+    // rendered user bubble has advanced past the dispatch baseline.
+    if (t.userTurnConfirmed && !t.confirmedUserSig &&
+        (hashMatches || countAdvanced) && t.sendAttempted) {
+      t.confirmedUserSig = signature(msgs.lastUserText);
+      saveTxn();
+      log('txn-user-anchor-upgraded', { source: t.source });
     }
     const asig = signature(msgs.lastAssistantText);
     if (msgs.assistants.length > Number(t.baselineAssistantCount || 0) || asig !== t.baselineAssistantSig) {
@@ -1943,11 +1955,16 @@
     // protocol tokens invalidate the cache through the root MutationObserver.
     const key = S.route + ':' + signature(msgs.lastUserText) + ':' + DC.protocolRevision;
     const cached = DC.corridorScan;
+    // Never cache "marker absent" forever: ChatGPT can hydrate/virtualize
+    // response wrappers without a recognized token mutation in our observer.
+    const negativeCacheMs = S.txn ? 10_000 : 20_000;
     if (cached && cached.key === key && cached.user === msgs.lastUser &&
-        cached.assistant === msgs.lastAssistant && cached.value === null) return null;
+        cached.assistant === msgs.lastAssistant && cached.value === null &&
+        now() - Number(cached.checkedAt || 0) < negativeCacheMs) return null;
 
     const marker = corridorProtocolMarker(msgs);
-    DC.corridorScan = { key, user: msgs.lastUser, assistant: msgs.lastAssistant, value: marker };
+    DC.corridorScan = { key, user: msgs.lastUser, assistant: msgs.lastAssistant,
+      value: marker, checkedAt: now() };
     return marker;
   }
 
@@ -2713,10 +2730,28 @@
   }
 
   // ---------- completion and recovery FSM --------------------------------------------
+  function userTurnBelongsToTxn(msgs, t = S.txn) {
+    if (!t || !t.userTurnConfirmed || !msgs?.lastUserText) return false;
+    const renderedSig = signature(msgs.lastUserText);
+    // New journals pin the exact rendered user message at confirmation time.
+    // A different subsequent user turn cannot claim an earlier marker.
+    if (t.confirmedUserSig) return renderedSig === t.confirmedUserSig;
+
+    // Compatibility for journals saved before confirmedUserSig existed.
+    if (fnv1a(norm(msgs.lastUserText)) === t.currentPromptHash) return true;
+
+    // Formatted Markdown may not hash like the source prompt. For an already
+    // confirmed legacy transaction, count advancement plus the changed user
+    // bubble and independent dispatch evidence are sufficient to recover.
+    // Do not accept an arbitrary marker from an older chat turn.
+    const advanced = (msgs.users?.length || 0) > Number(t.baselineUserCount || 0) &&
+      renderedSig !== String(t.baselineUserSig || '');
+    return !!(advanced && t.sendAttempted && t.confirmedAt &&
+      (t.sendObserved || t.assistantObserved || t.generationObserved));
+  }
+
   function markerBelongsToTxn(msgs, t = S.txn) {
-    if (!t || !t.userTurnConfirmed || !msgs.lastUserText) return false;
-    if (fnv1a(norm(msgs.lastUserText)) !== t.currentPromptHash) return false;
-    return !!latestMarker(msgs);
+    return userTurnBelongsToTxn(msgs, t) && !!latestMarker(msgs);
   }
 
   function resetVerification(reason = 'activity') {
@@ -4033,6 +4068,24 @@
     const cases = [
       ['done marker', terminalMarker('hello\n[[CGR_DONE]]'), 'done'],
       ['study done', terminalMarker('saved\n[[STUDY_STEP_DONE:S02]]'), 'done'],
+      ['formatted user bubble retains confirmed ownership',
+        userTurnBelongsToTxn({lastUserText:'Bond valuation explained',users:[{},{}]},
+          {userTurnConfirmed:true,currentPromptHash:'different-markdown-hash',
+           confirmedUserSig:signature('Bond valuation explained')}), true],
+      ['unrelated user cannot steal prior transaction marker',
+        userTurnBelongsToTxn({lastUserText:'Unrelated follow-up',users:[{},{}]},
+          {userTurnConfirmed:true,currentPromptHash:'different-markdown-hash',
+           confirmedUserSig:signature('Bond valuation explained')}), false],
+      ['legacy formatted user ownership backed by send evidence',
+        userTurnBelongsToTxn({lastUserText:'Bond valuation explained',users:[{},{}]},
+          {userTurnConfirmed:true,currentPromptHash:'source-markdown-hash',
+           baselineUserCount:1,baselineUserSig:signature('Previous prompt'),
+           sendAttempted:true,confirmedAt:1,sendObserved:true}), true],
+      ['legacy ownership rejects unchanged prior user',
+        userTurnBelongsToTxn({lastUserText:'Previous prompt',users:[{}]},
+          {userTurnConfirmed:true,currentPromptHash:'source-markdown-hash',
+           baselineUserCount:1,baselineUserSig:signature('Previous prompt'),
+           sendAttempted:true,confirmedAt:1,sendObserved:true}), false],
       ['study more', terminalMarker('saved\n[[STUDY_STEP_MORE:S03]]'), 'done'],
       ['study final', terminalMarker('saved\n[[STUDY_FINAL_READY]]'), 'done'],
       ['study wait', terminalMarker('blocked\n[[STUDY_WAIT_FOR_HUMAN]]'), 'wait-user'],
