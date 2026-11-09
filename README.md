@@ -72,11 +72,11 @@ Moving the study chat to a new tab or another browser no longer strands the pipe
 
 Run only **one** tab with the userscript on a given study chat.
 
-## Confirmed-turn virtualization recovery (v1.3.43+)
+## Confirmed-turn virtualization recovery (v1.3.44+)
 
 When ChatGPT unmounts or rehydrates the original long user bubble after it was **already confirmed sent**, the completion marker can still close that transaction if the tracked assistant response progressed beyond the pre-send baseline. The fallback never confirms a previously unconfirmed send, and short `continue` prompts cannot use the weaker rehydrated-text comparison. Study DONE continues to request its same-stage independent verifier, not the next stage.
 
-Install/update the userscript to v1.3.43 and reload the *existing* Study chat; do not manually repost a completed S01 repair. The update must be installed in Tampermonkey, not just committed to GitHub.
+Install/update the userscript to v1.3.44 and reload the *existing* Study chat; do not manually repost a completed S01 repair. The update must be installed in Tampermonkey, not just committed to GitHub.
 
 ## No blind reposts (v1.3.42+)
 
