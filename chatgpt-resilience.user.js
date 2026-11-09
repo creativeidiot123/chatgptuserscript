@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/creativeidiot123/chatgptuserscript/issues
 // @updateURL    https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
 // @downloadURL  https://raw.githubusercontent.com/creativeidiot123/chatgptuserscript/main/chatgpt-resilience.user.js
-// @version      1.3.42
+// @version      1.3.43
 // @description  Protocol-first ChatGPT recovery, Codex-style durable queueing, and GitHub Actions hibernation with low-overhead event-driven liveness.
 // @author       Ankit + ChatGPT
 // @match        https://chatgpt.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   /*
-   * ChatGPT Resilience 1.3.42
+   * ChatGPT Resilience 1.3.43
    *
    * Core invariant for this dedicated project browser:
    *   NO TERMINAL MARKER = THE LOGICAL TASK IS NOT PROVEN COMPLETE.
@@ -59,7 +59,7 @@
    */
 
   const APP = 'ChatGPT Resilience';
-  const VERSION = '1.3.42';
+  const VERSION = '1.3.43';
   const PREFIX = 'cgr1:';
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
@@ -2880,14 +2880,38 @@
 
   // ---------- completion and recovery FSM --------------------------------------------
   function userTurnBelongsToTxn(msgs, t = S.txn) {
-    if (!t || !t.userTurnConfirmed || !msgs?.lastUserText) return false;
-    const renderedSig = signature(msgs.lastUserText);
-    // New journals pin the exact rendered user message at confirmation time.
-    // A different subsequent user turn cannot claim an earlier marker.
-    if (t.confirmedUserSig) return renderedSig === t.confirmedUserSig;
+    if (!t || !t.userTurnConfirmed || t.route !== S.route) return false;
+    const renderedUser = String(msgs?.lastUserText || '');
+    const renderedSig = signature(renderedUser);
+
+    // ChatGPT virtualizes long conversations. After the user turn was
+    // positively confirmed, its bubble can disappear while the current
+    // assistant response and terminal marker remain mounted. Don't strand
+    // a completed, already-dispatched transaction solely for that reason.
+    // Require independently observed assistant progress and a response that
+    // differs from the pre-send assistant baseline; never reconstruct a
+    // missing, unconfirmed send or infer that the original prompt was sent.
+    if (!renderedUser) {
+      return !!(t.confirmedUserSig && t.sendAttempted && t.assistantObserved &&
+        msgs?.lastAssistant && msgs.lastAssistantText &&
+        signature(msgs.lastAssistantText) !== String(t.baselineAssistantSig || ''));
+    }
+
+    // The same user bubble can also rehydrate from a truncated/partial DOM
+    // rendering into full Markdown after confirmation. A changed signature
+    // is acceptable only when the substantial prompt prefix still matches,
+    // and the current assistant is after that user. Short recovery prompts
+    // (notably "continue") never qualify for this weaker fallback.
+    if (t.confirmedUserSig) {
+      if (renderedSig === t.confirmedUserSig) return true;
+      return !!(t.sendAttempted && t.assistantObserved &&
+        looseText(renderedUser).length >= 24 &&
+        userTextMatchesPrompt(renderedUser, t.currentPrompt) &&
+        assistantIsCurrentTail(msgs));
+    }
 
     // Compatibility for journals saved before confirmedUserSig existed.
-    if (fnv1a(norm(msgs.lastUserText)) === t.currentPromptHash) return true;
+    if (fnv1a(norm(renderedUser)) === t.currentPromptHash) return true;
 
     // Formatted Markdown may not hash like the source prompt. For an already
     // confirmed legacy transaction, count advancement plus the changed user
