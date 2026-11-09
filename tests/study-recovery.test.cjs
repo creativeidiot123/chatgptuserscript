@@ -142,6 +142,45 @@ test('unconfirmed or mismatched recovery turns do not own verification', async (
   }
 });
 
+test('a confirmed long study response may complete after its user bubble is virtualized', () => {
+  const h = harness('S01', 'PASS', false);
+  const t = h.context.S.txn;
+  t.sendAttempted = true;
+  t.assistantObserved = true;
+  t.baselineAssistantSig = h.context.signature('Previous response');
+  // ChatGPT has unmounted the long auto-repair user bubble while retaining
+  // the visible assistant response and exact terminal marker.
+  h.messages.lastUser = null;
+  h.messages.lastUserText = '';
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), true);
+  // A claimed-but-never-dispatched prompt must not be completed this way.
+  t.sendAttempted = false;
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), false);
+  t.sendAttempted = true;
+  t.assistantObserved = false;
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), false);
+  t.assistantObserved = true;
+  h.messages.lastAssistantText = 'Previous response';
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), false);
+});
+
+test('rehydrated long user prompt is recognized but unrelated turns are rejected', () => {
+  const h = harness('S01', 'PASS', false);
+  const t = h.context.S.txn;
+  t.currentPrompt = '[STUDYSHIT AUTO REPAIR S01] Read the slides, restore missing source tables, and commit verified study.html';
+  t.confirmedUserSig = h.context.signature('Initially partial user bubble');
+  t.sendAttempted = true;
+  t.assistantObserved = true;
+  h.messages.lastUserText = '[STUDYSHIT AUTO REPAIR S01] Read the slides, restore missing source tables, and commit verified study.html';
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), true);
+  h.messages.lastUserText = 'Explain this unrelated topic instead, ignoring all previous repair prompts';
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), false);
+  // Literal continue is deliberately too short for prefix-based adoption.
+  t.currentPrompt = 'continue';
+  h.messages.lastUserText = 'continue';
+  assert.equal(h.context.userTurnBelongsToTxn(h.messages, t), false);
+});
+
 test('a human follow-up then recovery cannot inherit the original verifier', async () => {
   const h = harness();
   h.context.beginSubturn('Explain an unrelated topic', 'human-send');
